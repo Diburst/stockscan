@@ -1,0 +1,31 @@
+# Local TimescaleDB for stockscan.
+# Apple Silicon: works under Docker Desktop or OrbStack (recommended).
+# Bind to localhost only — never expose 5432 to the LAN.
+
+services:
+  db:
+    image: timescale/timescaledb:2.17.2-pg16
+    container_name: stockscan-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: stockscan
+      POSTGRES_USER: stockscan
+      POSTGRES_PASSWORD_FILE: /run/secrets/db_password
+      TS_TUNE_MEMORY: 4GB
+      TS_TUNE_NUM_CPUS: 4
+    volumes:
+      - ./pgdata:/var/lib/postgresql/data
+    ports:
+      - "127.0.0.1:5432:5432"
+    secrets:
+      - db_password
+    shm_size: 1gb
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U stockscan -d stockscan"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+secrets:
+  db_password:
+    file: ./db_password.secret

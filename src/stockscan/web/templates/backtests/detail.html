@@ -1,0 +1,243 @@
+{% extends "base.html" %}
+{% from "_macros.html" import card, badge, empty, stat %}
+
+{% block title %}Backtest #{{ run.run_id if run else "?" }}{% endblock %}
+
+{% block head_extra %}
+  <script src="https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
+{% endblock %}
+
+{% block content %}
+{% if not run %}
+  {{ empty("Backtest not found.", "❓") }}
+{% else %}
+<div class="space-y-6">
+  <div>
+    <h1 class="text-2xl font-semibold">
+      Backtest <span class="font-mono">#{{ run.run_id }}</span>
+    </h1>
+    <p class="text-sm text-ink-500">{{ run.strategy_name }} v{{ run.strategy_version }} · {{ run.start_date }} → {{ run.end_date }}</p>
+  </div>
+
+  <!-- Headline metrics -->
+  {% set m = run.metrics_json or {} %}
+  <div class="grid grid-cols-2 sm:grid-cols-4 gap-4">
+    <div class="bg-white rounded-xl shadow-sm border border-ink-300/40 p-4">
+      {{ stat("Total return", "{:.1%}".format(m.get('total_return_pct', 0)),
+              kind=("ok" if m.get('total_return_pct', 0) > 0 else "bad")) }}
+    </div>
+    <div class="bg-white rounded-xl shadow-sm border border-ink-300/40 p-4">
+      {{ stat("CAGR", "{:.2%}".format(m.get('cagr', 0))) }}
+    </div>
+    <div class="bg-white rounded-xl shadow-sm border border-ink-300/40 p-4">
+      {{ stat("Sharpe", "{:.2f}".format(m.get('sharpe', 0))) }}
+    </div>
+    <div class="bg-white rounded-xl shadow-sm border border-ink-300/40 p-4">
+      {{ stat("Max drawdown",
+              "{:.2%}".format(m.get('max_drawdown_pct', 0)),
+              sub="{} days".format(m.get('max_drawdown_days', 0)),
+              kind="bad") }}
+    </div>
+    <div class="bg-white rounded-xl shadow-sm border border-ink-300/40 p-4">
+      {{ stat("Trades", run.num_trades or 0) }}
+    </div>
+    <div class="bg-white rounded-xl shadow-sm border border-ink-300/40 p-4">
+      {{ stat("Win rate", "{:.1%}".format(m.get('win_rate', 0))) }}
+    </div>
+    <div class="bg-white rounded-xl shadow-sm border border-ink-300/40 p-4">
+      {{ stat("Profit factor", "{:.2f}".format(m.get('profit_factor', 0))) }}
+    </div>
+    <div class="bg-white rounded-xl shadow-sm border border-ink-300/40 p-4">
+      {{ stat("Expectancy", "{:.2%}".format(m.get('expectancy_pct', 0))) }}
+    </div>
+    <div class="bg-white rounded-xl shadow-sm border border-ink-300/40 p-4">
+      {{ stat("Avg R",
+              "{:+.2f}R".format(avg_r) if avg_r is not none else "—",
+              sub=("best {:+.2f}R · worst {:+.2f}R".format(best_r, worst_r)
+                   if avg_r is not none else "no stops recorded"),
+              kind=("ok" if avg_r and avg_r > 0 else ("bad" if avg_r and avg_r < 0 else "neutral"))) }}
+    </div>
+  </div>
+
+  <!-- Equity curve -->
+  {% if equity %}
+    {% call card(title="Equity curve") %}
+      <div id="equity-chart" style="width:100%; height: 320px;"></div>
+      <script>
+        document.addEventListener('DOMContentLoaded', function() {
+          const chart = LightweightCharts.createChart(document.getElementById('equity-chart'), {
+            layout: { background: { color: '#ffffff' }, textColor: '#334155' },
+            grid: { vertLines: { color: '#f1f5f9' }, horzLines: { color: '#f1f5f9' } },
+            rightPriceScale: { borderColor: '#cbd5e1' },
+            timeScale: { borderColor: '#cbd5e1', timeVisible: false },
+            handleScroll: true, handleScale: true,
+          });
+          const series = chart.addAreaSeries({
+            lineColor: '#0f172a', topColor: 'rgba(15,23,42,0.4)', bottomColor: 'rgba(15,23,42,0)'
+          });
+          series.setData([
+            {% for e in equity %}
+              {time: "{{ e.as_of_date }}", value: {{ e.total_equity|float }}}{% if not loop.last %},{% endif %}
+            {% endfor %}
+          ]);
+          chart.timeScale().fitContent();
+          new ResizeObserver(() => chart.applyOptions({ width: document.getElementById('equity-chart').clientWidth }))
+              .observe(document.getElementById('equity-chart'));
+        });
+      </script>
+    {% endcall %}
+  {% endif %}
+
+  <!-- Per-symbol price chart with entry/exit markers -->
+  {% if symbols %}
+    {% call card(
+        title="Price action — " ~ (selected_symbol or "—"),
+        subtitle="Entry (▲) and exit (▼) markers for every trade in this symbol. Hover for details."
+    ) %}
+      {% if symbols|length > 1 %}
+        <div class="flex flex-wrap gap-2 mb-3 -mt-1">
+          {% for sym, count in symbols %}
+            <a href="/backtests/{{ run.run_id }}?symbol={{ sym }}"
+               class="inline-flex items-center gap-1 px-3 py-1 rounded-full text-xs border
+                      {% if sym == selected_symbol %}bg-ink-900 text-white border-ink-900
+                      {% else %}bg-white text-ink-700 border-ink-300 hover:bg-ink-100{% endif %}">
+              <span class="font-mono">{{ sym }}</span>
+              <span class="text-[10px] opacity-70">{{ count }}</span>
+            </a>
+          {% endfor %}
+        </div>
+      {% endif %}
+
+      {% if chart_bars %}
+        <div id="price-chart" style="width:100%; height: 380px;"></div>
+        <script>
+          document.addEventListener('DOMContentLoaded', function() {
+            const el = document.getElementById('price-chart');
+            const chart = LightweightCharts.createChart(el, {
+              layout: { background: { color: '#ffffff' }, textColor: '#334155' },
+              grid: { vertLines: { color: '#f1f5f9' }, horzLines: { color: '#f1f5f9' } },
+              rightPriceScale: { borderColor: '#cbd5e1' },
+              timeScale: { borderColor: '#cbd5e1', timeVisible: false },
+              handleScroll: true, handleScale: true,
+              crosshair: { mode: 1 },  // magnet
+            });
+            const series = chart.addCandlestickSeries({
+              upColor: '#059669', downColor: '#dc2626',
+              wickUpColor: '#059669', wickDownColor: '#dc2626',
+              borderUpColor: '#059669', borderDownColor: '#dc2626',
+            });
+            series.setData({{ chart_bars|tojson }});
+            series.setMarkers({{ chart_markers|tojson }});
+            chart.timeScale().fitContent();
+            new ResizeObserver(() => chart.applyOptions({ width: el.clientWidth }))
+                .observe(el);
+          });
+        </script>
+      {% else %}
+        {{ empty(
+          "No bars in the local store for " ~ (selected_symbol or "this symbol") ~
+          " over the run window. Run `stockscan refresh bars " ~ (selected_symbol or "<SYM>") ~ "` first.",
+          "📉"
+        ) }}
+      {% endif %}
+
+      {% if selected_trades %}
+        <p class="text-xs text-ink-500 mt-3">
+          {{ selected_trades|length }} trade{{ "s" if selected_trades|length != 1 else "" }} on
+          <span class="font-mono">{{ selected_symbol }}</span> in this run.
+        </p>
+      {% endif %}
+    {% endcall %}
+  {% endif %}
+
+  <!-- Trade log — all symbols -->
+  {% call card(
+      title="Trade log (" ~ trades|length ~ ")",
+      subtitle="Every trade with entry context and exit reason. Hover entry-meta for indicator values."
+  ) %}
+    {% if trades %}
+      <div class="overflow-x-auto -mx-4">
+        <table class="w-full text-sm">
+          <thead class="text-xs uppercase text-ink-500 border-b border-ink-300/40">
+            <tr>
+              <th class="text-left px-4 py-2">Symbol</th>
+              <th class="text-right px-4 py-2">Qty</th>
+              <th class="text-left px-4 py-2">Entry</th>
+              <th class="text-right px-4 py-2" title="Hard-stop level set at entry">Stop</th>
+              <th class="text-left px-4 py-2">Exit</th>
+              <th class="text-left px-4 py-2" title="Why the trade exited">Reason</th>
+              <th class="text-right px-4 py-2">Days</th>
+              <th class="text-right px-4 py-2">Return</th>
+              <th class="text-right px-4 py-2" title="Return on planned risk: (exit−entry) / (entry−stop). +1R = made the planned risk; −1R = stop hit cleanly.">R</th>
+              <th class="text-right px-4 py-2">P&amp;L</th>
+            </tr>
+          </thead>
+          <tbody class="divide-y divide-ink-300/40">
+            {% for t in trades %}
+              <tr>
+                <td class="px-4 py-1.5 font-mono">
+                  <a href="/backtests/{{ run.run_id }}?symbol={{ t.symbol }}"
+                     class="hover:underline {% if t.symbol == selected_symbol %}font-semibold{% endif %}">{{ t.symbol }}</a>
+                </td>
+                <td class="px-4 py-1.5 text-right">{{ t.qty }}</td>
+                <td class="px-4 py-1.5 text-xs"
+                    {% if t.entry_metadata %}title="{% for k, v in t.entry_metadata.items() %}{{ k }}: {{ v }}{% if not loop.last %} · {% endif %}{% endfor %}"{% endif %}>
+                  {{ t.entry_date }} @ ${{ "%.2f"|format(t.entry_price|float) }}
+                  {% if t.entry_metadata %}
+                    <span class="text-ink-500 cursor-help">ⓘ</span>
+                  {% endif %}
+                </td>
+                <td class="px-4 py-1.5 text-right text-xs font-mono text-bad-600">
+                  {% if t.stop_price is not none %}${{ "%.2f"|format(t.stop_price|float) }}{% else %}—{% endif %}
+                </td>
+                <td class="px-4 py-1.5 text-xs">
+                  {% if t.exit_date %}
+                    {{ t.exit_date }} @ ${{ "%.2f"|format(t.exit_price|float) if t.exit_price else "—" }}
+                  {% else %}<span class="text-ink-500">open</span>{% endif %}
+                </td>
+                <td class="px-4 py-1.5 text-xs">
+                  {% if t.exit_reason %}
+                    {% set reason_color = {
+                      'hard_stop': 'bad-600',
+                      'macd_below_zero': 'warn-600',
+                      'time_stop': 'ink-500',
+                      'reached_profit_sma': 'ok-600',
+                      'mean_reverted_above_sma5': 'ok-600',
+                      'chandelier_stop': 'ok-600',
+                      'exit_below_n_day_low': 'bad-600',
+                      'end_of_backtest': 'ink-500',
+                    } %}
+                    <span class="px-1.5 py-0.5 rounded text-[10px] bg-{{ reason_color.get(t.exit_reason, 'ink-500') }}/10 text-{{ reason_color.get(t.exit_reason, 'ink-700') }} border border-{{ reason_color.get(t.exit_reason, 'ink-300') }}/30 font-mono">
+                      {{ t.exit_reason }}
+                    </span>
+                  {% else %}—{% endif %}
+                </td>
+                <td class="px-4 py-1.5 text-right">{{ t.holding_days or "—" }}</td>
+                <td class="px-4 py-1.5 text-right
+                           {% if t.return_pct and t.return_pct > 0 %}text-ok-600{% elif t.return_pct and t.return_pct < 0 %}text-bad-600{% endif %}">
+                  {% if t.return_pct is not none %}{{ "%.2f%%"|format(t.return_pct|float * 100) }}{% else %}—{% endif %}
+                </td>
+                <td class="px-4 py-1.5 text-right font-mono
+                           {% if t.r_multiple and t.r_multiple > 0 %}text-ok-600{% elif t.r_multiple and t.r_multiple < 0 %}text-bad-600{% endif %}">
+                  {% if t.r_multiple is not none %}{{ "%+.2fR"|format(t.r_multiple|float) }}{% else %}—{% endif %}
+                </td>
+                <td class="px-4 py-1.5 text-right font-mono
+                           {% if t.realized_pnl and t.realized_pnl > 0 %}text-ok-600{% elif t.realized_pnl and t.realized_pnl < 0 %}text-bad-600{% endif %}">
+                  {% if t.realized_pnl is not none %}${{ "%.2f"|format(t.realized_pnl|float) }}{% else %}—{% endif %}
+                </td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    {% else %}
+      {{ empty("No trades in this run.", "📭") }}
+    {% endif %}
+  {% endcall %}
+
+  <a href="/backtests" class="inline-flex items-center px-4 py-2 rounded border border-ink-300 text-sm">
+    ← Back to backtests
+  </a>
+</div>
+{% endif %}
+{% endblock %}

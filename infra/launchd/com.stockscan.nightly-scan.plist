@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Nightly scan: M-F at 20:00 ET (after market close).
+    1. Bulk-refresh recent EOD bars
+    2. Run every registered strategy
+    3. Send email + Discord summary
+
+  Install:
+    cp infra/launchd/com.stockscan.nightly-scan.plist ~/Library/LaunchAgents/
+    launchctl load ~/Library/LaunchAgents/com.stockscan.nightly-scan.plist
+
+  REPLACE the two paths below before installing:
+    {{PROJECT_DIR}}  → absolute path to your stock-scan repo
+    {{UV_BIN}}       → output of `which uv` (typically ~/.local/bin/uv)
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.stockscan.nightly-scan</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>{{UV_BIN}}</string>
+    <string>run</string>
+    <string>stockscan</string>
+    <string>jobs</string>
+    <string>nightly-scan</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>{{PROJECT_DIR}}</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/usr/local/bin:/usr/bin:/bin</string>
+    <key>TZ</key>
+    <string>America/New_York</string>
+  </dict>
+
+  <!-- Run every weekday (Mon=1..Fri=5) at 20:00 -->
+  <key>StartCalendarInterval</key>
+  <array>
+    <dict><key>Weekday</key><integer>1</integer><key>Hour</key><integer>20</integer><key>Minute</key><integer>0</integer></dict>
+    <dict><key>Weekday</key><integer>2</integer><key>Hour</key><integer>20</integer><key>Minute</key><integer>0</integer></dict>
+    <dict><key>Weekday</key><integer>3</integer><key>Hour</key><integer>20</integer><key>Minute</key><integer>0</integer></dict>
+    <dict><key>Weekday</key><integer>4</integer><key>Hour</key><integer>20</integer><key>Minute</key><integer>0</integer></dict>
+    <dict><key>Weekday</key><integer>5</integer><key>Hour</key><integer>20</integer><key>Minute</key><integer>0</integer></dict>
+  </array>
+
+  <key>StandardOutPath</key>
+  <string>{{PROJECT_DIR}}/logs/nightly-scan.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>{{PROJECT_DIR}}/logs/nightly-scan.err.log</string>
+
+  <!-- launchd will retry if it exits non-zero, but throttle attempts. -->
+  <key>ThrottleInterval</key>
+  <integer>60</integer>
+</dict>
+</plist>

@@ -1,0 +1,52 @@
+{# Reusable UI partials. Import via {% from "_macros.html" import card, badge, empty %} #}
+
+{% macro card(title=None, subtitle=None) %}
+  <section class="bg-white rounded-xl shadow-sm border border-ink-300/40 overflow-hidden">
+    {% if title %}
+      <header class="px-4 py-3 border-b border-ink-300/40">
+        <h2 class="font-semibold text-ink-900">{{ title }}</h2>
+        {% if subtitle %}<p class="text-xs text-ink-500 mt-0.5">{{ subtitle }}</p>{% endif %}
+      </header>
+    {% endif %}
+    <div class="p-4">{{ caller() }}</div>
+  </section>
+{% endmacro %}
+
+{% macro badge(label, kind="neutral") %}
+  {%- set classes = {
+    'neutral': 'bg-ink-100 text-ink-700 border-ink-300/60',
+    'ok':      'bg-ok-100 text-ok-600 border-ok-600/30',
+    'warn':    'bg-warn-100 text-warn-600 border-warn-600/30',
+    'bad':     'bg-bad-100 text-bad-600 border-bad-600/30',
+  } -%}
+  <span class="inline-flex items-center text-xs px-2 py-0.5 rounded border {{ classes.get(kind, classes['neutral']) }}">{{ label }}</span>
+{% endmacro %}
+
+{% macro empty(message, icon="📭") %}
+  <div class="text-center text-ink-500 py-8">
+    <div class="text-3xl mb-2">{{ icon }}</div>
+    <p class="text-sm">{{ message }}</p>
+  </div>
+{% endmacro %}
+
+{% macro stat(label, value, sub=None, kind="neutral") %}
+  {%- set color = {
+    'neutral': 'text-ink-900',
+    'ok': 'text-ok-600',
+    'warn': 'text-warn-600',
+    'bad': 'text-bad-600',
+  }.get(kind, 'text-ink-900') -%}
+  <div>
+    <div class="text-xs text-ink-500 uppercase tracking-wide">{{ label }}</div>
+    <div class="text-2xl font-semibold {{ color }}">{{ value }}</div>
+    {% if sub %}<div class="text-xs text-ink-500 mt-0.5">{{ sub }}</div>{% endif %}
+  </div>
+{% endmacro %}
+
+{% macro pill_link(href, label, active=False) %}
+  <a href="{{ href }}"
+     class="inline-flex items-center px-3 py-1.5 rounded-full text-xs border
+            {% if active %}bg-ink-900 text-white border-ink-900{% else %}bg-white text-ink-700 border-ink-300 hover:bg-ink-100{% endif %}">
+    {{ label }}
+  </a>
+{% endmacro %}

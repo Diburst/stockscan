@@ -1,0 +1,92 @@
+{% extends "base.html" %}
+{% from "_macros.html" import card, badge, empty %}
+
+{% block title %}Trade {{ trade.symbol if trade else "?" }}{% endblock %}
+
+{% block content %}
+{% if not trade %}
+  {{ empty("Trade not found.", "❓") }}
+{% else %}
+<div class="space-y-6">
+
+  <!-- Header -->
+  <div class="flex items-baseline justify-between flex-wrap gap-2">
+    <h1 class="text-2xl font-semibold">
+      <span class="font-mono">{{ trade.symbol }}</span>
+      <span class="text-base text-ink-500">· {{ trade.strategy }}</span>
+    </h1>
+    {% if trade.status == 'open' %}{{ badge("open", "ok") }}{% else %}{{ badge("closed") }}{% endif %}
+  </div>
+
+  {% call card(title="Trade summary") %}
+    <dl class="grid grid-cols-2 sm:grid-cols-3 gap-x-6 gap-y-2 text-sm">
+      <div><dt class="text-ink-500">Opened</dt><dd>{{ trade.opened_at.date() }}</dd></div>
+      <div><dt class="text-ink-500">Closed</dt><dd>{{ trade.closed_at.date() if trade.closed_at else "—" }}</dd></div>
+      <div><dt class="text-ink-500">Hold (days)</dt><dd>{{ trade.holding_days or "—" }}</dd></div>
+      <div><dt class="text-ink-500">Realized P&amp;L</dt>
+        <dd class="font-mono {% if trade.realized_pnl and trade.realized_pnl > 0 %}text-ok-600{% elif trade.realized_pnl and trade.realized_pnl < 0 %}text-bad-600{% endif %}">
+          {% if trade.realized_pnl is not none %}${{ "%.2f"|format(trade.realized_pnl|float) }}{% else %}—{% endif %}
+        </dd></div>
+      <div><dt class="text-ink-500">MFE</dt><dd>{{ "%.2f%%"|format(trade.mfe|float * 100) if trade.mfe else "—" }}</dd></div>
+      <div><dt class="text-ink-500">MAE</dt><dd>{{ "%.2f%%"|format(trade.mae|float * 100) if trade.mae else "—" }}</dd></div>
+    </dl>
+  {% endcall %}
+
+  <!-- Lots -->
+  {% call card(title="Tax lots (" ~ lots|length ~ ")") %}
+    {% if lots %}
+      <ul class="divide-y divide-ink-300/40 -mx-4 text-sm">
+        {% for l in lots %}
+          <li class="px-4 py-2 flex items-center justify-between">
+            <div>
+              <span class="font-mono">lot #{{ l.lot_id }}</span>
+              <span class="text-ink-500 ml-2">{{ l.qty_remaining }}/{{ l.qty_original }} @ ${{ "%.2f"|format(l.cost_basis|float) }}</span>
+            </div>
+            <span class="text-xs text-ink-500">acquired {{ l.acquired_at.date() }}</span>
+          </li>
+        {% endfor %}
+      </ul>
+    {% else %}
+      {{ empty("No lots recorded.", "🧾") }}
+    {% endif %}
+  {% endcall %}
+
+  <!-- Notes thread -->
+  {% call card(title="Notes (" ~ notes|length ~ ")") %}
+    {% if notes %}
+      <ul class="space-y-3">
+        {% for n in notes %}
+          <li class="border border-ink-300/40 rounded p-3 bg-ink-100/40">
+            <div class="flex justify-between items-baseline mb-1">
+              <span class="text-xs text-ink-500">
+                {{ n.created_at.strftime("%Y-%m-%d %H:%M") }} · {{ n.note_type }}
+              </span>
+            </div>
+            <div class="prose-sm whitespace-pre-wrap">{{ n.body }}</div>
+          </li>
+        {% endfor %}
+      </ul>
+    {% else %}
+      {{ empty("No notes yet — capture your thesis below.", "📝") }}
+    {% endif %}
+
+    <form action="/trades/{{ trade.trade_id }}/notes" method="post" class="mt-4 space-y-2">
+      <select name="note_type" class="px-3 py-2 rounded border border-ink-300 text-sm w-full sm:w-auto">
+        <option value="entry">Entry thesis</option>
+        <option value="mid">Mid-trade observation</option>
+        <option value="exit">Exit review</option>
+        <option value="free" selected>Free-form</option>
+      </select>
+      <textarea name="body" rows="4" required minlength="1"
+                placeholder="Capture rationale, context, or lessons. Markdown supported."
+                class="block w-full px-3 py-2 rounded border border-ink-300 text-sm font-mono"></textarea>
+      <button class="px-4 py-2 rounded bg-ink-900 text-white text-sm">Add note</button>
+    </form>
+  {% endcall %}
+
+  <a href="/trades" class="inline-flex items-center px-4 py-2 rounded border border-ink-300 text-sm">
+    ← Back to trades
+  </a>
+</div>
+{% endif %}
+{% endblock %}

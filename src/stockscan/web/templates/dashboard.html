@@ -1,0 +1,137 @@
+{% extends "base.html" %}
+{% from "_macros.html" import card, badge, empty, stat %}
+
+{% block title %}Dashboard{% endblock %}
+
+{# Render either the "+ Watch" form (HTMX-enabled) or a static "watching" pill,
+   depending on whether the symbol is already on the watchlist. The pill
+   markup MUST match what /watchlist/add returns to HTMX so the look is
+   identical pre- and post-click. #}
+{% macro watch_button(symbol, redirect_to="/", watching=set()) %}
+  {% if symbol in watching %}
+    <span class="text-xs px-2 py-1 rounded bg-ok-100 text-ok-600 border border-ok-600/30 inline-block">✓ watching</span>
+  {% else %}
+    <form action="/watchlist/add" method="post"
+          hx-post="/watchlist/add"
+          hx-target="this"
+          hx-swap="outerHTML"
+          class="inline">
+      <input type="hidden" name="symbol" value="{{ symbol }}">
+      <input type="hidden" name="redirect_to" value="{{ redirect_to }}">
+      <button type="submit"
+              class="text-xs px-2 py-1 rounded border border-ink-300 hover:bg-ink-100"
+              title="Add {{ symbol }} to watchlist">+ Watch</button>
+    </form>
+  {% endif %}
+{% endmacro %}
+
+{% block content %}
+<div class="space-y-6">
+
+  <!-- Headline numbers -->
+  <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
+    <div class="bg-white rounded-xl shadow-sm border border-ink-300/40 p-4">
+      {{ stat("Equity",
+        "${:,.0f}".format(equity.total_equity|float) if equity else "—",
+        sub=("as of " ~ equity.as_of_date) if equity else "no NAV history yet") }}
+    </div>
+    <div class="bg-white rounded-xl shadow-sm border border-ink-300/40 p-4">
+      {{ stat("Cash",
+        "${:,.0f}".format(equity.cash|float) if equity else "—") }}
+    </div>
+    <div class="bg-white rounded-xl shadow-sm border border-ink-300/40 p-4">
+      {{ stat("Open positions", open_trades|length) }}
+    </div>
+    <div class="bg-white rounded-xl shadow-sm border border-ink-300/40 p-4">
+      {% set strategy_names = strategies|map(attribute='name')|join(', ') %}
+      {{ stat("Strategies", strategies|length,
+              sub=strategy_names if strategies else "none registered") }}
+    </div>
+  </div>
+
+  <!-- Latest signals -->
+  {% call card(title="Latest signals", subtitle="Most recent 25 across all strategies") %}
+    {% if signals %}
+      <ul class="divide-y divide-ink-300/40 -mx-4">
+        {% for sig in signals %}
+          <li class="px-4 py-3 flex items-center justify-between gap-4">
+            <div class="min-w-0">
+              <div class="flex items-center gap-2">
+                <span class="font-mono font-semibold">{{ sig.symbol }}</span>
+                {% if sig.status == 'new' %}
+                  {{ badge("passing", "ok") }}
+                {% elif sig.status == 'rejected' %}
+                  {{ badge("rejected", "warn") }}
+                {% elif sig.status == 'ordered' %}
+                  {{ badge("ordered", "neutral") }}
+                {% endif %}
+              </div>
+              <div class="text-xs text-ink-500 truncate">
+                {{ sig.strategy_name }} · {{ sig.as_of_date }}
+                {% if sig.rejected_reason %} · {{ sig.rejected_reason }}{% endif %}
+              </div>
+            </div>
+            <div class="flex items-center gap-3 flex-shrink-0">
+              {{ watch_button(sig.symbol, watching=watching) }}
+              <a href="/signals/{{ sig.signal_id }}" class="text-xs text-ink-700 hover:text-ink-900 underline">view</a>
+            </div>
+          </li>
+        {% endfor %}
+      </ul>
+    {% else %}
+      {{ empty("No signals yet — run `stockscan scan run rsi2_meanrev`.", "🔍") }}
+    {% endif %}
+  {% endcall %}
+
+  <!-- Open positions -->
+  {% call card(title="Open positions") %}
+    {% if open_trades %}
+      <ul class="divide-y divide-ink-300/40 -mx-4">
+        {% for t in open_trades %}
+          <li class="px-4 py-3 flex items-center justify-between">
+            <div>
+              <div class="font-mono font-semibold">{{ t.symbol }}</div>
+              <div class="text-xs text-ink-500">{{ t.strategy }} · opened {{ t.opened_at.date() }}</div>
+            </div>
+            <div class="flex items-center gap-3 flex-shrink-0">
+              {{ watch_button(t.symbol, watching=watching) }}
+              <a href="/trades/{{ t.trade_id }}" class="text-xs text-ink-700 underline">detail</a>
+            </div>
+          </li>
+        {% endfor %}
+      </ul>
+    {% else %}
+      {{ empty("No open positions.", "💼") }}
+    {% endif %}
+  {% endcall %}
+
+  <!-- System health -->
+  {% call card(title="System health") %}
+    <dl class="grid grid-cols-1 sm:grid-cols-2 gap-x-6 gap-y-2 text-sm">
+      <div class="flex justify-between">
+        <dt class="text-ink-500">Database</dt>
+        <dd>
+          {% if health.ok %}{{ badge("ok", "ok") }}{% else %}{{ badge("down", "bad") }}{% endif %}
+        </dd>
+      </div>
+      <div class="flex justify-between">
+        <dt class="text-ink-500">TimescaleDB</dt>
+        <dd>
+          {% if health.timescaledb and health.timescaledb != "(missing)" %}
+            {{ badge("v" ~ health.timescaledb, "ok") }}
+          {% else %}{{ badge("missing", "bad") }}{% endif %}
+        </dd>
+      </div>
+      <div class="flex justify-between">
+        <dt class="text-ink-500">Postgres</dt>
+        <dd class="text-xs text-ink-700 truncate max-w-[60%]">{{ health.postgres or "—" }}</dd>
+      </div>
+      <div class="flex justify-between">
+        <dt class="text-ink-500">Strategies registered</dt>
+        <dd>{{ strategies|length }}</dd>
+      </div>
+    </dl>
+  {% endcall %}
+
+</div>
+{% endblock %}

@@ -1,0 +1,31 @@
+{% extends "base.html" %}
+{% from "_macros.html" import card, badge, empty %}
+
+{% block title %}Strategies{% endblock %}
+
+{% block content %}
+<div class="space-y-4">
+  <h1 class="text-2xl font-semibold">Strategies</h1>
+  <p class="text-sm text-ink-500">{{ strategies|length }} registered. Drop a Python file in <code>src/stockscan/strategies/</code> and restart to add more.</p>
+
+  {% if strategies %}
+    <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+      {% for s in strategies %}
+        <a href="/strategies/{{ s.name }}"
+           class="bg-white rounded-xl shadow-sm border border-ink-300/40 p-4 hover:bg-ink-100 block">
+          <div class="flex items-baseline justify-between mb-1">
+            <h2 class="font-semibold">{{ s.display_name }}</h2>
+            <span class="text-xs text-ink-500 font-mono">v{{ s.version }}</span>
+          </div>
+          <p class="text-sm text-ink-700 mb-3">{{ s.description or "" }}</p>
+          <div class="flex flex-wrap gap-1">
+            {% for tag in s.tags %}{{ badge(tag, "neutral") }}{% endfor %}
+          </div>
+        </a>
+      {% endfor %}
+    </div>
+  {% else %}
+    {{ empty("No strategies registered.", "🧩") }}
+  {% endif %}
+</div>
+{% endblock %}

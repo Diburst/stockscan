@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Daily logical backup of the stockscan database via pg_dump.
+  Runs every day at 02:00 ET. Keeps the last 14 daily dumps + 8 weekly.
+
+  Install:
+    cp infra/launchd/com.stockscan.db-backup.plist ~/Library/LaunchAgents/
+    launchctl load ~/Library/LaunchAgents/com.stockscan.db-backup.plist
+
+  REPLACE the path below before installing:
+    {{PROJECT_DIR}}  → absolute path to your stock-scan repo
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.stockscan.db-backup</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>{{PROJECT_DIR}}/infra/scripts/db_backup.sh</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>{{PROJECT_DIR}}</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/usr/local/bin:/usr/bin:/bin</string>
+  </dict>
+
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key><integer>2</integer>
+    <key>Minute</key><integer>0</integer>
+  </dict>
+
+  <key>StandardOutPath</key>
+  <string>{{PROJECT_DIR}}/logs/db-backup.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>{{PROJECT_DIR}}/logs/db-backup.err.log</string>
+</dict>
+</plist>

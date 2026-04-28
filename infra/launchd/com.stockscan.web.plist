@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Always-on FastAPI web server. Loaded by launchd at user login and kept alive.
+
+  Install:
+    cp infra/launchd/com.stockscan.web.plist ~/Library/LaunchAgents/
+    launchctl load ~/Library/LaunchAgents/com.stockscan.web.plist
+
+  REPLACE the two paths below before installing:
+    {{PROJECT_DIR}}  → absolute path to your stock-scan repo
+    {{UV_BIN}}       → output of `which uv` (typically ~/.local/bin/uv)
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.stockscan.web</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>{{UV_BIN}}</string>
+    <string>run</string>
+    <string>uvicorn</string>
+    <string>stockscan.web.app:app</string>
+    <string>--host</string>
+    <string>0.0.0.0</string>
+    <string>--port</string>
+    <string>8000</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>{{PROJECT_DIR}}</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/usr/local/bin:/usr/bin:/bin</string>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>StandardOutPath</key>
+  <string>{{PROJECT_DIR}}/logs/web.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>{{PROJECT_DIR}}/logs/web.err.log</string>
+
+  <key>ThrottleInterval</key>
+  <integer>30</integer>
+</dict>
+</plist>

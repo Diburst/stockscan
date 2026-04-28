@@ -1,0 +1,50 @@
+{% extends "base.html" %}
+{% from "_macros.html" import card, badge, empty %}
+
+{% block title %}Signal {{ signal.symbol if signal else "?" }}{% endblock %}
+
+{% block content %}
+{% if not signal %}
+  {{ empty("Signal not found.", "❓") }}
+{% else %}
+<div class="space-y-4">
+  <div class="flex items-baseline justify-between flex-wrap gap-2">
+    <h1 class="text-2xl font-semibold">
+      <span class="font-mono">{{ signal.symbol }}</span>
+      <span class="text-base text-ink-500">· {{ signal.strategy_name }} v{{ signal.strategy_version }}</span>
+    </h1>
+    {% if signal.status == 'new' %}{{ badge("passing", "ok") }}{% elif signal.status == 'rejected' %}{{ badge("rejected", "warn") }}{% else %}{{ badge(signal.status) }}{% endif %}
+  </div>
+
+  {% call card(title="Signal") %}
+    <dl class="grid grid-cols-2 sm:grid-cols-3 gap-x-6 gap-y-2 text-sm">
+      <div><dt class="text-ink-500">Side</dt><dd class="font-semibold">{{ signal.side }}</dd></div>
+      <div><dt class="text-ink-500">As of</dt><dd>{{ signal.as_of_date }}</dd></div>
+      <div><dt class="text-ink-500">Score</dt><dd>{{ "%.4f"|format(signal.score|float) if signal.score else "—" }}</dd></div>
+      <div><dt class="text-ink-500">Suggested entry</dt><dd class="font-mono">${{ "%.2f"|format(signal.suggested_entry|float) }}</dd></div>
+      <div><dt class="text-ink-500">Suggested stop</dt><dd class="font-mono text-bad-600">${{ "%.2f"|format(signal.suggested_stop|float) }}</dd></div>
+      <div><dt class="text-ink-500">Suggested qty</dt><dd>{{ signal.suggested_qty or "—" }}</dd></div>
+      {% if signal.rejected_reason %}
+        <div class="col-span-full"><dt class="text-ink-500">Rejection reason</dt><dd class="text-warn-600">{{ signal.rejected_reason }}</dd></div>
+      {% endif %}
+    </dl>
+    {% if signal.metadata %}
+      <details class="mt-4 text-xs">
+        <summary class="text-ink-500 cursor-pointer">Strategy metadata</summary>
+        <pre class="mt-2 bg-ink-100 p-2 rounded text-xs overflow-auto">{{ signal.metadata|tojson(indent=2) }}</pre>
+      </details>
+    {% endif %}
+  {% endcall %}
+
+  <div class="flex gap-3">
+    <a href="/signals/{{ signal.signal_id }}/base-rates"
+       class="inline-flex items-center px-4 py-2 rounded bg-ink-900 text-white text-sm">
+      📊 View base rates
+    </a>
+    <a href="/signals" class="inline-flex items-center px-4 py-2 rounded border border-ink-300 text-sm">
+      ← Back to signals
+    </a>
+  </div>
+</div>
+{% endif %}
+{% endblock %}

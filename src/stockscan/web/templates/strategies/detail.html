@@ -1,0 +1,40 @@
+{% extends "base.html" %}
+{% from "_macros.html" import card, badge, empty %}
+
+{% block title %}{{ strategy.display_name if strategy else "Strategy" }}{% endblock %}
+
+{% block content %}
+{% if not strategy %}
+  {{ empty("Strategy not found.", "❓") }}
+{% else %}
+<div class="space-y-4">
+  <div>
+    <h1 class="text-2xl font-semibold">{{ strategy.display_name }}</h1>
+    <p class="text-sm text-ink-500">{{ strategy.name }} v{{ strategy.version }}</p>
+  </div>
+
+  {% call card(title="Summary") %}
+    <p class="text-sm">{{ strategy.description }}</p>
+    <div class="flex flex-wrap gap-1 mt-3">
+      {% for tag in strategy.tags %}{{ badge(tag, "neutral") }}{% endfor %}
+    </div>
+    <p class="text-xs text-ink-500 mt-3">Default risk per trade: {{ "{:.2%}".format(strategy.default_risk_pct) }}</p>
+  {% endcall %}
+
+  {% if strategy.manual %}
+    {% call card(title="How this strategy works", subtitle="Beginner-friendly walkthrough") %}
+      <article class="max-w-none whitespace-pre-wrap leading-relaxed text-sm text-ink-900">{{ strategy.manual|md_lite }}</article>
+    {% endcall %}
+  {% endif %}
+
+  {% call card(title="Parameter schema",
+               subtitle="Editing in v1.5; for now, override defaults via strategy_configs SQL or in code") %}
+    <pre class="text-xs bg-ink-100 p-3 rounded overflow-auto">{{ schema|tojson(indent=2) }}</pre>
+  {% endcall %}
+
+  <a href="/strategies" class="inline-flex items-center px-4 py-2 rounded border border-ink-300 text-sm">
+    ← Back to strategies
+  </a>
+</div>
+{% endif %}
+{% endblock %}

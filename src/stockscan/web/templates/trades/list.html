@@ -1,0 +1,93 @@
+{% extends "base.html" %}
+{% from "_macros.html" import card, badge, empty %}
+
+{% block title %}Trades{% endblock %}
+
+{% block content %}
+<div class="space-y-6">
+
+  <form action="/trades/search" method="get"
+        class="flex gap-2 items-center">
+    <input type="search" name="q" placeholder="Search notes (Postgres FTS)…"
+           class="flex-1 px-4 py-2 rounded border border-ink-300 text-sm" minlength="2">
+    <button class="px-4 py-2 rounded bg-ink-900 text-white text-sm">Search</button>
+  </form>
+
+  {% call card(title="Open positions (" ~ open_trades|length ~ ")") %}
+    {% if open_trades %}
+      <ul class="divide-y divide-ink-300/40 -mx-4">
+        {% for t in open_trades %}
+          <li class="px-4 py-3 flex items-center justify-between">
+            <div>
+              <div class="font-mono font-semibold">{{ t.symbol }}</div>
+              <div class="text-xs text-ink-500">{{ t.strategy }} · opened {{ t.opened_at.date() }}</div>
+            </div>
+            <a href="/trades/{{ t.trade_id }}" class="text-xs underline">detail</a>
+          </li>
+        {% endfor %}
+      </ul>
+    {% else %}
+      {{ empty("No open positions.", "💼") }}
+    {% endif %}
+  {% endcall %}
+
+  {% call card(title="Closed trades (" ~ closed_trades|length ~ ")") %}
+    {% if closed_trades %}
+      {# Desktop table #}
+      <div class="hidden sm:block overflow-x-auto -mx-4">
+        <table class="w-full text-sm">
+          <thead class="text-xs uppercase text-ink-500 border-b border-ink-300/40">
+            <tr>
+              <th class="text-left px-4 py-2">Symbol</th>
+              <th class="text-left px-4 py-2">Strategy</th>
+              <th class="text-left px-4 py-2">Closed</th>
+              <th class="text-right px-4 py-2">Days</th>
+              <th class="text-right px-4 py-2">P&amp;L</th>
+              <th class="text-right px-4 py-2"></th>
+            </tr>
+          </thead>
+          <tbody class="divide-y divide-ink-300/40">
+            {% for t in closed_trades %}
+              <tr>
+                <td class="px-4 py-2 font-mono font-semibold">{{ t.symbol }}</td>
+                <td class="px-4 py-2 text-ink-700">{{ t.strategy }}</td>
+                <td class="px-4 py-2 text-xs text-ink-500">{{ t.closed_at.date() if t.closed_at else "—" }}</td>
+                <td class="px-4 py-2 text-right">{{ t.holding_days or "—" }}</td>
+                <td class="px-4 py-2 text-right font-mono
+                           {% if t.realized_pnl and t.realized_pnl > 0 %}text-ok-600{% elif t.realized_pnl and t.realized_pnl < 0 %}text-bad-600{% endif %}">
+                  {% if t.realized_pnl is not none %}${{ "%.2f"|format(t.realized_pnl|float) }}{% else %}—{% endif %}
+                </td>
+                <td class="px-4 py-2 text-right">
+                  <a href="/trades/{{ t.trade_id }}" class="text-xs underline">detail</a>
+                </td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+
+      {# Mobile cards #}
+      <ul class="sm:hidden divide-y divide-ink-300/40 -mx-4">
+        {% for t in closed_trades %}
+          <li class="px-4 py-3">
+            <div class="flex items-baseline justify-between">
+              <span class="font-mono font-semibold">{{ t.symbol }}</span>
+              <span class="font-mono text-sm
+                           {% if t.realized_pnl and t.realized_pnl > 0 %}text-ok-600{% elif t.realized_pnl and t.realized_pnl < 0 %}text-bad-600{% endif %}">
+                {% if t.realized_pnl is not none %}${{ "%.2f"|format(t.realized_pnl|float) }}{% else %}—{% endif %}
+              </span>
+            </div>
+            <div class="text-xs text-ink-500 mt-0.5">
+              {{ t.strategy }} · {{ t.holding_days or "?" }}d · closed {{ t.closed_at.date() if t.closed_at else "—" }}
+            </div>
+            <a href="/trades/{{ t.trade_id }}" class="inline-block mt-2 text-xs underline">detail</a>
+          </li>
+        {% endfor %}
+      </ul>
+    {% else %}
+      {{ empty("No closed trades yet.", "📭") }}
+    {% endif %}
+  {% endcall %}
+
+</div>
+{% endblock %}

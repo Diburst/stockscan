@@ -1,0 +1,205 @@
+{% extends "base.html" %}
+{% from "_macros.html" import card, badge, empty %}
+
+{% block title %}Watchlist{% endblock %}
+
+{% macro tech_score_badge(score) %}
+  {% if score is none %}
+    <span class="text-xs text-ink-500">—</span>
+  {% else %}
+    {% set s = score|float %}
+    {% set color = 'ok-600' if s > 0.05 else ('bad-600' if s < -0.05 else 'ink-500') %}
+    {% set bg = 'ok-100' if s > 0.05 else ('bad-100' if s < -0.05 else 'ink-100') %}
+    <span class="inline-flex items-center text-xs font-mono px-2 py-0.5 rounded
+                 bg-{{ bg }} text-{{ color }} border border-{{ color }}/30">
+      {{ "%+.2f"|format(s) }}
+    </span>
+  {% endif %}
+{% endmacro %}
+
+{% block content %}
+<div class="space-y-6">
+
+  {% if err %}
+    <div class="bg-bad-100 border border-bad-600/30 text-bad-600 px-4 py-3 rounded text-sm">
+      {{ err.replace('+', ' ') }}
+    </div>
+  {% endif %}
+
+  <!-- Add a symbol -->
+  {% call card(title="Add a symbol", subtitle="Type a ticker, optionally set a price target") %}
+    <form action="/watchlist/add" method="post"
+          class="flex flex-col sm:flex-row sm:items-end gap-2">
+      <div class="flex-1">
+        <label class="block text-xs text-ink-500 mb-1">Symbol</label>
+        <input name="symbol" required maxlength="10"
+               placeholder="AAPL"
+               class="w-full px-3 py-2 rounded border border-ink-300 text-sm font-mono uppercase"
+               style="text-transform: uppercase;">
+      </div>
+      <div class="flex-1 grid grid-cols-2 gap-2">
+        <div>
+          <label class="block text-xs text-ink-500 mb-1">Target price (optional)</label>
+          <input name="target_price" type="number" step="0.01" min="0"
+                 inputmode="decimal" placeholder="—"
+                 class="w-full px-3 py-2 rounded border border-ink-300 text-sm">
+        </div>
+        <div>
+          <label class="block text-xs text-ink-500 mb-1">Direction</label>
+          <select name="target_direction"
+                  class="w-full px-3 py-2 rounded border border-ink-300 text-sm">
+            <option value="">—</option>
+            <option value="above">above</option>
+            <option value="below">below</option>
+          </select>
+        </div>
+      </div>
+      <button class="px-4 py-2 rounded bg-ink-900 text-white text-sm h-fit">
+        Add
+      </button>
+    </form>
+  {% endcall %}
+
+  {% if not items %}
+    {{ empty("Your watchlist is empty.", "👀") }}
+  {% else %}
+    <!-- Desktop table -->
+    <div class="hidden sm:block bg-white rounded-xl shadow-sm border border-ink-300/40 overflow-x-auto">
+      <table class="w-full text-sm">
+        <thead class="text-xs uppercase text-ink-500 bg-ink-100 border-b border-ink-300/40">
+          <tr>
+            <th class="text-left px-4 py-2">Symbol</th>
+            <th class="text-right px-4 py-2">Last close</th>
+            <th class="text-right px-4 py-2">Δ</th>
+            <th class="text-right px-4 py-2">Volume</th>
+            <th class="text-center px-4 py-2" title="Direction-agnostic technical bias from RSI(14) + MACD. Positive = bullish recent action; negative = bearish.">Tech</th>
+            <th class="text-left px-4 py-2">Target</th>
+            <th class="text-left px-4 py-2">Alert</th>
+            <th class="px-4 py-2"></th>
+          </tr>
+        </thead>
+        <tbody class="divide-y divide-ink-300/40">
+          {% for w in items %}
+            <tr class="{% if w.target_satisfied %}bg-ok-100/40{% endif %}">
+              <td class="px-4 py-2 font-mono font-semibold align-middle whitespace-nowrap">
+                {{ w.symbol }}
+                {% if w.target_satisfied and w.alert_enabled %}
+                  {{ badge("target hit", "ok") }}
+                {% endif %}
+              </td>
+              <td class="px-4 py-2 text-right font-mono align-middle whitespace-nowrap">
+                {% if w.last_close is not none %}${{ "%.2f"|format(w.last_close|float) }}{% else %}—{% endif %}
+              </td>
+              <td class="px-4 py-2 text-right font-mono align-middle whitespace-nowrap
+                         {% if w.pct_change_today and w.pct_change_today > 0 %}text-ok-600{% elif w.pct_change_today and w.pct_change_today < 0 %}text-bad-600{% endif %}">
+                {% if w.pct_change_today is not none %}{{ "%+.2f%%"|format(w.pct_change_today * 100) }}{% else %}—{% endif %}
+              </td>
+              <td class="px-4 py-2 text-right font-mono text-xs text-ink-700 align-middle whitespace-nowrap">
+                {% if w.last_volume %}{{ "{:,}".format(w.last_volume) }}{% else %}—{% endif %}
+              </td>
+              <td class="px-4 py-2 text-center align-middle">
+                {{ tech_score_badge(tech_scores.get(w.symbol)) }}
+              </td>
+              <!-- Target editor -->
+              <td class="px-4 py-2 align-middle">
+                <form action="/watchlist/{{ w.watchlist_id }}/target" method="post"
+                      class="flex items-center gap-1">
+                  <select name="target_direction"
+                          class="px-2 py-1 rounded border border-ink-300 text-xs">
+                    <option value="">—</option>
+                    <option value="above" {% if w.target_direction == 'above' %}selected{% endif %}>above</option>
+                    <option value="below" {% if w.target_direction == 'below' %}selected{% endif %}>below</option>
+                  </select>
+                  <input name="target_price" type="number" step="0.01" min="0"
+                         inputmode="decimal"
+                         value="{{ '%.2f'|format(w.target_price|float) if w.target_price is not none else '' }}"
+                         placeholder="—"
+                         class="w-24 px-2 py-1 rounded border border-ink-300 text-xs font-mono">
+                  <button class="text-xs underline">save</button>
+                </form>
+              </td>
+              <!-- Alert toggle (no label text — checkbox alone) -->
+              <td class="px-4 py-2 align-middle text-center">
+                {% if w.target_price is not none %}
+                  <form action="/watchlist/{{ w.watchlist_id }}/toggle-alert" method="post">
+                    <input type="checkbox" name="enabled" value="on"
+                           {% if w.alert_enabled %}checked{% endif %}
+                           onchange="this.form.submit()"
+                           class="h-4 w-4 cursor-pointer"
+                           aria-label="alert enabled">
+                  </form>
+                {% else %}
+                  <span class="text-xs text-ink-500">—</span>
+                {% endif %}
+              </td>
+              <!-- Remove (no confirm popup) -->
+              <td class="px-4 py-2 text-right align-middle">
+                <form action="/watchlist/{{ w.watchlist_id }}/delete" method="post">
+                  <button class="text-ink-500 hover:text-bad-600 text-lg" aria-label="remove">×</button>
+                </form>
+              </td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+
+    <!-- Mobile cards -->
+    <ul class="sm:hidden space-y-2">
+      {% for w in items %}
+        <li class="bg-white rounded-xl shadow-sm border {% if w.target_satisfied %}border-ok-600/40 bg-ok-100/30{% else %}border-ink-300/40{% endif %} p-4">
+          <div class="flex items-baseline justify-between mb-1">
+            <div>
+              <span class="font-mono font-semibold text-base">{{ w.symbol }}</span>
+              {% if w.target_satisfied and w.alert_enabled %}{{ badge("hit", "ok") }}{% endif %}
+            </div>
+            <form action="/watchlist/{{ w.watchlist_id }}/delete" method="post">
+              <button class="text-ink-500 hover:text-bad-600 text-xl" aria-label="remove">×</button>
+            </form>
+          </div>
+          <div class="font-mono text-sm">
+            {% if w.last_close is not none %}${{ "%.2f"|format(w.last_close|float) }}{% else %}—{% endif %}
+            <span class="ml-2 {% if w.pct_change_today and w.pct_change_today > 0 %}text-ok-600{% elif w.pct_change_today and w.pct_change_today < 0 %}text-bad-600{% endif %}">
+              {% if w.pct_change_today is not none %}{{ "%+.2f%%"|format(w.pct_change_today * 100) }}{% endif %}
+            </span>
+          </div>
+          {% if w.last_volume %}
+            <div class="text-xs text-ink-500">vol {{ "{:,}".format(w.last_volume) }}</div>
+          {% endif %}
+          <div class="mt-1 text-xs flex items-center gap-2">
+            <span class="text-ink-500">tech</span>
+            {{ tech_score_badge(tech_scores.get(w.symbol)) }}
+          </div>
+
+          <form action="/watchlist/{{ w.watchlist_id }}/target" method="post"
+                class="mt-3 flex items-center gap-1">
+            <select name="target_direction"
+                    class="px-2 py-1.5 rounded border border-ink-300 text-xs flex-shrink-0">
+              <option value="">—</option>
+              <option value="above" {% if w.target_direction == 'above' %}selected{% endif %}>above</option>
+              <option value="below" {% if w.target_direction == 'below' %}selected{% endif %}>below</option>
+            </select>
+            <input name="target_price" type="number" step="0.01" min="0"
+                   inputmode="decimal"
+                   value="{{ '%.2f'|format(w.target_price|float) if w.target_price is not none else '' }}"
+                   placeholder="target"
+                   class="flex-1 px-2 py-1.5 rounded border border-ink-300 text-xs font-mono">
+            <button class="px-3 py-1.5 rounded bg-ink-900 text-white text-xs">save</button>
+          </form>
+
+          {% if w.target_price is not none %}
+            <form action="/watchlist/{{ w.watchlist_id }}/toggle-alert" method="post" class="mt-2">
+              <input type="checkbox" name="enabled" value="on"
+                     {% if w.alert_enabled %}checked{% endif %}
+                     onchange="this.form.submit()"
+                     class="h-4 w-4 cursor-pointer"
+                     aria-label="alert enabled">
+            </form>
+          {% endif %}
+        </li>
+      {% endfor %}
+    </ul>
+  {% endif %}
+
+</div>
+{% endblock %}

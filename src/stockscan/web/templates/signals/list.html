@@ -1,0 +1,134 @@
+{% extends "base.html" %}
+{% from "_macros.html" import card, badge, empty, pill_link %}
+
+{% block title %}Signals{% endblock %}
+
+{# Tech score badge: signed [-1, +1] rendered as a small bar with the
+   numeric value alongside. Green for positive (confirming), red for
+   negative (contradicting), grey for zero / null. #}
+{% macro tech_score_badge(score) %}
+  {% if score is none %}
+    <span class="text-xs text-ink-500">—</span>
+  {% else %}
+    {% set s = score|float %}
+    {% set color = 'ok-600' if s > 0.05 else ('bad-600' if s < -0.05 else 'ink-500') %}
+    {% set bg = 'ok-100' if s > 0.05 else ('bad-100' if s < -0.05 else 'ink-100') %}
+    <span class="inline-flex items-center gap-1.5 text-xs font-mono px-2 py-0.5 rounded
+                 bg-{{ bg }} text-{{ color }} border border-{{ color }}/30">
+      <span class="font-semibold">{{ "%+.2f"|format(s) }}</span>
+    </span>
+  {% endif %}
+{% endmacro %}
+
+{% block content %}
+<div class="space-y-6">
+
+  <!-- Strategy filter chips -->
+  <div class="flex flex-wrap items-center gap-2">
+    {{ pill_link("/signals?days=" ~ days, "All", active=(not active_strategy)) }}
+    {% for s in strategies %}
+      {{ pill_link(
+        "/signals?strategy=" ~ s.name ~ "&days=" ~ days,
+        s.display_name,
+        active=(active_strategy == s.name)
+      ) }}
+    {% endfor %}
+  </div>
+
+  <!-- Passing signals -->
+  {% call card(
+    title="Passing signals (" ~ passing|length ~ ")",
+    subtitle="Last " ~ days ~ " days · ranked by score"
+  ) %}
+    {% if passing %}
+      {# Desktop table #}
+      <div class="hidden sm:block overflow-x-auto -mx-4">
+        <table class="w-full text-sm">
+          <thead class="text-xs uppercase text-ink-500 border-b border-ink-300/40">
+            <tr>
+              <th class="text-left px-4 py-2">Symbol</th>
+              <th class="text-left px-4 py-2">Strategy</th>
+              <th class="text-right px-4 py-2">Score</th>
+              <th class="text-center px-4 py-2" title="Technical confirmation score: positive = technicals confirm the setup; negative = technicals contradict.">Tech</th>
+              <th class="text-right px-4 py-2">Entry</th>
+              <th class="text-right px-4 py-2">Stop</th>
+              <th class="text-right px-4 py-2">Qty</th>
+              <th class="text-left px-4 py-2">Date</th>
+              <th class="text-right px-4 py-2"></th>
+            </tr>
+          </thead>
+          <tbody class="divide-y divide-ink-300/40">
+            {% for sig in passing %}
+              <tr>
+                <td class="px-4 py-2 font-mono font-semibold">{{ sig.symbol }}</td>
+                <td class="px-4 py-2 text-ink-700">{{ sig.strategy_name }}</td>
+                <td class="px-4 py-2 text-right">{{ "%.2f"|format(sig.score|float) if sig.score else "—" }}</td>
+                <td class="px-4 py-2 text-center">{{ tech_score_badge(sig.tech_score) }}</td>
+                <td class="px-4 py-2 text-right font-mono">${{ "%.2f"|format(sig.suggested_entry|float) }}</td>
+                <td class="px-4 py-2 text-right font-mono text-bad-600">${{ "%.2f"|format(sig.suggested_stop|float) }}</td>
+                <td class="px-4 py-2 text-right">{{ sig.suggested_qty or "—" }}</td>
+                <td class="px-4 py-2 text-ink-500 text-xs">{{ sig.as_of_date }}</td>
+                <td class="px-4 py-2 text-right space-x-3">
+                  <a href="/signals/{{ sig.signal_id }}/base-rates" class="text-xs underline">base rates</a>
+                  <a href="/signals/{{ sig.signal_id }}" class="text-xs underline">detail</a>
+                </td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+
+      {# Mobile card list #}
+      <ul class="sm:hidden divide-y divide-ink-300/40 -mx-4">
+        {% for sig in passing %}
+          <li class="px-4 py-3">
+            <div class="flex items-baseline justify-between">
+              <span class="font-mono font-semibold text-base">{{ sig.symbol }}</span>
+              <span class="text-xs text-ink-500">{{ sig.as_of_date }}</span>
+            </div>
+            <div class="text-xs text-ink-700 mt-0.5 flex items-center gap-2">
+              <span>{{ sig.strategy_name }} · score {{ "%.2f"|format(sig.score|float) if sig.score else "—" }}</span>
+              <span>tech {{ tech_score_badge(sig.tech_score) }}</span>
+            </div>
+            <div class="text-xs mt-1 font-mono">
+              entry <span class="font-semibold">${{ "%.2f"|format(sig.suggested_entry|float) }}</span>
+              · stop <span class="text-bad-600">${{ "%.2f"|format(sig.suggested_stop|float) }}</span>
+              · qty {{ sig.suggested_qty or "—" }}
+            </div>
+            <div class="mt-2 flex gap-3">
+              <a href="/signals/{{ sig.signal_id }}/base-rates" class="text-xs underline">base rates</a>
+              <a href="/signals/{{ sig.signal_id }}" class="text-xs underline">detail</a>
+            </div>
+          </li>
+        {% endfor %}
+      </ul>
+    {% else %}
+      {{ empty("No passing signals in the last " ~ days ~ " days.", "🔍") }}
+    {% endif %}
+  {% endcall %}
+
+  <!-- Rejected signals -->
+  {% if show_rejected %}
+    {% call card(
+      title="Rejected signals (" ~ rejected|length ~ ")",
+      subtitle="Strategy fired but a portfolio filter blocked the trade"
+    ) %}
+      {% if rejected %}
+        <ul class="divide-y divide-ink-300/40 -mx-4">
+          {% for sig in rejected %}
+            <li class="px-4 py-3 flex flex-wrap items-baseline gap-x-3 gap-y-1">
+              <span class="font-mono font-semibold">{{ sig.symbol }}</span>
+              {{ badge(sig.rejected_reason or "rejected", "warn") }}
+              <span class="text-xs text-ink-500">{{ sig.strategy_name }} · {{ sig.as_of_date }}</span>
+              <a href="/signals/{{ sig.signal_id }}" class="ml-auto text-xs underline">detail</a>
+            </li>
+          {% endfor %}
+        </ul>
+      {% else %}
+        {{ empty("No rejected signals in this window.") }}
+      {% endif %}
+    {% endcall %}
+  {% endif %}
+
+</div>
+{% endblock %}

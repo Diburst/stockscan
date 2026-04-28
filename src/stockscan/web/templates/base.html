@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+  <meta name="theme-color" content="#0f172a">
+  <title>{% block title %}stockscan{% endblock %} · stockscan</title>
+
+  <!-- Tailwind via Play CDN. For prod we'd build a static bundle; fine for personal use. -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          colors: {
+            ink: { 900: '#0f172a', 800: '#1e293b', 700: '#334155',
+                   500: '#64748b', 300: '#cbd5e1', 100: '#f1f5f9' },
+            ok:  { 600: '#059669', 100: '#d1fae5' },
+            warn:{ 600: '#d97706', 100: '#fef3c7' },
+            bad: { 600: '#dc2626', 100: '#fee2e2' },
+          },
+          fontFamily: {
+            sans: ['system-ui', '-apple-system', 'Segoe UI', 'Roboto', 'sans-serif'],
+            mono: ['ui-monospace', 'SFMono-Regular', 'Menlo', 'monospace'],
+          },
+        },
+      },
+    };
+  </script>
+  <script src="https://unpkg.com/htmx.org@1.9.10"
+          integrity="sha384-D1Kt99CQMDuVetoL1lrYwg5t+9QdHe7NLX/SoJYkXDFfX37iInKRy5xLSi8nO7UC"
+          crossorigin="anonymous"></script>
+
+  <style>
+    /* Tap targets ≥44px on touch devices (Apple HIG). */
+    @media (hover: none) {
+      a, button, [role="button"], summary { min-height: 44px; }
+    }
+  </style>
+
+  {% block head_extra %}{% endblock %}
+</head>
+<body class="bg-ink-100 text-ink-900 font-sans antialiased min-h-screen">
+  <header class="bg-ink-900 text-white sticky top-0 z-30 shadow">
+    <div class="max-w-6xl mx-auto px-4 py-3 flex items-center justify-between">
+      <a href="/" class="font-semibold text-lg flex items-center gap-2">
+        <span class="text-2xl leading-none">📈</span>
+        <span>stockscan</span>
+      </a>
+
+      <!-- Desktop nav -->
+      <nav class="hidden sm:flex items-center gap-1 text-sm">
+        {% set nav_items = [
+          ('/', 'Dashboard'),
+          ('/signals', 'Signals'),
+          ('/watchlist', 'Watchlist'),
+          ('/trades', 'Trades'),
+          ('/backtests', 'Backtests'),
+          ('/strategies', 'Strategies'),
+        ] %}
+        {% for href, label in nav_items %}
+          <a href="{{ href }}"
+             class="px-3 py-2 rounded hover:bg-ink-800 {% if request.url.path == href or (href != '/' and request.url.path.startswith(href)) %}bg-ink-800{% endif %}">
+            {{ label }}
+          </a>
+        {% endfor %}
+      </nav>
+
+      <!-- Mobile menu toggle -->
+      <button class="sm:hidden p-2 -mr-2" aria-label="Open menu"
+              onclick="document.getElementById('mobile-nav').classList.toggle('hidden')">
+        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <line x1="4" y1="6" x2="20" y2="6"/>
+          <line x1="4" y1="12" x2="20" y2="12"/>
+          <line x1="4" y1="18" x2="20" y2="18"/>
+        </svg>
+      </button>
+    </div>
+
+    <!-- Mobile nav (hidden by default; shown by hamburger) -->
+    <nav id="mobile-nav" class="sm:hidden hidden border-t border-ink-800">
+      <div class="max-w-6xl mx-auto px-2 py-2 flex flex-col">
+        {% for href, label in nav_items %}
+          <a href="{{ href }}"
+             class="px-4 py-3 rounded hover:bg-ink-800 {% if request.url.path == href or (href != '/' and request.url.path.startswith(href)) %}bg-ink-800{% endif %}">
+            {{ label }}
+          </a>
+        {% endfor %}
+      </div>
+    </nav>
+  </header>
+
+  <main class="max-w-6xl mx-auto px-4 py-6">
+    {% block content %}{% endblock %}
+  </main>
+
+  <footer class="max-w-6xl mx-auto px-4 py-6 text-xs text-ink-500">
+    <div class="flex justify-between items-center">
+      <span>stockscan {{ app_version }}</span>
+      <span>{{ request.url.path }}</span>
+    </div>
+  </footer>
+
+  {% block scripts %}{% endblock %}
+</body>
+</html>

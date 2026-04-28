@@ -1,0 +1,97 @@
+{% extends "base.html" %}
+{% from "_macros.html" import card, badge, empty, stat %}
+
+{% block title %}Base rates{% endblock %}
+
+{% block content %}
+{% if not signal %}
+  {{ empty("Signal not found.", "❓") }}
+{% else %}
+<div class="space-y-6">
+  <div>
+    <h1 class="text-2xl font-semibold">
+      Base rates · <span class="font-mono">{{ signal.symbol }}</span>
+    </h1>
+    <p class="text-sm text-ink-500">
+      {{ signal.strategy_name }} v{{ signal.strategy_version }} · setup as of {{ signal.as_of_date }}
+    </p>
+  </div>
+
+  {% if error %}
+    <div class="bg-bad-100 border border-bad-600/30 text-bad-600 px-4 py-3 rounded">
+      Could not compute base rates: {{ error }}
+    </div>
+  {% elif report and report.n_setups > 0 %}
+    {% if report.sample_size_warning %}
+      <div class="bg-warn-100 border border-warn-600/30 text-warn-600 px-4 py-3 rounded text-sm">
+        ⚠ Sample size {{ report.n_setups }} is below 50 — treat as directional, not gospel.
+      </div>
+    {% endif %}
+
+    <div class="grid grid-cols-2 sm:grid-cols-3 gap-4">
+      <div class="bg-white rounded-xl shadow-sm border border-ink-300/40 p-4">
+        {{ stat("Setups", report.n_setups, sub="historical instances") }}
+      </div>
+      <div class="bg-white rounded-xl shadow-sm border border-ink-300/40 p-4">
+        {{ stat("Win rate", "{:.1%}".format(report.win_rate),
+                kind=("ok" if report.win_rate > 0.5 else "warn")) }}
+      </div>
+      <div class="bg-white rounded-xl shadow-sm border border-ink-300/40 p-4">
+        {{ stat("Expectancy", "{:.2%}".format(report.expectancy_pct),
+                sub="per trade",
+                kind=("ok" if report.expectancy_pct > 0 else "bad")) }}
+      </div>
+      <div class="bg-white rounded-xl shadow-sm border border-ink-300/40 p-4">
+        {{ stat("Avg win", "{:.2%}".format(report.avg_win_pct), kind="ok") }}
+      </div>
+      <div class="bg-white rounded-xl shadow-sm border border-ink-300/40 p-4">
+        {{ stat("Avg loss", "{:.2%}".format(report.avg_loss_pct), kind="bad") }}
+      </div>
+      <div class="bg-white rounded-xl shadow-sm border border-ink-300/40 p-4">
+        {{ stat("Profit factor", "{:.2f}".format(report.profit_factor)) }}
+      </div>
+      <div class="bg-white rounded-xl shadow-sm border border-ink-300/40 p-4">
+        {{ stat("Avg hold", "{:.1f}d".format(report.avg_holding_days)) }}
+      </div>
+    </div>
+
+    <!-- Distribution histogram (simple bar chart in HTML) -->
+    {% if report.return_distribution %}
+      {% call card(title="Return distribution") %}
+        {% set rets = report.return_distribution %}
+        {% set bins = namespace(neg5=0, neg3=0, neg1=0, flat=0, pos1=0, pos3=0, pos5=0, big=0) %}
+        {% for r in rets %}
+          {% if r < -0.05 %}{% set _ = bins.update({"neg5": bins.neg5 + 1}) %}
+          {% elif r < -0.03 %}{% set _ = bins.update({"neg3": bins.neg3 + 1}) %}
+          {% elif r < -0.01 %}{% set _ = bins.update({"neg1": bins.neg1 + 1}) %}
+          {% elif r < 0.01 %}{% set _ = bins.update({"flat": bins.flat + 1}) %}
+          {% elif r < 0.03 %}{% set _ = bins.update({"pos1": bins.pos1 + 1}) %}
+          {% elif r < 0.05 %}{% set _ = bins.update({"pos3": bins.pos3 + 1}) %}
+          {% elif r < 0.10 %}{% set _ = bins.update({"pos5": bins.pos5 + 1}) %}
+          {% else %}{% set _ = bins.update({"big": bins.big + 1}) %}{% endif %}
+        {% endfor %}
+        {% set max_count = [bins.neg5, bins.neg3, bins.neg1, bins.flat, bins.pos1, bins.pos3, bins.pos5, bins.big]|max or 1 %}
+        <div class="grid grid-cols-8 gap-1 items-end h-32">
+          {% for label, count in [("<-5%", bins.neg5), ("-5..-3%", bins.neg3), ("-3..-1%", bins.neg1),
+                                  ("flat", bins.flat), ("+1..+3%", bins.pos1), ("+3..+5%", bins.pos3),
+                                  ("+5..+10%", bins.pos5), (">+10%", bins.big)] %}
+            <div class="flex flex-col items-center justify-end h-full">
+              <div class="w-full {{ 'bg-bad-600' if loop.index < 4 else ('bg-ink-500' if loop.index == 4 else 'bg-ok-600') }} rounded-t"
+                   style="height: {{ (count / max_count * 100)|round }}%; min-height: {% if count %}3px{% else %}0{% endif %}"></div>
+              <span class="text-[10px] text-ink-500 mt-1">{{ label }}</span>
+              <span class="text-[10px] font-mono">{{ count }}</span>
+            </div>
+          {% endfor %}
+        </div>
+      {% endcall %}
+    {% endif %}
+  {% else %}
+    {{ empty("Strategy never fired on this symbol in the historical window.", "🤷") }}
+  {% endif %}
+
+  <a href="/signals/{{ signal.signal_id }}" class="inline-flex items-center px-4 py-2 rounded border border-ink-300 text-sm">
+    ← Back to signal
+  </a>
+</div>
+{% endif %}
+{% endblock %}
