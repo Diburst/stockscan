@@ -1,8 +1,20 @@
 # Personal Stock Trading App — Design Document
 
 **Author:** Thomas
-**Status:** Draft v0.7 — Phases 0–3 implemented, watchlist + tech score + fundamentals layer + 3rd strategy added
-**Date:** 2026-04-27
+**Status:** Draft v0.8 — Phases 0–3 implemented, regime detection upgraded to a soft-sizing composite
+**Date:** 2026-04-29
+
+> **v0.8 changes** (regime detection v2 — composite + soft sizing; migration 0010):
+> - **Composite regime score** replaces the v1 ADX/SMA-only label as the primary regime output. Four components in [0, 1] (1 = healthy/calm), weighted per the research synthesis: **vol 0.40 / trend 0.25 / breadth 0.20 / credit 0.15**. The discrete `trending_up / trending_down / choppy / transitioning` label is preserved for the dashboard banner and back-compat, but it no longer drives sizing.
+> - **No look-ahead is the load-bearing invariant.** Every percentile, z-score, and slope uses *trailing* rolling windows (default 252 trading days). `tests/test_regime_composite.py` enforces this with truncation-invariance property tests on each windowed function plus an end-to-end pipeline test.
+> - **VIX-aware vol score** via EODHD's `.INDX` exchange path (`get_bars("VIX", ..., exchange="INDX")`). VIX OHLC is stored in the existing `bars` hypertable. `vol_score = 1 - rolling_pct_rank(VIX, 252)`.
+> - **HY OAS credit-stress signal** via FRED (series `BAMLH0A0HYM2`). New `FredProvider` mirrors `EODHDProvider`'s retry/transport pattern; new `macro_series` table holds level-only daily series. Two outputs: a smooth `credit_score = 1 - rolling_pct_rank(HY OAS, 252)` and a discrete `credit_stress_flag` (rank > 0.85 AND rising over 5 days) — the latter is wired as a tail-risk circuit breaker (0.5x size, block new long entries).
+> - **Soft sizing replaces the hard regime gate.** `Strategy.applicable_regimes` is deprecated; strategies declare `regime_affinity: dict[label, weight in [0,1]]` instead. The scanner runner computes `effective_qty = round(base_qty * affinity * (0.5 + 0.5*composite) * stress_mult)` per signal. The runner's `_check_regime` skip-path is gone; `_resolve_regime_factor` returns a `RegimeFactor` dataclass instead. A back-compat shim in `Strategy.__init_subclass__` auto-derives `regime_affinity` from any legacy `applicable_regimes` declaration (in-set → 1.0, out → 0.0) and emits a `DeprecationWarning`. The three shipped strategies were migrated to declare `regime_affinity` directly.
+> - **Schema**: migration 0010 adds `macro_series` + 13 new columns on `market_regime` (composite + 4 components + VIX/HY OAS levels and ranks/z + `credit_stress_flag` + `methodology_version`). All v2 score columns are NULLABLE so partial rows persist when a data source is degraded.
+> - **Graceful degradation per source**: if VIX bars are missing, `vol_score` is NULL and the composite renormalizes weights over the remaining 3 components. Same for RSP (breadth) and HY OAS (credit). The composite is NULL only when every component is missing. Tests cover each missing-source path individually in `tests/test_regime_detect_v2.py`.
+> - **Dashboard banner** redesigned: composite score with a coloured bar, four per-component bars (vol/trend/breadth/credit), underlying levels (VIX, HY OAS rank + z), credit-stress badge when fired, and a per-strategy effective-sizing table (`affinity × composite × stress = effective`). Mobile-responsive layout preserved (banner stacks vertically below the sm breakpoint).
+> - **Cache discipline**: `detect_regime` returns cached v2 rows (`methodology_version >= 2`) as-is; v1 cached rows get re-detected on first call so the composite columns can backfill. `force_recompute=True` bypasses the cache for backtest replay.
+> - **Skipped per the research doc** (deferred, *not* a v0.8 limitation): HMMs (Tier 2 in the research doc), BOCPD/PELT change-point detection, regime-switching GARCH, ML/deep-learning regime classifiers, multi-state HMMs, and trader-blog indicators (Aroon, Vortex, Choppiness, Fisher, MESA).
 
 > **v0.7 changes** (post-implementation reality check, reflecting what shipped):
 > - **Watchlist** (§4.13): manually-tracked symbols with optional `(target_price, target_direction)` alerts. Auto-disable on fire to prevent re-spam. Discord/email via the nightly hook. UI on `/watchlist` + Dashboard "+ Watch" quick-adds (HTMX in-place swap, no page reload).

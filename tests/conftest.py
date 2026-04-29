@@ -15,6 +15,7 @@ import pytest
 os.environ.setdefault("STOCKSCAN_ENV", "test")
 os.environ.setdefault("DATABASE_URL", "postgresql+psycopg://stockscan:test@127.0.0.1:5432/stockscan_test")
 os.environ.setdefault("EODHD_API_KEY", "")  # forces stub provider in tests
+os.environ.setdefault("FRED_API_KEY", "")   # FredProvider missing-key path
 
 
 # Populate the strategy registry once at collection time so the autouse fixture

@@ -6,6 +6,7 @@ Phase 0 commands:
   stockscan db status                 — current schema revision
   stockscan refresh universe          — pull S&P 500 membership from EODHD
   stockscan refresh bars [SYMBOL...]  — backfill bars
+  stockscan refresh macro [SERIES...] — backfill FRED macro series (HY OAS)
   stockscan strategies list           — print registered strategies
   stockscan strategies show NAME      — print strategy metadata + params schema
 
@@ -102,7 +103,9 @@ def health() -> None:
     )
     table.add_row(
         "TimescaleDB",
-        "[green]ok[/green]" if db.get("timescaledb") not in (None, "(missing)") else "[red]missing[/red]",
+        "[green]ok[/green]"
+        if db.get("timescaledb") not in (None, "(missing)")
+        else "[red]missing[/red]",
         str(db.get("timescaledb", "")),
     )
     table.add_row(
@@ -112,7 +115,9 @@ def health() -> None:
     )
     table.add_row(
         "EODHD key",
-        "[green]set[/green]" if settings.eodhd_api_key.get_secret_value() else "[yellow]not set[/yellow]",
+        "[green]set[/green]"
+        if settings.eodhd_api_key.get_secret_value()
+        else "[yellow]not set[/yellow]",
         "",
     )
     console.print(table)
@@ -196,11 +201,10 @@ def refresh_universe_cmd() -> None:
 
 @refresh_app.command("fundamentals")
 def refresh_fundamentals_cmd(
-    symbols: list[str] = typer.Argument(
-        None, help="Symbols to refresh; default = current S&P 500"
-    ),
+    symbols: list[str] = typer.Argument(None, help="Symbols to refresh; default = current S&P 500"),
     current_only: bool = typer.Option(
-        False, "--current-only",
+        False,
+        "--current-only",
         help="Restrict to current S&P 500 (skips ex-members)",
     ),
 ) -> None:
@@ -219,7 +223,9 @@ def refresh_fundamentals_cmd(
             )
             raise typer.Exit(1)
         scope = "current S&P 500" if current_only else "all ever-members of S&P 500"
-        console.print(f"[cyan]→[/cyan] refreshing fundamentals for {len(symbols)} symbols ({scope})")
+        console.print(
+            f"[cyan]→[/cyan] refreshing fundamentals for {len(symbols)} symbols ({scope})"
+        )
     else:
         console.print(f"[cyan]→[/cyan] refreshing fundamentals for {len(symbols)} symbols")
 
@@ -228,9 +234,7 @@ def refresh_fundamentals_cmd(
     ok = sum(1 for v in results.values() if v == "ok")
     missing = sum(1 for v in results.values() if v == "missing")
     failed = sum(1 for v in results.values() if v == "error")
-    console.print(
-        f"[green]✓[/green] {ok:,} fetched · {missing:,} missing · {failed:,} failed"
-    )
+    console.print(f"[green]✓[/green] {ok:,} fetched · {missing:,} missing · {failed:,} failed")
 
 
 @refresh_app.command("daily")
@@ -253,6 +257,7 @@ def refresh_daily_cmd(
     API calls when refreshing a single day.
     """
     from datetime import date as _date
+
     from stockscan.data.backfill import refresh_recent_days_bulk, trading_days_since
 
     target_days = trading_days_since(_date.today() - typedelta_days(days), _date.today())
@@ -266,9 +271,7 @@ def refresh_daily_cmd(
     else:
         filter_to = set(all_known_symbols())
     if not filter_to:
-        console.print(
-            "[yellow]Universe is empty. Run `stockscan refresh universe` first.[/yellow]"
-        )
+        console.print("[yellow]Universe is empty. Run `stockscan refresh universe` first.[/yellow]")
         raise typer.Exit(1)
 
     console.print(
@@ -283,20 +286,26 @@ def refresh_daily_cmd(
 def typedelta_days(n: int):
     """tiny helper so the CLI doesn't need to import timedelta."""
     from datetime import timedelta
+
     return timedelta(days=n)
 
 
 @refresh_app.command("bars")
 def refresh_bars_cmd(
-    symbols: list[str] = typer.Argument(None, help="Symbols to refresh; default = ALL members ever"),
-    start: str = typer.Option(
-        "2007-01-01", "--start", help="ISO date for initial backfill"
+    symbols: list[str] = typer.Argument(
+        None, help="Symbols to refresh; default = ALL members ever"
     ),
+    start: str = typer.Option("2007-01-01", "--start", help="ISO date for initial backfill"),
     end: str | None = typer.Option(None, "--end", help="ISO date; default = today"),
     current_only: bool = typer.Option(
         False,
         "--current-only",
         help="Only fetch current S&P 500 (skips ~700 historical-only members; faster but reintroduces survivorship bias for old backtests)",
+    ),
+    exchange: str = typer.Option(
+        "US",
+        "--exchange",
+        help="EODHD exchange suffix (e.g., 'US' for equities, 'INDX' for cash indices like VIX)",
     ),
 ) -> None:
     """Backfill / incrementally update bars.
@@ -304,6 +313,9 @@ def refresh_bars_cmd(
     Default behavior fetches bars for **every symbol ever in the S&P 500**,
     so backtests of historical periods have data for companies that have
     since been removed (survivorship-bias correction).
+
+    Use ``--exchange INDX`` for cash indices like VIX:
+        stockscan refresh bars VIX --exchange INDX
     """
     start_d = date.fromisoformat(start)
     end_d = date.fromisoformat(end) if end else date.today()
@@ -316,16 +328,87 @@ def refresh_bars_cmd(
             raise typer.Exit(1)
         scope = "current S&P 500" if current_only else "all ever-members of S&P 500"
         console.print(
-            f"[cyan]→[/cyan] backfilling {len(symbols)} symbols ({scope}) from {start_d} to {end_d}"
+            f"[cyan]→[/cyan] backfilling {len(symbols)} symbols ({scope}) "
+            f"from {start_d} to {end_d} (exchange={exchange})"
         )
     with _provider_ctx() as p:
-        results = backfill_universe(p, symbols, start=start_d, end=end_d)
+        results = backfill_universe(p, symbols, start=start_d, end=end_d, exchange=exchange)
     upserts = sum(v for v in results.values() if v >= 0)
     failed = sum(1 for v in results.values() if v < 0)
     console.print(
         f"[green]✓[/green] {upserts:,} bars upserted across {len(results)} symbols "
         f"({failed} failed)"
     )
+
+
+@refresh_app.command("macro")
+def refresh_macro_cmd(
+    series: list[str] = typer.Argument(
+        None,
+        help="FRED series codes to refresh; default = ['BAMLH0A0HYM2'] (HY OAS)",
+    ),
+    start: str = typer.Option(
+        "2007-01-01",
+        "--start",
+        help="ISO date for initial backfill",
+    ),
+    end: str | None = typer.Option(
+        None,
+        "--end",
+        help="ISO date; default = today",
+    ),
+) -> None:
+    """Pull macro time series from FRED into the ``macro_series`` table.
+
+    Default series is ``BAMLH0A0HYM2`` (ICE BofA US High Yield OAS) — the
+    credit component of the v2 regime composite. The detector needs at
+    least 252 trailing observations (~1 year) to compute the percentile
+    rank, so the default 2007-01-01 start gives ample warmup history.
+
+    Examples:
+        stockscan refresh macro                       # HY OAS, 2007-today
+        stockscan refresh macro BAMLH0A0HYM2 BAMLC0A0CMEY  # HY + IG OAS
+        stockscan refresh macro --start 2020-01-01    # shorter window
+    """
+    from stockscan.data.macro_store import upsert_macro_series
+    from stockscan.data.providers.fred import FredError, FredProvider
+
+    if not series:
+        series = ["BAMLH0A0HYM2"]
+
+    start_d = date.fromisoformat(start)
+    end_d = date.fromisoformat(end) if end else date.today()
+
+    fred_key = settings.fred_api_key.get_secret_value()
+    if not fred_key:
+        console.print(
+            "[red]✗[/red] FRED_API_KEY is not set. Get a free key from "
+            "https://fred.stlouisfed.org/docs/api/api_key.html and add "
+            "FRED_API_KEY=... to your .env."
+        )
+        raise typer.Exit(1)
+
+    console.print(
+        f"[cyan]→[/cyan] refreshing {len(series)} series from FRED ({start_d} to {end_d})"
+    )
+
+    total = 0
+    failed: list[str] = []
+    with FredProvider(api_key=fred_key) as p:
+        for code in series:
+            try:
+                rows = p.get_macro_series(code, start_d, end_d)
+            except FredError as exc:
+                console.print(f"  [red]✗[/red] {code}: {exc}")
+                failed.append(code)
+                continue
+            n = upsert_macro_series(rows)
+            console.print(f"  [green]✓[/green] {code}: {n:,} observations")
+            total += n
+
+    if failed:
+        console.print(f"[yellow]{len(failed)} series failed: {', '.join(failed)}[/yellow]")
+    console.print(f"[green]✓[/green] {total:,} total observations upserted")
 
 
 # ----------------------------------------------------------------------
@@ -336,8 +419,10 @@ def strategies_list() -> None:
     """List registered strategies."""
     discover_strategies()
     if not STRATEGY_REGISTRY:
-        console.print("[yellow]No strategies registered.[/yellow] "
-                      "(Drop a file in src/stockscan/strategies/ that subclasses Strategy.)")
+        console.print(
+            "[yellow]No strategies registered.[/yellow] "
+            "(Drop a file in src/stockscan/strategies/ that subclasses Strategy.)"
+        )
         return
     table = Table(title="Registered strategies")
     table.add_column("Name")
@@ -406,7 +491,9 @@ def _backfill_tech_scores(
     """Shared work for backfill / recompute. Returns (succeeded, skipped, failed)."""
     from datetime import date as _date
     from datetime import timedelta as _td
+
     from sqlalchemy import text
+
     from stockscan.data.store import get_bars
     from stockscan.db import session_scope
     from stockscan.technical import compute_technical_score, upsert_score
@@ -449,7 +536,7 @@ def _backfill_tech_scores(
     console.print(f"[cyan]→[/cyan] processing {len(rows):,} signal(s)")
 
     # Group rows by symbol so we load bars once per symbol per range.
-    bars_cache: dict[str, "pd.DataFrame"] = {}  # type: ignore[name-defined]
+    bars_cache: dict[str, pd.DataFrame] = {}  # type: ignore[name-defined]
 
     for i, row in enumerate(rows, 1):
         if i % 200 == 0:
@@ -460,7 +547,8 @@ def _backfill_tech_scores(
             skipped += 1
             log.debug(
                 "tech-backfill: skipping signal %s — strategy %s not registered",
-                row.signal_id, row.strategy_name,
+                row.signal_id,
+                row.strategy_name,
             )
             continue
         try:
@@ -484,7 +572,7 @@ def _backfill_tech_scores(
                 continue
             upsert_score(row.symbol, row.as_of_date, row.strategy_name, score)
             succeeded += 1
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             failed += 1
             log.error("tech-backfill failed for signal %s: %s", row.signal_id, exc)
 
@@ -568,11 +656,13 @@ def watchlist_list_cmd() -> None:
         vol = f"{w.last_volume:,}" if w.last_volume else "—"
         target = (
             f"{w.target_direction} ${float(w.target_price):.2f}"
-            if w.target_price is not None else "—"
+            if w.target_price is not None
+            else "—"
         )
         alert = (
             ("[green]armed[/green]" if w.alert_enabled else "[yellow]off[/yellow]")
-            if w.target_price is not None else "—"
+            if w.target_price is not None
+            else "—"
         )
         if w.target_satisfied and w.alert_enabled:
             alert = "[bold red]TRIGGERED[/bold red]"
@@ -584,13 +674,12 @@ def watchlist_list_cmd() -> None:
 def watchlist_add_cmd(
     symbol: str,
     target: float | None = typer.Option(None, "--target", help="Price target"),
-    direction: str | None = typer.Option(
-        None, "--direction", help="'above' or 'below'"
-    ),
+    direction: str | None = typer.Option(None, "--direction", help="'above' or 'below'"),
     note: str | None = typer.Option(None, "--note"),
 ) -> None:
     """Add a symbol to the watchlist."""
     from decimal import Decimal as _Dec
+
     from stockscan.watchlist import add_to_watchlist
 
     if (target is None) != (direction is None):
@@ -634,6 +723,7 @@ def jobs_nightly_scan(
 ) -> None:
     """Bulk-refresh recent bars, run every strategy, send a summary."""
     from datetime import date as _date
+
     from stockscan.jobs import run_nightly_scan
 
     as_of_d = _date.fromisoformat(as_of) if as_of else _date.today()
@@ -667,6 +757,7 @@ def scan_run(
 ) -> None:
     """Run a strategy (or all strategies) and persist signals to the DB."""
     from datetime import date as _date
+
     from stockscan.scan import ScanRunner
 
     discover_strategies()
@@ -691,7 +782,7 @@ def scan_run(
                 f"[yellow]{summary.rejected_count}[/yellow]",
                 str(summary.run_id),
             )
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             table.add_row(name, "—", "—", "—", f"[red]error: {exc}[/red]")
     console.print(table)
 
@@ -774,9 +865,10 @@ def backtest_run(
     if save:
         try:
             from stockscan.backtest.store import save_run
+
             run_id = save_run(result, note=note)
             console.print(f"[green]✓[/green] saved as backtest run #{run_id}")
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             console.print(f"[yellow]⚠[/yellow] could not persist results: {exc}")
 
 
@@ -787,6 +879,7 @@ def backtest_list(
 ) -> None:
     """List recent backtest runs from the database."""
     from stockscan.backtest.store import list_runs
+
     runs = list_runs(strategy_name=strategy, limit=limit)
     if not runs:
         console.print("[yellow]No backtest runs found.[/yellow]")
@@ -810,8 +903,8 @@ def backtest_list(
 # ----------------------------------------------------------------------
 # Provider context manager (handles cleanup)
 # ----------------------------------------------------------------------
-from contextlib import contextmanager
 from collections.abc import Iterator
+from contextlib import contextmanager
 
 
 @contextmanager

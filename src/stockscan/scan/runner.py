@@ -51,15 +51,50 @@ log = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
+class RegimeFactor:
+    """Soft-sizing inputs derived from the current market regime.
+
+    Replaces the v1 ``regime_skipped`` hard gate. Computed once per scan
+    invocation and applied to every signal's base qty:
+
+        final_qty = round(base_qty * multiplier)
+
+    ``multiplier`` is the product of three terms:
+      * The strategy's affinity for the current discrete regime label.
+      * The composite-score health multiplier (``0.5 + 0.5 * composite``,
+        per the research doc's conservative recommendation — never zeros
+        out exposure entirely on the composite alone).
+      * A 0.5x credit-stress override (research doc §Tier 0(b)) when the
+        circuit-breaker fires.
+
+    ``block_new_longs`` short-circuits long entries under credit stress
+    regardless of the multiplier — sized-down longs would still bleed in
+    a rolling drawdown.
+    """
+
+    multiplier: float
+    label: str | None  # None when regime data unavailable
+    composite_score: float | None
+    credit_stress_flag: bool
+    block_new_longs: bool
+
+
+@dataclass(frozen=True, slots=True)
 class ScanSummary:
-    run_id: int             # -1 when regime_skipped=True (no DB record created)
+    run_id: int  # always >= 0 under soft sizing; -1 only on hard data outage
     strategy_name: str
     strategy_version: str
     as_of_date: date
     universe_size: int
     signals_emitted: int
     rejected_count: int
-    regime_skipped: bool = False  # True when strategy was suppressed by regime filter
+    # Kept for back-compat with v1 dashboards. With soft sizing nothing
+    # is skipped on regime grounds, so the field stays but always reports
+    # False — callers that surface it should migrate to ``regime_multiplier``.
+    regime_skipped: bool = False
+    # Effective regime multiplier applied to base sizing (1.0 = neutral,
+    # 0.0 = no exposure on regime grounds).
+    regime_multiplier: float = 1.0
 
 
 class ScanRunner:
@@ -98,19 +133,23 @@ class ScanRunner:
         config_id, params = self._ensure_strategy_config(s, strategy_cls)
         strategy = strategy_cls(params)
 
-        # 1b. Regime gate: skip this strategy if the current market regime is
-        #     not in its applicable_regimes set (empty = all regimes pass).
-        if strategy_cls.applicable_regimes:
-            regime_skip = self._check_regime(s, strategy_cls, as_of)
-            if regime_skip:
-                return regime_skip
+        # 1b. Resolve the regime soft-sizing multiplier. Replaces the v1
+        #     hard gate: instead of skipping the strategy when the regime
+        #     doesn't match, we compute a multiplier (0.0..1.0+) that scales
+        #     each signal's base qty. ``block_new_longs`` short-circuits
+        #     long entries when credit stress fires.
+        regime_factor = self._resolve_regime_factor(s, strategy_cls, as_of)
 
         # 2. Resolve universe.
         if symbols is None:
             symbols = members_as_of(as_of, session=s) or current_constituents(session=s)
         log.info(
-            "scanning %s v%s on %d symbols as of %s",
-            strategy_cls.name, strategy_cls.version, len(symbols), as_of,
+            "scanning %s v%s on %d symbols as of %s (regime mult=%.3f)",
+            strategy_cls.name,
+            strategy_cls.version,
+            len(symbols),
+            as_of,
+            regime_factor.multiplier,
         )
 
         # 3. Build portfolio context (positions, equity, earnings).
@@ -132,7 +171,7 @@ class ScanRunner:
         for symbol in symbols:
             try:
                 bars = get_bars(symbol, as_of.replace(year=as_of.year - 5), as_of, session=s)
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 log.debug("skip %s — bars query failed: %s", symbol, exc)
                 continue
             if bars.empty or len(bars) < strategy.required_history():
@@ -142,9 +181,22 @@ class ScanRunner:
             bars_cache[symbol] = bars
             raw_sigs = strategy.signals(bars, as_of)
             for sig in raw_sigs:
-                qty = self._size(sig)
-                if qty <= 0:
+                base_qty = self._size(sig)
+                if base_qty <= 0:
                     rejected.append((sig, 0, "qty_zero"))
+                    continue
+
+                # Credit-stress override: hard-block new long entries
+                # regardless of the multiplier (research doc §Tier 0(b)).
+                if regime_factor.block_new_longs and sig.side == "long":
+                    rejected.append((sig, base_qty, "credit_stress_long_block"))
+                    continue
+
+                # Soft sizing: scale base qty by the regime multiplier.
+                # round() with one arg already returns int in Py3.
+                qty = max(0, round(base_qty * regime_factor.multiplier))
+                if qty <= 0:
+                    rejected.append((sig, 0, "regime_zero_size"))
                     continue
                 result = chain.evaluate(sig, qty, ctx)
                 if result.passed:
@@ -154,14 +206,21 @@ class ScanRunner:
 
         # 5. Persist signals, then technical scores for each.
         run_id = self._persist_run(
-            s, strategy_cls, config_id, as_of,
-            len(symbols), len(passing), len(rejected),
+            s,
+            strategy_cls,
+            config_id,
+            as_of,
+            len(symbols),
+            len(passing),
+            len(rejected),
         )
         for sig, qty in passing:
             self._persist_signal(s, run_id, strategy_cls, config_id, as_of, sig, qty, "new", None)
             self._persist_tech_score(s, strategy_cls, sig.symbol, as_of, bars_cache.get(sig.symbol))
         for sig, qty, reason in rejected:
-            self._persist_signal(s, run_id, strategy_cls, config_id, as_of, sig, qty, "rejected", reason)
+            self._persist_signal(
+                s, run_id, strategy_cls, config_id, as_of, sig, qty, "rejected", reason
+            )
             self._persist_tech_score(s, strategy_cls, sig.symbol, as_of, bars_cache.get(sig.symbol))
 
         return ScanSummary(
@@ -172,6 +231,7 @@ class ScanRunner:
             universe_size=len(symbols),
             signals_emitted=len(passing),
             rejected_count=len(rejected),
+            regime_multiplier=regime_factor.multiplier,
         )
 
     # ------------------------------------------------------------------
@@ -307,48 +367,73 @@ class ScanRunner:
             earnings_within_5d=earnings,
         )
 
-    def _check_regime(
+    def _resolve_regime_factor(
         self,
         s: Session,
         strategy_cls: type[Strategy],
         as_of: date,
-    ) -> ScanSummary | None:
-        """Return a regime-skipped ScanSummary if the strategy shouldn't run today.
+    ) -> RegimeFactor:
+        """Compute the soft-sizing multiplier for this strategy.
 
-        Returns None when the strategy should proceed (regime matches or is unknown).
+        Replaces the v1 ``_check_regime`` hard gate. Multiplier is the
+        product of:
+
+          * ``strategy_cls.affinity_for(label)`` — strategy's preference
+            for the current discrete regime label.
+          * ``0.5 + 0.5 * composite_score`` — continuous health
+            multiplier (research doc §6.1's conservative form; never
+            zeros out exposure on the composite alone).
+          * ``0.5`` if ``credit_stress_flag`` is set, else ``1.0``
+            (research doc §Tier 0(b)).
+
+        Soft-fails to a neutral 1.0 multiplier on any failure path so
+        a regime-data outage doesn't block the strategy from running.
         """
+        # Default = neutral. Used when regime detection is degraded or fails.
+        neutral = RegimeFactor(
+            multiplier=1.0,
+            label=None,
+            composite_score=None,
+            credit_stress_flag=False,
+            block_new_longs=False,
+        )
+
         try:
             regime_obj = detect_regime(as_of, session=s)
         except Exception as exc:
-            log.warning("regime detection failed — proceeding without filter: %s", exc)
-            return None
+            log.warning("regime detection failed — using neutral multiplier: %s", exc)
+            return neutral
 
         if regime_obj is None:
-            # No SPY data yet; degrade gracefully.
-            return None
+            log.info("regime: no row for %s — using neutral multiplier", as_of)
+            return neutral
 
-        if not strategy_cls.applicable_regimes:
-            # Empty set = runs in all regimes.
-            return None
+        label = regime_obj.regime
+        affinity = strategy_cls.affinity_for(label)
+        composite_dec = regime_obj.composite_score
+        composite = float(composite_dec) if composite_dec is not None else None
+        composite_mult = 0.5 + 0.5 * composite if composite is not None else 1.0
+        stress = bool(regime_obj.credit_stress_flag)
+        stress_mult = 0.5 if stress else 1.0
 
-        if regime_obj.regime in strategy_cls.applicable_regimes:
-            return None  # regime is OK — proceed normally
-
+        multiplier = affinity * composite_mult * stress_mult
         log.info(
-            "regime gate: skipping %s — regime '%s' not in applicable_regimes %s",
+            "regime sizing: %s @ %s | affinity=%.2f composite_mult=%.2f stress_mult=%.2f -> %.3f%s",
             strategy_cls.name,
-            regime_obj.regime,
-            sorted(strategy_cls.applicable_regimes),
+            label,
+            affinity,
+            composite_mult,
+            stress_mult,
+            multiplier,
+            " [block_new_longs]" if stress else "",
         )
-        return ScanSummary(
-            run_id=-1,
-            strategy_name=strategy_cls.name,
-            strategy_version=strategy_cls.version,
-            as_of_date=as_of,
-            universe_size=0,
-            signals_emitted=0,
-            rejected_count=0,
-            regime_skipped=True,
+
+        return RegimeFactor(
+            multiplier=multiplier,
+            label=label,
+            composite_score=composite,
+            credit_stress_flag=stress,
+            block_new_longs=stress,
         )
 
     def _persist_run(
@@ -396,14 +481,14 @@ class ScanRunner:
             return
         try:
             score = compute_technical_score(strategy_cls, bars, as_of)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             log.debug("tech score failed for %s: %s", symbol, exc)
             return
         if score is None:
             return
         try:
             upsert_score(symbol, as_of, strategy_cls.name, score, session=s)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             log.error("tech score upsert failed for %s: %s", symbol, exc)
 
     def _persist_signal(

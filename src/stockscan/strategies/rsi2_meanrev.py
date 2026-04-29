@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from datetime import date
 from decimal import Decimal
+from typing import ClassVar
 
 import pandas as pd
 from pydantic import Field
@@ -36,12 +37,8 @@ class RSI2Params(StrategyParams):
     """Tunable parameters for RSI(2) Mean-Reversion."""
 
     rsi_period: int = Field(2, ge=1, le=20, description="RSI lookback window")
-    rsi_threshold: float = Field(
-        10.0, ge=1.0, le=30.0, description="Enter when RSI ≤ this"
-    )
-    trend_sma_period: int = Field(
-        200, ge=20, le=400, description="Long-term uptrend filter"
-    )
+    rsi_threshold: float = Field(10.0, ge=1.0, le=30.0, description="Enter when RSI ≤ this")
+    trend_sma_period: int = Field(200, ge=20, le=400, description="Long-term uptrend filter")
     exit_sma_period: int = Field(
         5, ge=2, le=20, description="Mean-reversion exit when close > this SMA"
     )
@@ -63,9 +60,17 @@ class RSI2MeanReversion(Strategy):
     tags = ("mean_reversion", "long_only", "swing")
     params_model = RSI2Params
     default_risk_pct = 0.01
-    # RSI(2) mean-reversion works best when the market is not in a sustained
-    # downtrend.  In a confirmed bear trend the oversold bounces typically fail.
-    applicable_regimes: frozenset[str] = frozenset({"choppy", "trending_up", "transitioning"})
+    # Mean-reversion's home turf is chop and uptrends with normal pullbacks.
+    # Confirmed downtrends break the "the dip will bounce" assumption — keep
+    # weight at zero in trending_down. ``transitioning`` gets a partial
+    # weight because the regime classifier can't tell early reversals from
+    # noise in real time.
+    regime_affinity: ClassVar[dict[str, float]] = {
+        "trending_up": 1.0,
+        "trending_down": 0.0,
+        "choppy": 1.0,
+        "transitioning": 0.7,
+    }
 
     manual = """\
 ## What this strategy is trying to do

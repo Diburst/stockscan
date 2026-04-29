@@ -48,15 +48,24 @@ class EODHDError(RuntimeError):
 class EODHDProvider(DataProvider):
     name = "eodhd"
 
-    def __init__(self, api_key: str | None = None, base_url: str | None = None) -> None:
+    def __init__(
+        self,
+        api_key: str | None = None,
+        base_url: str | None = None,
+        *,
+        transport: httpx.BaseTransport | None = None,
+    ) -> None:
         self.api_key = api_key or settings.eodhd_api_key.get_secret_value()
         self.base_url = (base_url or settings.eodhd_base_url).rstrip("/")
         if not self.api_key:
             raise EODHDError("EODHD_API_KEY is not set; cannot initialize EODHDProvider")
+        # `transport` is an injection point for tests (httpx.MockTransport).
+        # In production it is None and httpx selects its default transport.
         self._client = httpx.Client(
             base_url=self.base_url,
             timeout=30.0,
             headers={"User-Agent": "stockscan/0.1"},
+            transport=transport,
         )
 
     # ------------------------------------------------------------------
@@ -93,6 +102,7 @@ class EODHDProvider(DataProvider):
         start: date,
         end: date,
         interval: str = "1d",
+        exchange: str = "US",
     ) -> list[BarRow]:
         if interval != "1d":
             raise NotImplementedError(
@@ -100,7 +110,11 @@ class EODHDProvider(DataProvider):
                 "Intraday endpoint integration is a Phase 1.5 follow-up."
             )
 
-        path = f"/eod/{symbol}.US"
+        # EODHD addresses instruments as /eod/{TICKER}.{EXCHANGE}. Equities
+        # use "US" (default); cash indices like VIX use "INDX". The ticker
+        # is passed without any leading caret — EODHD doesn't use Yahoo's
+        # "^VIX" convention.
+        path = f"/eod/{symbol}.{exchange}"
         rows = self._get(
             path,
             from_=start.isoformat(),

@@ -57,37 +57,141 @@
     </div>
   </div>
 
-  <!-- Market regime banner -->
-  <div class="bg-white rounded-xl shadow-sm border border-ink-300/40 p-4 flex flex-col sm:flex-row sm:items-center gap-3">
-    <div class="flex items-center gap-3 flex-1">
-      <div>
-        <div class="text-xs text-ink-500 uppercase tracking-wide font-medium mb-1">Market regime</div>
+  {# Render a horizontal progress bar for a [0,1] component score.
+     Width is the score as a percentage; color reflects health bands. #}
+  {% macro score_bar(label, value) %}
+    {% if value is none %}
+      <div class="flex items-center gap-2">
+        <div class="text-xs text-ink-500 w-14 flex-shrink-0">{{ label }}</div>
+        <div class="text-xs text-ink-400">—</div>
+      </div>
+    {% else %}
+      {% set v = value | float %}
+      {% set pct = (v * 100) | round(0, 'floor') | int %}
+      {% if v >= 0.66 %}
+        {% set bar = "bg-ok-600" %}
+      {% elif v >= 0.33 %}
+        {% set bar = "bg-warn-600" %}
+      {% else %}
+        {% set bar = "bg-bad-600" %}
+      {% endif %}
+      <div class="flex items-center gap-2">
+        <div class="text-xs text-ink-500 w-14 flex-shrink-0">{{ label }}</div>
+        <div class="flex-1 h-2 rounded bg-ink-100 overflow-hidden">
+          <div class="h-full {{ bar }}" style="width: {{ pct }}%"></div>
+        </div>
+        <div class="text-xs font-mono text-ink-700 w-10 text-right flex-shrink-0">{{ "%.2f"|format(v) }}</div>
+      </div>
+    {% endif %}
+  {% endmacro %}
+
+  <!-- Market regime banner (v2 composite) -->
+  <div class="bg-white rounded-xl shadow-sm border border-ink-300/40 p-4">
+    <div class="flex flex-col sm:flex-row sm:items-start gap-4">
+
+      <!-- LEFT: discrete label + composite score + stress indicator -->
+      <div class="flex-1 min-w-0">
+        <div class="text-xs text-ink-500 uppercase tracking-wide font-medium mb-2">Market regime</div>
         {% if regime %}
-          {% set colour = regime_colour.get(regime.regime, 'neutral') %}
-          {{ badge(regime.regime | replace("_", " "), colour) }}
-          <span class="text-xs text-ink-500 ml-2">ADX {{ "%.1f"|format(regime.adx|float) }} · SPY {{ "%.2f"|format(regime.spy_close|float) }} / SMA200 {{ "%.2f"|format(regime.spy_sma200|float) }} · {{ regime.as_of_date }}</span>
+          <div class="flex items-center gap-2 flex-wrap">
+            {% set colour = regime_colour.get(regime.regime, 'neutral') %}
+            {{ badge(regime.regime | replace("_", " "), colour) }}
+            {% if regime.credit_stress_flag %}
+              <span class="inline-block px-2 py-0.5 rounded bg-bad-100 text-bad-600 border border-bad-600/40 text-xs font-semibold uppercase tracking-wide" title="HY OAS in top 15% AND rising — long entries blocked, sizes halved">
+                ⚠ credit stress
+              </span>
+            {% endif %}
+            {% if regime.methodology_version and regime.methodology_version >= 2 %}
+              <span class="text-xs text-ink-400" title="Composite score methodology v{{ regime.methodology_version }}">v{{ regime.methodology_version }}</span>
+            {% else %}
+              <span class="text-xs text-ink-400" title="Legacy ADX/SMA detection — composite columns unpopulated">v1 legacy</span>
+            {% endif %}
+          </div>
+          {% if regime.composite_score is not none %}
+            {% set comp = regime.composite_score | float %}
+            <div class="mt-3">
+              <div class="flex items-baseline justify-between mb-1">
+                <span class="text-sm font-semibold text-ink-700">Composite health</span>
+                <span class="font-mono font-semibold text-ink-900">{{ "%.2f"|format(comp) }}</span>
+              </div>
+              <div class="h-3 rounded bg-ink-100 overflow-hidden">
+                {% set comp_pct = (comp * 100) | round(0, 'floor') | int %}
+                {% if comp >= 0.66 %}
+                  {% set comp_bar = "bg-ok-600" %}
+                {% elif comp >= 0.33 %}
+                  {% set comp_bar = "bg-warn-600" %}
+                {% else %}
+                  {% set comp_bar = "bg-bad-600" %}
+                {% endif %}
+                <div class="h-full {{ comp_bar }}" style="width: {{ comp_pct }}%"></div>
+              </div>
+            </div>
+          {% endif %}
         {% else %}
           <span class="text-sm text-ink-500">unknown — run a scan to compute</span>
         {% endif %}
       </div>
+
+      <!-- RIGHT: per-component scores -->
+      {% if regime %}
+        <div class="sm:w-72 flex-shrink-0 space-y-2">
+          {{ score_bar("vol", regime.vol_score) }}
+          {{ score_bar("trend", regime.trend_score) }}
+          {{ score_bar("breadth", regime.breadth_score) }}
+          {{ score_bar("credit", regime.credit_score) }}
+        </div>
+      {% endif %}
     </div>
+
     {% if regime %}
-      <div class="text-xs text-ink-500 flex-shrink-0">
-        <span class="font-medium text-ink-700">Active today:</span>
-        {% if active_strategies %}
-          {% for cls in active_strategies %}
-            <span class="inline-block px-1.5 py-0.5 rounded bg-ok-100 text-ok-600 border border-ok-600/30 mr-1">{{ cls.display_name }}</span>
-          {% endfor %}
-        {% else %}
-          <span class="text-bad-600">none</span>
+      <!-- Underlying levels — small print, scrolls horizontally on narrow screens. -->
+      <div class="mt-3 pt-3 border-t border-ink-300/30 text-xs text-ink-500 overflow-x-auto whitespace-nowrap">
+        <span>ADX {{ "%.1f"|format(regime.adx|float) }}</span>
+        <span class="mx-1">·</span>
+        <span>SPY {{ "%.2f"|format(regime.spy_close|float) }} / SMA200 {{ "%.2f"|format(regime.spy_sma200|float) }}</span>
+        {% if regime.vix_level is not none %}
+          <span class="mx-1">·</span>
+          <span>VIX {{ "%.2f"|format(regime.vix_level|float) }}{% if regime.vix_pct_rank is not none %} (rank {{ "%.2f"|format(regime.vix_pct_rank|float) }}){% endif %}</span>
         {% endif %}
-        {% if inactive_strategies %}
-          · <span class="font-medium text-ink-700">Paused:</span>
-          {% for cls in inactive_strategies %}
-            <span class="inline-block px-1.5 py-0.5 rounded bg-ink-100 text-ink-500 border border-ink-300 mr-1" title="Not active in {{ regime.regime | replace('_', ' ') }} regime">{{ cls.display_name }}</span>
-          {% endfor %}
+        {% if regime.hy_oas_level is not none %}
+          <span class="mx-1">·</span>
+          <span>HY OAS {{ "%.2f"|format(regime.hy_oas_level|float) }}%{% if regime.hy_oas_pct_rank is not none %} (rank {{ "%.2f"|format(regime.hy_oas_pct_rank|float) }}{% if regime.hy_oas_zscore is not none %}, z {{ "%+.1f"|format(regime.hy_oas_zscore|float) }}{% endif %}){% endif %}</span>
         {% endif %}
+        <span class="mx-1">·</span>
+        <span>{{ regime.as_of_date }}</span>
       </div>
+
+      <!-- Per-strategy effective sizing -->
+      {% if strategy_factors %}
+        <div class="mt-3 pt-3 border-t border-ink-300/30">
+          <div class="text-xs text-ink-500 uppercase tracking-wide font-medium mb-2">Strategy sizing today</div>
+          <div class="overflow-x-auto -mx-1">
+            <table class="w-full text-xs min-w-[480px]">
+              <thead class="text-ink-500">
+                <tr class="text-left">
+                  <th class="px-1 py-1 font-medium">Strategy</th>
+                  <th class="px-1 py-1 font-medium text-right">Affinity</th>
+                  <th class="px-1 py-1 font-medium text-right">Composite ×</th>
+                  <th class="px-1 py-1 font-medium text-right">Stress ×</th>
+                  <th class="px-1 py-1 font-medium text-right">Effective</th>
+                </tr>
+              </thead>
+              <tbody>
+                {% for sf in strategy_factors %}
+                  {% set eff = sf.effective | float %}
+                  <tr class="border-t border-ink-300/30">
+                    <td class="px-1 py-1.5 font-medium text-ink-700">{{ sf.cls.display_name }}</td>
+                    <td class="px-1 py-1.5 text-right font-mono text-ink-700">{{ "%.2f"|format(sf.affinity|float) }}</td>
+                    <td class="px-1 py-1.5 text-right font-mono text-ink-500">{{ "%.2f"|format(sf.composite_mult|float) }}</td>
+                    <td class="px-1 py-1.5 text-right font-mono {{ 'text-bad-600 font-semibold' if sf.stress_mult|float < 1.0 else 'text-ink-500' }}">{{ "%.2f"|format(sf.stress_mult|float) }}</td>
+                    <td class="px-1 py-1.5 text-right font-mono font-semibold {% if eff >= 0.66 %}text-ok-600{% elif eff >= 0.33 %}text-warn-600{% elif eff > 0 %}text-bad-600{% else %}text-ink-400{% endif %}">{{ "%.2f"|format(eff) }}</td>
+                  </tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      {% endif %}
     {% endif %}
   </div>
 

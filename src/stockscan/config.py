@@ -51,6 +51,12 @@ class Settings(BaseSettings):
     eodhd_api_key: SecretStr = Field(SecretStr(""), alias="EODHD_API_KEY")
     eodhd_base_url: str = Field("https://eodhd.com/api", alias="EODHD_BASE_URL")
 
+    # ---- FRED macro data (HY OAS, yield-curve spreads, etc.) ----
+    fred_api_key: SecretStr = Field(SecretStr(""), alias="FRED_API_KEY")
+    fred_base_url: str = Field(
+        "https://api.stlouisfed.org/fred", alias="FRED_BASE_URL"
+    )
+
     # ---- E*TRADE (Phase 4) ----
     etrade_consumer_key: SecretStr = Field(SecretStr(""), alias="ETRADE_CONSUMER_KEY")
     etrade_consumer_secret: SecretStr = Field(SecretStr(""), alias="ETRADE_CONSUMER_SECRET")
