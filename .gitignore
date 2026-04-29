@@ -41,7 +41,7 @@ Thumbs.db
 infra/db_password.secret
 infra/pgdata/
 infra/migration_export/
-data/
+/data/
 exports/
 backups/
 logs/
