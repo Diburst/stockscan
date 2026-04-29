@@ -45,6 +45,21 @@ class UniverseMember:
     left_date: date | None  # None if currently a member
 
 
+@dataclass(frozen=True, slots=True)
+class MacroRow:
+    """A single observation of a scalar macro time series.
+
+    Used for FRED-style series that don't have OHLC structure (e.g.,
+    HY OAS, yield-curve spreads, dollar index level). One row = one
+    (series, date) observation. Stored in the ``macro_series`` table.
+    """
+
+    series_code: str  # e.g., 'BAMLH0A0HYM2'
+    as_of_date: date
+    value: Decimal
+    source: str  # 'fred', etc.
+
+
 class DataProvider(ABC):
     """Provider contract.
 
@@ -62,8 +77,14 @@ class DataProvider(ABC):
         start: date,
         end: date,
         interval: str = "1d",
+        exchange: str = "US",
     ) -> list[BarRow]:
-        """Return bars for `symbol` in [start, end] inclusive."""
+        """Return bars for `symbol` in [start, end] inclusive.
+
+        `exchange` selects the EODHD-style suffix appended to the ticker
+        (e.g., ``"US"`` for /eod/AAPL.US, ``"INDX"`` for /eod/VIX.INDX).
+        Providers without a per-exchange addressing scheme should ignore it.
+        """
 
     @abstractmethod
     def get_sp500_constituents(self) -> list[UniverseMember]:
@@ -113,5 +134,5 @@ class DataProvider(ABC):
         return [
             bar
             for symbol in symbols
-            for bar in self.get_bars(symbol, bar_date, bar_date)
+            for bar in self.get_bars(symbol, bar_date, bar_date, exchange=exchange)
         ]

@@ -32,6 +32,7 @@ from __future__ import annotations
 
 from datetime import date
 from decimal import Decimal
+from typing import ClassVar
 
 import pandas as pd
 from pydantic import Field
@@ -39,10 +40,16 @@ from pydantic import Field
 from stockscan.fundamentals import market_cap_percentile
 from stockscan.indicators import (
     adx as compute_adx,
+)
+from stockscan.indicators import (
     atr,
-    macd as compute_macd,
-    rsi as compute_rsi,
     sma,
+)
+from stockscan.indicators import (
+    macd as compute_macd,
+)
+from stockscan.indicators import (
+    rsi as compute_rsi,
 )
 from stockscan.strategies import (
     ExitDecision,
@@ -56,10 +63,10 @@ from stockscan.strategies import (
 class LargeCapReboundParams(StrategyParams):
     """Tunable parameters for Largecap Rebound."""
 
-    market_cap_pct_floor: int = Field(80, ge=0, le=101, description="Filter out symbols below market cap threshold")
-    trend_sma_period: int = Field(
-        200, ge=20, le=400, description="Long-term trend filter"
+    market_cap_pct_floor: int = Field(
+        80, ge=0, le=101, description="Filter out symbols below market cap threshold"
     )
+    trend_sma_period: int = Field(200, ge=20, le=400, description="Long-term trend filter")
     rsi_period: int = Field(14, ge=1, le=20, description="RSI lookback window")
     rsi_threshold: float = Field(
         35.0, ge=30.0, le=80.0, description="Enter when RSI ≥ this AND rising"
@@ -74,7 +81,9 @@ class LargeCapReboundParams(StrategyParams):
     # = clear trend. 20 is a reasonable middle ground.
     adx_period: int = Field(14, ge=5, le=50, description="ADX lookback")
     adx_min: float = Field(
-        20.0, ge=0.0, le=50.0,
+        20.0,
+        ge=0.0,
+        le=50.0,
         description="Skip entries when ADX is below this (chop filter)",
     )
 
@@ -93,9 +102,17 @@ class LargeCapRebound(Strategy):
     tags = ("mean_reversion", "long_only", "swing")
     params_model = LargeCapReboundParams
     default_risk_pct = 0.01
-    # Largecap Rebound needs some directional quality-stock recovery to work;
-    # excluded in pure bear trends and pure chop where it whipsaws.
-    applicable_regimes: frozenset[str] = frozenset({"trending_up", "transitioning"})
+    # Largecap rebound buys quality names on weakness; needs a friendly tape
+    # to actually recover. trending_up = best, trending_down = skip (catching
+    # falling knives in real bears is a known disaster mode for this style).
+    # choppy gets a small weight — rsi2_meanrev covers the chop case better,
+    # so keep largecap_rebound mostly out of the way there.
+    regime_affinity: ClassVar[dict[str, float]] = {
+        "trending_up": 1.0,
+        "trending_down": 0.0,
+        "choppy": 0.4,
+        "transitioning": 0.7,
+    }
 
     manual = """\
 ## What this strategy is trying to do
@@ -183,9 +200,7 @@ WIN
             return []
 
         entry = Decimal(str(round(last_close, 4)))
-        stop = Decimal(
-            str(round(last_close - self.params.atr_stop_mult * float(atr_v), 4))
-        )
+        stop = Decimal(str(round(last_close - self.params.atr_stop_mult * float(atr_v), 4)))
 
         # Score: weighted combo of how far below 200-SMA + RSI strength.
         # Further below SMA(200) and stronger momentum = higher score.
@@ -236,9 +251,7 @@ WIN
         """
         view = self._slice(bars, as_of)
         # Need MACD slow EMA + signal smoothing for two readings of the histogram.
-        min_hist = (
-            self.params.macd_slow_ma + self.params.macd_signal + self.params.atr_period + 5
-        )
+        min_hist = self.params.macd_slow_ma + self.params.macd_signal + self.params.atr_period + 5
         if len(view) < min_hist:
             return None
 
@@ -290,7 +303,6 @@ WIN
         if pct is None:
             return False
         return pct >= self.params.market_cap_pct_floor
-
 
     # ------------------------------------------------------------------
     @staticmethod

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from datetime import date
 from decimal import Decimal
+from typing import ClassVar
 
 import pandas as pd
 from pydantic import Field
@@ -51,8 +52,17 @@ class DonchianBreakout(Strategy):
     tags = ("trend_following", "breakout", "long_only", "swing")
     params_model = DonchianParams
     default_risk_pct = 0.0075  # tighter risk per DESIGN §6.2 (more positions)
-    # Donchian breakout requires genuine directional momentum to avoid whipsaw.
-    applicable_regimes: frozenset[str] = frozenset({"trending_up", "trending_down"})
+    # Donchian breakout wants genuine directional momentum. Soft sizing:
+    # full size in trends; quarter size in chop (whipsaw risk); half size
+    # in transitions. (Long-only, but kept at full weight in trending_down
+    # so legacy short-leg parameter sweeps stay possible — the strategy
+    # itself self-gates by emitting no long signals when SPY is below SMA.)
+    regime_affinity: ClassVar[dict[str, float]] = {
+        "trending_up": 1.0,
+        "trending_down": 1.0,
+        "choppy": 0.25,
+        "transitioning": 0.5,
+    }
 
     manual = """\
 ## What this strategy is trying to do
@@ -282,9 +292,7 @@ early as the 1960s.
             return []
 
         entry = Decimal(str(round(last_close, 4)))
-        stop = Decimal(
-            str(round(last_close - self.params.atr_stop_mult * float(atr_v), 4))
-        )
+        stop = Decimal(str(round(last_close - self.params.atr_stop_mult * float(atr_v), 4)))
         # Score: how far above the prior max close (in ATRs).
         breakout_strength = (last_close - float(prior_max_close)) / float(atr_v)
         score = Decimal(str(round(min(1.0, breakout_strength), 4)))

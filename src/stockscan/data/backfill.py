@@ -23,12 +23,17 @@ def backfill_symbol(
     start: date,
     end: date | None = None,
     overlap_days: int = 5,
+    exchange: str = "US",
 ) -> int:
     """Backfill `symbol` from provider into local store.
 
     If we already have data for this symbol, only fetch from
     `latest_bar_date - overlap_days` (so corrections to the last few bars
     are picked up). Otherwise fetch the full window from `start`.
+
+    `exchange` is forwarded to the provider's `get_bars` to select the
+    EODHD-style suffix (e.g., ``"US"`` for equities, ``"INDX"`` for cash
+    indices like VIX).
     """
     end = end or date.today()
     last = latest_bar_date(symbol)
@@ -36,8 +41,8 @@ def backfill_symbol(
     if fetch_start > end:
         log.debug("backfill: %s already up to date (last=%s)", symbol, last)
         return 0
-    log.info("backfill: %s [%s..%s]", symbol, fetch_start, end)
-    rows = provider.get_bars(symbol, fetch_start, end)
+    log.info("backfill: %s.%s [%s..%s]", symbol, exchange, fetch_start, end)
+    rows = provider.get_bars(symbol, fetch_start, end, exchange=exchange)
     return upsert_bars(rows)
 
 
@@ -47,12 +52,13 @@ def backfill_universe(
     *,
     start: date,
     end: date | None = None,
+    exchange: str = "US",
 ) -> dict[str, int]:
     """Backfill many symbols sequentially. Returns per-symbol upsert counts."""
     out: dict[str, int] = {}
     for s in symbols:
         try:
-            out[s] = backfill_symbol(provider, s, start=start, end=end)
+            out[s] = backfill_symbol(provider, s, start=start, end=end, exchange=exchange)
         except Exception as exc:  # noqa: BLE001
             log.error("backfill failed for %s: %s", s, exc)
             out[s] = -1

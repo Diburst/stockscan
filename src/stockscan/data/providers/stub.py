@@ -40,11 +40,15 @@ class StubProvider(DataProvider):
         if bars is None:
             bars = self._load_default_bars()
         self._bars = bars
-        self._constituents = constituents if constituents is not None else [
-            UniverseMember(symbol="AAPL", joined_date=date(1982, 11, 30), left_date=None),
-            UniverseMember(symbol="MSFT", joined_date=date(1994, 6, 1), left_date=None),
-            UniverseMember(symbol="SPY", joined_date=date(1993, 1, 22), left_date=None),
-        ]
+        self._constituents = (
+            constituents
+            if constituents is not None
+            else [
+                UniverseMember(symbol="AAPL", joined_date=date(1982, 11, 30), left_date=None),
+                UniverseMember(symbol="MSFT", joined_date=date(1994, 6, 1), left_date=None),
+                UniverseMember(symbol="SPY", joined_date=date(1993, 1, 22), left_date=None),
+            ]
+        )
         self._earnings = earnings or []
 
     @staticmethod
@@ -80,7 +84,11 @@ class StubProvider(DataProvider):
         start: date,
         end: date,
         interval: str = "1d",
+        exchange: str = "US",
     ) -> list[BarRow]:
+        # `interval` and `exchange` are part of the contract but the stub
+        # doesn't differentiate on them — its bars are pre-loaded.
+        del exchange
         return [
             b
             for b in self._bars

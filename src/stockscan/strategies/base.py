@@ -10,17 +10,33 @@ from __future__ import annotations
 import hashlib
 import inspect
 import json
+import warnings
 from abc import ABC, abstractmethod
-from datetime import date
-from typing import ClassVar
+from typing import TYPE_CHECKING, ClassVar
 
-import pandas as pd
 from pydantic import BaseModel
 
-from stockscan.strategies._signals import (
-    ExitDecision,
-    PositionSnapshot,
-    RawSignal,
+if TYPE_CHECKING:
+    from collections.abc import Mapping
+    from datetime import date
+
+    import pandas as pd
+
+    from stockscan.strategies._signals import (
+        ExitDecision,
+        PositionSnapshot,
+        RawSignal,
+    )
+
+# Canonical regime label set. Used by ``__init_subclass__`` when deriving
+# ``regime_affinity`` from the deprecated ``applicable_regimes`` so the
+# derived mapping covers every label explicitly (in-set → 1.0, out-of-set
+# → 0.0) rather than relying on per-lookup defaults.
+_ALL_REGIME_LABELS: tuple[str, ...] = (
+    "trending_up",
+    "trending_down",
+    "choppy",
+    "transitioning",
 )
 
 
@@ -46,9 +62,7 @@ class _Registry:
 
     def get(self, name: str) -> type[Strategy]:
         if name not in self._by_name:
-            raise KeyError(
-                f"Unknown strategy '{name}'. Registered: {sorted(self._by_name)}"
-            )
+            raise KeyError(f"Unknown strategy '{name}'. Registered: {sorted(self._by_name)}")
         return self._by_name[name]
 
     def all(self) -> list[type[Strategy]]:
@@ -85,15 +99,27 @@ class Strategy(ABC):
     name: ClassVar[str]
     version: ClassVar[str]
     display_name: ClassVar[str]
-    description: ClassVar[str] = ""           # one-paragraph teaser (UI cards)
-    manual: ClassVar[str] = ""                # long-form, beginner-friendly walkthrough
+    description: ClassVar[str] = ""  # one-paragraph teaser (UI cards)
+    manual: ClassVar[str] = ""  # long-form, beginner-friendly walkthrough
     tags: ClassVar[tuple[str, ...]] = ()
     params_model: ClassVar[type[StrategyParams]]
     default_risk_pct: ClassVar[float] = 0.01
 
-    # Regimes in which this strategy is permitted to generate signals.
-    # Empty frozenset = "runs in all regimes" (no restriction).
-    # Labels: 'trending_up', 'trending_down', 'choppy', 'transitioning'
+    # ----- Regime preferences (v2 — soft sizing) -----
+    # ``regime_affinity`` maps regime label → weight in [0, 1]. The runner
+    # multiplies a signal's base position size by this weight (along with
+    # the continuous composite-score multiplier) instead of gating signals
+    # on/off. Missing labels fall back to ``default_affinity`` (1.0 =
+    # neutral). An empty mapping means "no preference" — the strategy runs
+    # at full sizing in every regime.
+    regime_affinity: ClassVar[Mapping[str, float]] = {}
+    default_affinity: ClassVar[float] = 1.0
+
+    # ----- Deprecated v1 gate -----
+    # ``applicable_regimes`` is the old hard-gate API. If a subclass declares
+    # this and not ``regime_affinity``, ``__init_subclass__`` derives the
+    # affinity mapping (in-set → 1.0, out-of-set → 0.0) and emits a
+    # ``DeprecationWarning``. Declaring both is a hard error.
     applicable_regimes: ClassVar[frozenset[str]] = frozenset()
 
     # Subclasses set this to True if they should NOT be auto-registered
@@ -154,6 +180,24 @@ class Strategy(ABC):
         )
         return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
+    @classmethod
+    def affinity_for(cls, label: str) -> float:
+        """Return this strategy's affinity weight for ``label`` in [0, 1].
+
+        Lookup precedence:
+          1. The label is in ``regime_affinity`` → return the stored weight.
+          2. The mapping is empty AND ``label`` is unknown → ``default_affinity``.
+          3. The mapping is non-empty but doesn't include ``label`` →
+             ``default_affinity`` (the regime label set may grow over time;
+             unknown labels are treated as neutral, not as "blocked").
+
+        The runner multiplies the base position size by this weight and by
+        the composite-score multiplier to get the final sizing factor.
+        """
+        if label in cls.regime_affinity:
+            return float(cls.regime_affinity[label])
+        return cls.default_affinity
+
     # ----- auto-registration -----
     def __init_subclass__(cls, **kwargs: object) -> None:
         super().__init_subclass__(**kwargs)
@@ -166,4 +210,29 @@ class Strategy(ABC):
                     f"Strategy subclass {cls.__name__} is missing required class "
                     f"attribute '{attr}'."
                 )
+
+        # Migrate the deprecated ``applicable_regimes`` gate to the new
+        # ``regime_affinity`` mapping. ``cls.__dict__`` (not ``cls.X``)
+        # so we only inspect THIS subclass's declarations, not anything
+        # inherited from Strategy itself.
+        legacy = cls.__dict__.get("applicable_regimes")
+        new = cls.__dict__.get("regime_affinity")
+        if legacy and new:
+            raise TypeError(
+                f"Strategy {cls.__name__} declares both 'applicable_regimes' "
+                f"(deprecated) and 'regime_affinity'. Pick one — prefer the "
+                f"new 'regime_affinity' mapping for soft sizing."
+            )
+        if legacy and not new:
+            derived: dict[str, float] = {
+                label: 1.0 if label in legacy else 0.0 for label in _ALL_REGIME_LABELS
+            }
+            cls.regime_affinity = derived
+            warnings.warn(
+                f"Strategy {cls.name!r} uses deprecated 'applicable_regimes'. "
+                f"Migrate to 'regime_affinity = {derived!r}' for soft sizing.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+
         STRATEGY_REGISTRY.register(cls)
