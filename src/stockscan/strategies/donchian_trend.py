@@ -51,6 +51,8 @@ class DonchianBreakout(Strategy):
     tags = ("trend_following", "breakout", "long_only", "swing")
     params_model = DonchianParams
     default_risk_pct = 0.0075  # tighter risk per DESIGN §6.2 (more positions)
+    # Donchian breakout requires genuine directional momentum to avoid whipsaw.
+    applicable_regimes: frozenset[str] = frozenset({"trending_up", "trending_down"})
 
     manual = """\
 ## What this strategy is trying to do

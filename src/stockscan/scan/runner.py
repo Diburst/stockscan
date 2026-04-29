@@ -35,6 +35,7 @@ from sqlalchemy.orm import Session
 from stockscan.config import settings
 from stockscan.data.store import get_bars
 from stockscan.db import session_scope
+from stockscan.regime import detect_regime
 from stockscan.risk.filters import FilterChain, PortfolioContext
 from stockscan.risk.sizer import position_size
 from stockscan.strategies import (
@@ -51,13 +52,14 @@ log = logging.getLogger(__name__)
 
 @dataclass(frozen=True, slots=True)
 class ScanSummary:
-    run_id: int
+    run_id: int             # -1 when regime_skipped=True (no DB record created)
     strategy_name: str
     strategy_version: str
     as_of_date: date
     universe_size: int
     signals_emitted: int
     rejected_count: int
+    regime_skipped: bool = False  # True when strategy was suppressed by regime filter
 
 
 class ScanRunner:
@@ -95,6 +97,13 @@ class ScanRunner:
         # 1. Ensure strategy_versions + active strategy_configs row exist.
         config_id, params = self._ensure_strategy_config(s, strategy_cls)
         strategy = strategy_cls(params)
+
+        # 1b. Regime gate: skip this strategy if the current market regime is
+        #     not in its applicable_regimes set (empty = all regimes pass).
+        if strategy_cls.applicable_regimes:
+            regime_skip = self._check_regime(s, strategy_cls, as_of)
+            if regime_skip:
+                return regime_skip
 
         # 2. Resolve universe.
         if symbols is None:
@@ -296,6 +305,50 @@ class ScanRunner:
             high_water_mark=hwm,
             open_positions=open_positions,
             earnings_within_5d=earnings,
+        )
+
+    def _check_regime(
+        self,
+        s: Session,
+        strategy_cls: type[Strategy],
+        as_of: date,
+    ) -> ScanSummary | None:
+        """Return a regime-skipped ScanSummary if the strategy shouldn't run today.
+
+        Returns None when the strategy should proceed (regime matches or is unknown).
+        """
+        try:
+            regime_obj = detect_regime(as_of, session=s)
+        except Exception as exc:
+            log.warning("regime detection failed — proceeding without filter: %s", exc)
+            return None
+
+        if regime_obj is None:
+            # No SPY data yet; degrade gracefully.
+            return None
+
+        if not strategy_cls.applicable_regimes:
+            # Empty set = runs in all regimes.
+            return None
+
+        if regime_obj.regime in strategy_cls.applicable_regimes:
+            return None  # regime is OK — proceed normally
+
+        log.info(
+            "regime gate: skipping %s — regime '%s' not in applicable_regimes %s",
+            strategy_cls.name,
+            regime_obj.regime,
+            sorted(strategy_cls.applicable_regimes),
+        )
+        return ScanSummary(
+            run_id=-1,
+            strategy_name=strategy_cls.name,
+            strategy_version=strategy_cls.version,
+            as_of_date=as_of,
+            universe_size=0,
+            signals_emitted=0,
+            rejected_count=0,
+            regime_skipped=True,
         )
 
     def _persist_run(

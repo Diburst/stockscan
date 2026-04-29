@@ -91,6 +91,11 @@ class Strategy(ABC):
     params_model: ClassVar[type[StrategyParams]]
     default_risk_pct: ClassVar[float] = 0.01
 
+    # Regimes in which this strategy is permitted to generate signals.
+    # Empty frozenset = "runs in all regimes" (no restriction).
+    # Labels: 'trending_up', 'trending_down', 'choppy', 'transitioning'
+    applicable_regimes: ClassVar[frozenset[str]] = frozenset()
+
     # Subclasses set this to True if they should NOT be auto-registered
     # (e.g., abstract intermediate base classes).
     __abstract__: ClassVar[bool] = False

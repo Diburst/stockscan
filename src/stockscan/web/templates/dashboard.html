@@ -3,6 +3,14 @@
 
 {% block title %}Dashboard{% endblock %}
 
+{# Regime-to-colour mapping for the badge #}
+{% set regime_colour = {
+  'trending_up':   'ok',
+  'transitioning': 'warn',
+  'choppy':        'warn',
+  'trending_down': 'bad',
+} %}
+
 {# Render either the "+ Watch" form (HTMX-enabled) or a static "watching" pill,
    depending on whether the symbol is already on the watchlist. The pill
    markup MUST match what /watchlist/add returns to HTMX so the look is
@@ -47,6 +55,40 @@
       {{ stat("Strategies", strategies|length,
               sub=strategy_names if strategies else "none registered") }}
     </div>
+  </div>
+
+  <!-- Market regime banner -->
+  <div class="bg-white rounded-xl shadow-sm border border-ink-300/40 p-4 flex flex-col sm:flex-row sm:items-center gap-3">
+    <div class="flex items-center gap-3 flex-1">
+      <div>
+        <div class="text-xs text-ink-500 uppercase tracking-wide font-medium mb-1">Market regime</div>
+        {% if regime %}
+          {% set colour = regime_colour.get(regime.regime, 'neutral') %}
+          {{ badge(regime.regime | replace("_", " "), colour) }}
+          <span class="text-xs text-ink-500 ml-2">ADX {{ "%.1f"|format(regime.adx|float) }} · SPY {{ "%.2f"|format(regime.spy_close|float) }} / SMA200 {{ "%.2f"|format(regime.spy_sma200|float) }} · {{ regime.as_of_date }}</span>
+        {% else %}
+          <span class="text-sm text-ink-500">unknown — run a scan to compute</span>
+        {% endif %}
+      </div>
+    </div>
+    {% if regime %}
+      <div class="text-xs text-ink-500 flex-shrink-0">
+        <span class="font-medium text-ink-700">Active today:</span>
+        {% if active_strategies %}
+          {% for cls in active_strategies %}
+            <span class="inline-block px-1.5 py-0.5 rounded bg-ok-100 text-ok-600 border border-ok-600/30 mr-1">{{ cls.display_name }}</span>
+          {% endfor %}
+        {% else %}
+          <span class="text-bad-600">none</span>
+        {% endif %}
+        {% if inactive_strategies %}
+          · <span class="font-medium text-ink-700">Paused:</span>
+          {% for cls in inactive_strategies %}
+            <span class="inline-block px-1.5 py-0.5 rounded bg-ink-100 text-ink-500 border border-ink-300 mr-1" title="Not active in {{ regime.regime | replace('_', ' ') }} regime">{{ cls.display_name }}</span>
+          {% endfor %}
+        {% endif %}
+      </div>
+    {% endif %}
   </div>
 
   <!-- Latest signals -->

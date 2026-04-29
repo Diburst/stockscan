@@ -93,6 +93,9 @@ class LargeCapRebound(Strategy):
     tags = ("mean_reversion", "long_only", "swing")
     params_model = LargeCapReboundParams
     default_risk_pct = 0.01
+    # Largecap Rebound needs some directional quality-stock recovery to work;
+    # excluded in pure bear trends and pure chop where it whipsaws.
+    applicable_regimes: frozenset[str] = frozenset({"trending_up", "transitioning"})
 
     manual = """\
 ## What this strategy is trying to do

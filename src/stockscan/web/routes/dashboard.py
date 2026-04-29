@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 
 from stockscan.db import healthcheck
 from stockscan.positions import list_open_trades
+from stockscan.regime import latest_regime
 from stockscan.strategies import STRATEGY_REGISTRY, discover_strategies
 from stockscan.watchlist import watchlist_symbols
 from stockscan.web.deps import get_session, render
@@ -47,6 +48,21 @@ async def dashboard(request: Request, s: Session = Depends(get_session)):
     open_trades = list_open_trades(session=s)
     health = healthcheck()
     watching = watchlist_symbols(session=s)
+    regime = latest_regime(session=s)
+
+    all_strategies = STRATEGY_REGISTRY.all()
+    if regime is not None:
+        active_strategies = [
+            cls for cls in all_strategies
+            if not cls.applicable_regimes or regime.regime in cls.applicable_regimes
+        ]
+        inactive_strategies = [
+            cls for cls in all_strategies
+            if cls.applicable_regimes and regime.regime not in cls.applicable_regimes
+        ]
+    else:
+        active_strategies = all_strategies
+        inactive_strategies = []
 
     return render(
         request,
@@ -55,6 +71,9 @@ async def dashboard(request: Request, s: Session = Depends(get_session)):
         signals=sig_rows,
         open_trades=open_trades,
         health=health,
-        strategies=STRATEGY_REGISTRY.all(),
+        strategies=all_strategies,
+        active_strategies=active_strategies,
+        inactive_strategies=inactive_strategies,
+        regime=regime,
         watching=watching,
     )

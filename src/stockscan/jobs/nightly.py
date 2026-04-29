@@ -15,6 +15,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from datetime import date
+from typing import TYPE_CHECKING
 
 from stockscan.config import settings
 from stockscan.data.backfill import refresh_recent_days_bulk, trading_days_since
@@ -22,10 +23,14 @@ from stockscan.data.providers import EODHDProvider, StubProvider
 from stockscan.data.providers.base import DataProvider
 from stockscan.data.store import latest_bar_date
 from stockscan.notify import notify
+from stockscan.regime import detect_regime
 from stockscan.scan import ScanRunner, ScanSummary
 from stockscan.strategies import STRATEGY_REGISTRY, discover_strategies
 from stockscan.universe import all_known_symbols
 from stockscan.watchlist import check_and_fire_alerts
+
+if TYPE_CHECKING:
+    from stockscan.regime.store import MarketRegime
 
 log = logging.getLogger(__name__)
 
@@ -72,9 +77,17 @@ def run_nightly_scan(
     except Exception as exc:  # noqa: BLE001
         log.error("watchlist alert check failed: %s", exc)
 
-    # 4. Send a summary notification.
+    # 4. Detect (and cache) today's regime — uses the freshly-refreshed bars.
+    regime: MarketRegime | None = None
+    try:
+        regime = detect_regime(as_of)
+    except Exception as exc:
+        log.warning("nightly: regime detection failed: %s", exc)
+
+    # 5. Send a summary notification.
     _send_summary(
         as_of, bars_upserted, scans,
+        regime=regime,
         watchlist_alerts=alerts_fired,
         channels=notify_channels,
     )
@@ -118,38 +131,49 @@ def _send_summary(
     bars_upserted: int,
     scans: list[ScanSummary],
     *,
+    regime: MarketRegime | None = None,
     watchlist_alerts: int = 0,
     channels=None,
 ) -> None:
+    regime_label = regime.regime.replace("_", " ") if regime else "unknown"
+
     if not scans:
         body = (
             f"Nightly run for {as_of}\n\n"
+            f"Market regime: {regime_label}\n"
             f"No strategies registered. Refreshed {bars_upserted} bars.\n"
         )
         notify(f"stockscan · {as_of}", body, channels=channels)
         return
 
-    total_passing = sum(s.signals_emitted for s in scans)
-    total_rejected = sum(s.rejected_count for s in scans)
+    active = [s for s in scans if not s.regime_skipped]
+    skipped = [s for s in scans if s.regime_skipped]
+    total_passing = sum(s.signals_emitted for s in active)
+    total_rejected = sum(s.rejected_count for s in active)
 
     lines = [
         f"Nightly scan — {as_of}",
+        f"Market regime: {regime_label}"
+        + (f" (ADX {regime.adx:.1f})" if regime else ""),
         "",
         f"Refreshed bars: {bars_upserted:,}",
-        f"Strategies run: {len(scans)}",
+        f"Strategies run: {len(active)}"
+        + (f" ({len(skipped)} paused by regime)" if skipped else ""),
         f"Passing signals: **{total_passing}**",
         f"Rejected (filter blocked): {total_rejected}",
     ]
     if watchlist_alerts:
         lines.append(f"Watchlist alerts fired: {watchlist_alerts}")
     lines.extend(["", "Per-strategy breakdown:"])
-    for s in scans:
+    for s in active:
         lines.append(
             f"  • {s.strategy_name} v{s.strategy_version}: "
             f"{s.signals_emitted} passing / {s.rejected_count} rejected "
             f"(universe {s.universe_size})"
         )
+    for s in skipped:
+        lines.append(f"  ○ {s.strategy_name} v{s.strategy_version}: paused (regime={regime_label})")
     body = "\n".join(lines)
 
-    subject = f"stockscan · {total_passing} signal{'s' if total_passing != 1 else ''} · {as_of}"
+    subject = f"stockscan · {total_passing} signal{'s' if total_passing != 1 else ''} · {as_of} · {regime_label}"
     notify(subject, body, channels=channels)

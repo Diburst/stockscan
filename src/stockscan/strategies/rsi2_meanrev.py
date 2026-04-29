@@ -63,6 +63,9 @@ class RSI2MeanReversion(Strategy):
     tags = ("mean_reversion", "long_only", "swing")
     params_model = RSI2Params
     default_risk_pct = 0.01
+    # RSI(2) mean-reversion works best when the market is not in a sustained
+    # downtrend.  In a confirmed bear trend the oversold bounces typically fail.
+    applicable_regimes: frozenset[str] = frozenset({"choppy", "trending_up", "transitioning"})
 
     manual = """\
 ## What this strategy is trying to do
