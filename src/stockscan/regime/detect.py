@@ -39,7 +39,9 @@ from stockscan.indicators import adx as compute_adx
 from stockscan.indicators import sma
 from stockscan.regime.composite import (
     BREADTH_LONG_WINDOW,
+    BREADTH_SHORT_WINDOW,
     DEFAULT_WINDOW,
+    TREND_SLOPE_WINDOW,
     breadth_score,
     composite_score,
     credit_score,
@@ -256,6 +258,12 @@ def detect_regime(
 
     # Trend score from SPY (always available since legacy succeeded).
     trend_val = _safe_last(trend_score(spy_close, sma200_series))
+    # Intermediate signal: relative SMA(200) slope over the last 20 bars.
+    # Persisted alongside the score so the dashboard can show "what we
+    # actually computed" — feeds into trend_score via clip(slope/0.02, -1, 1).
+    sma200_lagged = sma200_series.shift(TREND_SLOPE_WINDOW)
+    sma200_slope_series = (sma200_series - sma200_lagged) / sma200_lagged
+    sma200_slope_val = _safe_last(sma200_slope_series)
 
     # Vol score from VIX bars.
     vol_val: float | None = None
@@ -270,12 +278,24 @@ def detect_regime(
 
     # Breadth score from RSP/SPY ratio.
     breadth_val: float | None = None
+    rsp_spy_ratio_val: float | None = None
+    breadth_rel_gap_val: float | None = None
     rsp_close = _fetch_rsp_close(as_of, session=session)
     if rsp_close is not None:
         # Inner-join on date so the ratio is computed only on shared bars.
         merged = pd.concat([rsp_close.rename("rsp"), spy_close.rename("spy")], axis=1).dropna()
         if len(merged) >= BREADTH_LONG_WINDOW:
             breadth_val = _safe_last(breadth_score(merged["rsp"], merged["spy"]))
+            # Intermediate signals: today's spot ratio + the relative gap
+            # between its 20d and 200d SMAs (which is what feeds the score
+            # after band saturation).
+            ratio = merged["rsp"] / merged["spy"]
+            rsp_spy_ratio_val = _safe_last(ratio)
+            ratio_short = ratio.rolling(
+                BREADTH_SHORT_WINDOW, min_periods=BREADTH_SHORT_WINDOW
+            ).mean()
+            ratio_long = ratio.rolling(BREADTH_LONG_WINDOW, min_periods=BREADTH_LONG_WINDOW).mean()
+            breadth_rel_gap_val = _safe_last((ratio_short - ratio_long) / ratio_long)
 
     # Credit components from HY OAS.
     credit_val: float | None = None
@@ -326,6 +346,9 @@ def detect_regime(
         hy_oas_level=hy_oas_level_val,
         hy_oas_pct_rank=hy_oas_pct_rank_val,
         hy_oas_zscore=hy_oas_zscore_val,
+        spy_sma200_slope_20d=sma200_slope_val,
+        rsp_spy_ratio=rsp_spy_ratio_val,
+        breadth_rel_gap=breadth_rel_gap_val,
         credit_stress_flag=stress_flag,
         methodology_version=_METHODOLOGY_VERSION,
         session=session,

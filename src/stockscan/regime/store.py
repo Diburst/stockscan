@@ -77,6 +77,14 @@ class MarketRegime:
     hy_oas_pct_rank: Decimal | None = None
     hy_oas_zscore: Decimal | None = None
 
+    # ---- v2 intermediate signals (added in migration 0011) ----
+    # Persisted so the dashboard can show "what we computed most recently"
+    # for trend (slope) and breadth (ratio + 20d-vs-200d gap), which would
+    # otherwise be hidden inside the aggregated *_score values.
+    spy_sma200_slope_20d: Decimal | None = None
+    rsp_spy_ratio: Decimal | None = None
+    breadth_rel_gap: Decimal | None = None
+
     # ---- always-present v2 fields ----
     credit_stress_flag: bool = False
     methodology_version: int = 1
@@ -89,6 +97,7 @@ _SELECT_COLUMNS = (
     "as_of_date, regime, adx, spy_close, spy_sma200, "
     "composite_score, vol_score, trend_score, breadth_score, credit_score, "
     "vix_level, vix_pct_rank, hy_oas_level, hy_oas_pct_rank, hy_oas_zscore, "
+    "spy_sma200_slope_20d, rsp_spy_ratio, breadth_rel_gap, "
     "credit_stress_flag, methodology_version"
 )
 
@@ -99,31 +108,36 @@ _UPSERT_SQL = text(
         as_of_date, regime, adx, spy_close, spy_sma200,
         composite_score, vol_score, trend_score, breadth_score, credit_score,
         vix_level, vix_pct_rank, hy_oas_level, hy_oas_pct_rank, hy_oas_zscore,
+        spy_sma200_slope_20d, rsp_spy_ratio, breadth_rel_gap,
         credit_stress_flag, methodology_version
     ) VALUES (
         :d, :r, :adx, :close, :sma200,
         :composite, :vol, :trend, :breadth, :credit,
         :vix, :vix_rank, :hy_oas, :hy_rank, :hy_z,
+        :sma_slope, :rsp_ratio, :breadth_gap,
         :stress, :methver
     )
     ON CONFLICT (as_of_date) DO UPDATE SET
-        regime              = EXCLUDED.regime,
-        adx                 = EXCLUDED.adx,
-        spy_close           = EXCLUDED.spy_close,
-        spy_sma200          = EXCLUDED.spy_sma200,
-        composite_score     = EXCLUDED.composite_score,
-        vol_score           = EXCLUDED.vol_score,
-        trend_score         = EXCLUDED.trend_score,
-        breadth_score       = EXCLUDED.breadth_score,
-        credit_score        = EXCLUDED.credit_score,
-        vix_level           = EXCLUDED.vix_level,
-        vix_pct_rank        = EXCLUDED.vix_pct_rank,
-        hy_oas_level        = EXCLUDED.hy_oas_level,
-        hy_oas_pct_rank     = EXCLUDED.hy_oas_pct_rank,
-        hy_oas_zscore       = EXCLUDED.hy_oas_zscore,
-        credit_stress_flag  = EXCLUDED.credit_stress_flag,
-        methodology_version = EXCLUDED.methodology_version,
-        computed_at         = NOW();
+        regime               = EXCLUDED.regime,
+        adx                  = EXCLUDED.adx,
+        spy_close            = EXCLUDED.spy_close,
+        spy_sma200           = EXCLUDED.spy_sma200,
+        composite_score      = EXCLUDED.composite_score,
+        vol_score            = EXCLUDED.vol_score,
+        trend_score          = EXCLUDED.trend_score,
+        breadth_score        = EXCLUDED.breadth_score,
+        credit_score         = EXCLUDED.credit_score,
+        vix_level            = EXCLUDED.vix_level,
+        vix_pct_rank         = EXCLUDED.vix_pct_rank,
+        hy_oas_level         = EXCLUDED.hy_oas_level,
+        hy_oas_pct_rank      = EXCLUDED.hy_oas_pct_rank,
+        hy_oas_zscore        = EXCLUDED.hy_oas_zscore,
+        spy_sma200_slope_20d = EXCLUDED.spy_sma200_slope_20d,
+        rsp_spy_ratio        = EXCLUDED.rsp_spy_ratio,
+        breadth_rel_gap      = EXCLUDED.breadth_rel_gap,
+        credit_stress_flag   = EXCLUDED.credit_stress_flag,
+        methodology_version  = EXCLUDED.methodology_version,
+        computed_at          = NOW();
     """
 )
 
@@ -148,6 +162,10 @@ def _opt_round(value: float | None, places: int) -> Decimal | None:
 
 
 def _row(r: object) -> MarketRegime:
+    # ``getattr`` with default for the 0011 columns so this still maps a
+    # row from a DB at migration 0010 (before 0011 was applied). The
+    # columns won't exist in that case and the row object won't have
+    # those attributes; treating them as None is the right fallback.
     return MarketRegime(
         as_of_date=r.as_of_date,  # type: ignore[attr-defined]
         regime=r.regime,  # type: ignore[attr-defined]
@@ -164,6 +182,9 @@ def _row(r: object) -> MarketRegime:
         hy_oas_level=_opt_decimal(r.hy_oas_level),  # type: ignore[attr-defined]
         hy_oas_pct_rank=_opt_decimal(r.hy_oas_pct_rank),  # type: ignore[attr-defined]
         hy_oas_zscore=_opt_decimal(r.hy_oas_zscore),  # type: ignore[attr-defined]
+        spy_sma200_slope_20d=_opt_decimal(getattr(r, "spy_sma200_slope_20d", None)),
+        rsp_spy_ratio=_opt_decimal(getattr(r, "rsp_spy_ratio", None)),
+        breadth_rel_gap=_opt_decimal(getattr(r, "breadth_rel_gap", None)),
         credit_stress_flag=bool(r.credit_stress_flag),  # type: ignore[attr-defined]
         methodology_version=int(r.methodology_version),  # type: ignore[attr-defined]
     )
@@ -189,6 +210,9 @@ def upsert_regime(
     hy_oas_level: float | None = None,
     hy_oas_pct_rank: float | None = None,
     hy_oas_zscore: float | None = None,
+    spy_sma200_slope_20d: float | None = None,
+    rsp_spy_ratio: float | None = None,
+    breadth_rel_gap: float | None = None,
     credit_stress_flag: bool = False,
     methodology_version: int = 1,
     session: Session | None = None,
@@ -198,7 +222,10 @@ def upsert_regime(
     The legacy 5 positional arguments preserve full back-compat with
     pre-0010 callers — those calls stamp ``methodology_version=1``. v2
     callers (post-0010 ``detect_regime``) pass the composite kwargs and
-    stamp ``methodology_version=2`` explicitly.
+    stamp ``methodology_version=2`` explicitly. The 0011 intermediate
+    signals (``spy_sma200_slope_20d``, ``rsp_spy_ratio``,
+    ``breadth_rel_gap``) are also optional — they're surfaced on the
+    dashboard but don't drive sizing, so missing values aren't fatal.
     """
     params: dict[str, Any] = {
         "d": as_of,
@@ -217,6 +244,10 @@ def upsert_regime(
         "hy_oas": _opt_round(hy_oas_level, 4),
         "hy_rank": _opt_round(hy_oas_pct_rank, 4),
         "hy_z": _opt_round(hy_oas_zscore, 4),
+        # 6-decimal precision matches NUMERIC(8,6) / NUMERIC(10,6).
+        "sma_slope": _opt_round(spy_sma200_slope_20d, 6),
+        "rsp_ratio": _opt_round(rsp_spy_ratio, 6),
+        "breadth_gap": _opt_round(breadth_rel_gap, 6),
         "stress": credit_stress_flag,
         "methver": methodology_version,
     }
@@ -239,6 +270,9 @@ def upsert_regime(
             hy_oas_level=_opt_round(hy_oas_level, 4),
             hy_oas_pct_rank=_opt_round(hy_oas_pct_rank, 4),
             hy_oas_zscore=_opt_round(hy_oas_zscore, 4),
+            spy_sma200_slope_20d=_opt_round(spy_sma200_slope_20d, 6),
+            rsp_spy_ratio=_opt_round(rsp_spy_ratio, 6),
+            breadth_rel_gap=_opt_round(breadth_rel_gap, 6),
             credit_stress_flag=credit_stress_flag,
             methodology_version=methodology_version,
         )

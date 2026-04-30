@@ -57,143 +57,322 @@
     </div>
   </div>
 
-  {# Render a horizontal progress bar for a [0,1] component score.
-     Width is the score as a percentage; color reflects health bands. #}
-  {% macro score_bar(label, value) %}
+  {# Color the score with the same health bands used everywhere on the dashboard:
+     >=0.66 healthy (green), >=0.33 neutral (yellow), <0.33 stressed (red). #}
+  {% macro score_health_class(value) -%}
+    {%- if value is none -%}
+      text-ink-400
+    {%- elif value|float >= 0.66 -%}
+      text-ok-600
+    {%- elif value|float >= 0.33 -%}
+      text-warn-600
+    {%- else -%}
+      text-bad-600
+    {%- endif -%}
+  {%- endmacro %}
+
+  {% macro score_bar_class(value) -%}
+    {%- if value is none -%}
+      bg-ink-300
+    {%- elif value|float >= 0.66 -%}
+      bg-ok-600
+    {%- elif value|float >= 0.33 -%}
+      bg-warn-600
+    {%- else -%}
+      bg-bad-600
+    {%- endif -%}
+  {%- endmacro %}
+
+  {# Render one cell of a [0,1] score: a small bar plus the numeric value. #}
+  {% macro score_cell(value) %}
     {% if value is none %}
-      <div class="flex items-center gap-2">
-        <div class="text-xs text-ink-500 w-14 flex-shrink-0">{{ label }}</div>
-        <div class="text-xs text-ink-400">—</div>
-      </div>
+      <span class="text-ink-400">—</span>
     {% else %}
       {% set v = value | float %}
       {% set pct = (v * 100) | round(0, 'floor') | int %}
-      {% if v >= 0.66 %}
-        {% set bar = "bg-ok-600" %}
-      {% elif v >= 0.33 %}
-        {% set bar = "bg-warn-600" %}
-      {% else %}
-        {% set bar = "bg-bad-600" %}
-      {% endif %}
-      <div class="flex items-center gap-2">
-        <div class="text-xs text-ink-500 w-14 flex-shrink-0">{{ label }}</div>
-        <div class="flex-1 h-2 rounded bg-ink-100 overflow-hidden">
-          <div class="h-full {{ bar }}" style="width: {{ pct }}%"></div>
+      <div class="flex items-center gap-2 justify-end">
+        <div class="w-16 h-1.5 rounded bg-ink-100 overflow-hidden hidden sm:block">
+          <div class="h-full {{ score_bar_class(v) }}" style="width: {{ pct }}%"></div>
         </div>
-        <div class="text-xs font-mono text-ink-700 w-10 text-right flex-shrink-0">{{ "%.2f"|format(v) }}</div>
+        <span class="font-mono font-semibold {{ score_health_class(v) }}">{{ "%.2f"|format(v) }}</span>
       </div>
     {% endif %}
   {% endmacro %}
 
-  <!-- Market regime banner (v2 composite) -->
-  <div class="bg-white rounded-xl shadow-sm border border-ink-300/40 p-4">
-    <div class="flex flex-col sm:flex-row sm:items-start gap-4">
+  {# Render the percentile rank as "20th pct" with the inverted convention
+     (low VIX/HY OAS = low rank = healthy) preserved verbatim from the row. #}
+  {% macro rank_cell(rank) %}
+    {% if rank is none %}
+      <span class="text-ink-400">—</span>
+    {% else %}
+      {% set r = rank | float %}
+      {% set pct = (r * 100) | round(0, 'floor') | int %}
+      <span class="font-mono text-ink-700">{{ pct }}<span class="text-ink-400">th</span></span>
+    {% endif %}
+  {% endmacro %}
 
-      <!-- LEFT: discrete label + composite score + stress indicator -->
-      <div class="flex-1 min-w-0">
-        <div class="text-xs text-ink-500 uppercase tracking-wide font-medium mb-2">Market regime</div>
-        {% if regime %}
-          <div class="flex items-center gap-2 flex-wrap">
-            {% set colour = regime_colour.get(regime.regime, 'neutral') %}
-            {{ badge(regime.regime | replace("_", " "), colour) }}
-            {% if regime.credit_stress_flag %}
-              <span class="inline-block px-2 py-0.5 rounded bg-bad-100 text-bad-600 border border-bad-600/40 text-xs font-semibold uppercase tracking-wide" title="HY OAS in top 15% AND rising — long entries blocked, sizes halved">
-                ⚠ credit stress
-              </span>
-            {% endif %}
-            {% if regime.methodology_version and regime.methodology_version >= 2 %}
-              <span class="text-xs text-ink-400" title="Composite score methodology v{{ regime.methodology_version }}">v{{ regime.methodology_version }}</span>
-            {% else %}
-              <span class="text-xs text-ink-400" title="Legacy ADX/SMA detection — composite columns unpopulated">v1 legacy</span>
-            {% endif %}
-          </div>
-          {% if regime.composite_score is not none %}
-            {% set comp = regime.composite_score | float %}
-            <div class="mt-3">
-              <div class="flex items-baseline justify-between mb-1">
-                <span class="text-sm font-semibold text-ink-700">Composite health</span>
-                <span class="font-mono font-semibold text-ink-900">{{ "%.2f"|format(comp) }}</span>
-              </div>
-              <div class="h-3 rounded bg-ink-100 overflow-hidden">
-                {% set comp_pct = (comp * 100) | round(0, 'floor') | int %}
-                {% if comp >= 0.66 %}
-                  {% set comp_bar = "bg-ok-600" %}
-                {% elif comp >= 0.33 %}
-                  {% set comp_bar = "bg-warn-600" %}
-                {% else %}
-                  {% set comp_bar = "bg-bad-600" %}
-                {% endif %}
-                <div class="h-full {{ comp_bar }}" style="width: {{ comp_pct }}%"></div>
-              </div>
-            </div>
+  <!-- ============================================================
+       Market Regime card — DESIGN §regime
+       ============================================================ -->
+  {% if regime %}
+    {% set comp = regime.composite_score | float if regime.composite_score is not none else None %}
+    {% set comp_pct = (comp * 100) | round(0, 'floor') | int if comp is not none else 0 %}
+    {# Position vs SMA200, used as the underlying signal description for trend. #}
+    {% set spy_pos_pct = ((regime.spy_close|float - regime.spy_sma200|float) / regime.spy_sma200|float * 100) %}
+  {% endif %}
+  {% call card(title="Market Regime", subtitle="Daily composite — vol / trend / breadth / credit") %}
+    {% if not regime %}
+      {{ empty("No regime computed yet — run `stockscan jobs nightly-scan` to populate.", "📊") }}
+    {% else %}
+
+      <!-- Header strip: discrete label + stress + methodology + as-of date -->
+      <div class="flex items-center justify-between gap-3 flex-wrap mb-4">
+        <div class="flex items-center gap-2 flex-wrap">
+          {% set colour = regime_colour.get(regime.regime, 'neutral') %}
+          {{ badge(regime.regime | replace("_", " "), colour) }}
+          {% if regime.credit_stress_flag %}
+            <span class="inline-block px-2 py-0.5 rounded bg-bad-100 text-bad-600 border border-bad-600/40 text-xs font-semibold uppercase tracking-wide"
+                  title="HY OAS in top 15% AND rising — long entries blocked, sizes halved">
+              ⚠ credit stress
+            </span>
           {% endif %}
-        {% else %}
-          <span class="text-sm text-ink-500">unknown — run a scan to compute</span>
-        {% endif %}
+          {% if regime.methodology_version and regime.methodology_version >= 2 %}
+            <span class="text-xs text-ink-400" title="Composite methodology v{{ regime.methodology_version }}">v{{ regime.methodology_version }}</span>
+          {% else %}
+            <span class="text-xs text-ink-400" title="Legacy ADX/SMA detection — composite columns unpopulated">v1 legacy</span>
+          {% endif %}
+        </div>
+        <div class="text-xs text-ink-500">as of {{ regime.as_of_date }}</div>
       </div>
 
-      <!-- RIGHT: per-component scores -->
-      {% if regime %}
-        <div class="sm:w-72 flex-shrink-0 space-y-2">
-          {{ score_bar("vol", regime.vol_score) }}
-          {{ score_bar("trend", regime.trend_score) }}
-          {{ score_bar("breadth", regime.breadth_score) }}
-          {{ score_bar("credit", regime.credit_score) }}
+      <!-- Headline composite score -->
+      {% if comp is not none %}
+        <div class="mb-5">
+          <div class="flex items-baseline justify-between mb-1">
+            <span class="text-sm font-semibold text-ink-700">Composite health</span>
+            <span class="font-mono text-2xl font-bold {{ score_health_class(comp) }}">{{ "%.2f"|format(comp) }}</span>
+          </div>
+          <div class="h-3 rounded bg-ink-100 overflow-hidden">
+            <div class="h-full {{ score_bar_class(comp) }}" style="width: {{ comp_pct }}%"></div>
+          </div>
+          <div class="text-xs text-ink-500 mt-1">
+            Weighted average of the four components below (vol 40% / trend 25% / breadth 20% / credit 15%).
+            Renormalized over non-NULL components when a data source is unavailable.
+          </div>
         </div>
       {% endif %}
-    </div>
 
-    {% if regime %}
-      <!-- Underlying levels — small print, scrolls horizontally on narrow screens. -->
-      <div class="mt-3 pt-3 border-t border-ink-300/30 text-xs text-ink-500 overflow-x-auto whitespace-nowrap">
-        <span>ADX {{ "%.1f"|format(regime.adx|float) }}</span>
-        <span class="mx-1">·</span>
-        <span>SPY {{ "%.2f"|format(regime.spy_close|float) }} / SMA200 {{ "%.2f"|format(regime.spy_sma200|float) }}</span>
-        {% if regime.vix_level is not none %}
-          <span class="mx-1">·</span>
-          <span>VIX {{ "%.2f"|format(regime.vix_level|float) }}{% if regime.vix_pct_rank is not none %} (rank {{ "%.2f"|format(regime.vix_pct_rank|float) }}){% endif %}</span>
-        {% endif %}
-        {% if regime.hy_oas_level is not none %}
-          <span class="mx-1">·</span>
-          <span>HY OAS {{ "%.2f"|format(regime.hy_oas_level|float) }}%{% if regime.hy_oas_pct_rank is not none %} (rank {{ "%.2f"|format(regime.hy_oas_pct_rank|float) }}{% if regime.hy_oas_zscore is not none %}, z {{ "%+.1f"|format(regime.hy_oas_zscore|float) }}{% endif %}){% endif %}</span>
-        {% endif %}
-        <span class="mx-1">·</span>
-        <span>{{ regime.as_of_date }}</span>
+      <!-- Per-component breakdown — grid-based so each component can be a
+           clickable <details> block with its own explanation underneath.
+           Header row + summaries share the same grid template so columns
+           stay aligned vertically. -->
+      <div class="text-xs text-ink-500 uppercase tracking-wide font-medium mb-2">Components</div>
+      {# Tailwind arbitrary value: 6 columns proportioned for the headline data. #}
+      {% set _grid = "grid grid-cols-[1.3fr_1.6fr_1.1fr_0.7fr_1.3fr_0.6fr] gap-3 items-center" %}
+      <div class="overflow-x-auto -mx-4">
+        <div class="min-w-[640px]">
+
+          <!-- Column header -->
+          <div class="{{ _grid }} px-4 py-2 text-xs text-ink-500 font-medium border-b border-ink-300/40 uppercase tracking-wide">
+            <div>Component</div>
+            <div>Signal</div>
+            <div>Value</div>
+            <div class="text-right">Rank</div>
+            <div class="text-right">Score</div>
+            <div class="text-right">Weight</div>
+          </div>
+
+          {# Render one component as <details>: summary is a grid row,
+             body is an indented explanation that may include the secondary
+             intermediate signals (slope/ratio/z-score). #}
+          {% macro component_row(name, signal_label, value_html, rank, score, weight, explanation) %}
+            <details class="border-b border-ink-300/30 group/component">
+              {# list-none to suppress the default disclosure triangle; we draw our own. #}
+              <summary class="{{ _grid }} px-4 py-2.5 cursor-pointer hover:bg-ink-50 list-none transition-colors">
+                <div class="flex items-center gap-2 font-medium text-ink-700">
+                  <span class="text-ink-400 transition-transform group-open/component:rotate-90">▸</span>
+                  {{ name }}
+                </div>
+                <div class="font-mono text-sm text-ink-700 truncate" title="{{ signal_label }}">{{ signal_label }}</div>
+                <div class="font-mono text-sm text-ink-700">{{ value_html|safe }}</div>
+                <div class="text-right">{{ rank_cell(rank) }}</div>
+                <div class="text-right">{{ score_cell(score) }}</div>
+                <div class="text-right font-mono text-ink-500 text-sm">{{ weight }}</div>
+              </summary>
+              <div class="px-4 pb-4 pl-12 text-xs text-ink-600 leading-relaxed bg-ink-50/40">
+                {{ explanation }}
+              </div>
+            </details>
+          {% endmacro %}
+
+          <!-- VOL ============================================================ -->
+          {% set vol_value %}
+            {% if regime.vix_level is not none %}{{ "%.2f"|format(regime.vix_level|float) }}{% else %}<span class="text-ink-400">—</span>{% endif %}
+          {% endset %}
+          {% set vol_explanation %}
+            <p class="mt-2">
+              <strong>Volatility regime.</strong> Inverted percentile rank of the VIX index
+              over the trailing 252 trading days. The headline number on the left is today's
+              spot VIX; the rank shows where that level sits in its own recent history. Low
+              VIX (calm) → low rank → high score; spiking VIX (panic) → high rank → low score.
+              We use a percentile rank instead of fixed thresholds because what counts as
+              "stressed" drifts over time — VIX in the high teens was elevated in 2017 and
+              normal in 2022.
+            </p>
+            <ul class="mt-2 ml-4 list-disc space-y-0.5">
+              <li>Window: trailing 252 trading days (~1 year).</li>
+              <li>Score formula: <code>1 - rolling_pct_rank(VIX, 252)</code>.</li>
+              <li>Source: EODHD <code>/eod/VIX.INDX</code>, stored in the bars hypertable.</li>
+            </ul>
+          {% endset %}
+          {{ component_row("Volatility", "VIX", vol_value, regime.vix_pct_rank, regime.vol_score, "40%", vol_explanation) }}
+
+          <!-- TREND ========================================================== -->
+          {% set trend_value %}
+            {% if spy_pos_pct >= 0 %}+{% endif %}{{ "%.1f"|format(spy_pos_pct) }}%
+          {% endset %}
+          {% set trend_explanation %}
+            <p class="mt-2">
+              <strong>Trend regime.</strong> Smooth combination of two SPY trend signals:
+              today's close relative to its 200-day SMA (the headline value on the left)
+              and the 20-day slope of the SMA itself. Each is clipped to a saturation band
+              (±5% for position, ±2%/20d for slope) and averaged into a [0, 1] score where
+              0.5 is neutral. Captures both <em>where</em> the market is and <em>which way</em>
+              it's moving.
+            </p>
+            <ul class="mt-2 ml-4 list-disc space-y-0.5">
+              <li>SMA(200) 20-day slope:
+                {% if regime.spy_sma200_slope_20d is not none %}
+                  <code>{{ "%+.2f"|format(regime.spy_sma200_slope_20d|float * 100) }}%</code>
+                  over the last 20 days
+                {% else %}
+                  <span class="text-ink-400">not persisted (pre-0011 row)</span>
+                {% endif %}
+              </li>
+              <li>SPY close: <code>{{ "%.2f"|format(regime.spy_close|float) }}</code> · SMA(200): <code>{{ "%.2f"|format(regime.spy_sma200|float) }}</code></li>
+              <li>No percentile rank — this is a position+slope blend, not a percentile-based score.</li>
+            </ul>
+          {% endset %}
+          {{ component_row("Trend", "SPY vs SMA(200)", trend_value, None, regime.trend_score, "25%", trend_explanation) }}
+
+          <!-- BREADTH ======================================================== -->
+          {% set breadth_value %}
+            {% if regime.breadth_rel_gap is not none %}
+              {% set gap_pct = regime.breadth_rel_gap|float * 100 %}
+              {% if gap_pct >= 0 %}+{% endif %}{{ "%.2f"|format(gap_pct) }}%
+            {% elif regime.breadth_score is not none %}
+              <span class="text-ink-400">(pre-0011)</span>
+            {% else %}
+              <span class="text-ink-400">—</span>
+            {% endif %}
+          {% endset %}
+          {% set breadth_explanation %}
+            <p class="mt-2">
+              <strong>Breadth regime.</strong> Cheap proxy for "are most stocks
+              participating?" using the ratio of RSP (equal-weight S&amp;P 500) to SPY
+              (cap-weight S&amp;P 500). When the 20-day SMA of that ratio is
+              <em>above</em> its 200-day SMA, breadth is broadening — small/mid caps are
+              keeping up with mega-caps. When it's <em>below</em>, breadth is narrowing
+              (the "Mag 7 carrying everything" regime). The headline value on the left is
+              the relative gap between those two SMAs.
+            </p>
+            <ul class="mt-2 ml-4 list-disc space-y-0.5">
+              <li>Spot RSP/SPY ratio:
+                {% if regime.rsp_spy_ratio is not none %}
+                  <code>{{ "%.4f"|format(regime.rsp_spy_ratio|float) }}</code>
+                {% else %}
+                  <span class="text-ink-400">not persisted (pre-0011 row)</span>
+                {% endif %}
+              </li>
+              <li>Saturation band: ±5% gap → score in [0, 1] linearly.</li>
+              <li>No percentile rank — this is a ratio-trend signal, not a percentile-based score.</li>
+            </ul>
+          {% endset %}
+          {{ component_row("Breadth", "RSP/SPY 20d–200d gap", breadth_value, None, regime.breadth_score, "20%", breadth_explanation) }}
+
+          <!-- CREDIT ========================================================= -->
+          {% set credit_value %}
+            {% if regime.hy_oas_level is not none %}{{ "%.2f"|format(regime.hy_oas_level|float) }}%{% else %}<span class="text-ink-400">—</span>{% endif %}
+          {% endset %}
+          {% set credit_explanation %}
+            <p class="mt-2">
+              <strong>Credit regime.</strong> Inverted percentile rank of HY OAS
+              (ICE BofA US High Yield Option-Adjusted Spread, FRED series
+              <code>BAMLH0A0HYM2</code>) over the trailing 252 days. Tight spreads = high
+              score; wide spreads = low score. Bond markets typically lead equities by
+              1–3 days when stress is brewing, which is why this is in the composite at
+              all despite a daily-bar equity system.
+            </p>
+            <ul class="mt-2 ml-4 list-disc space-y-0.5">
+              <li>HY OAS z-score:
+                {% if regime.hy_oas_zscore is not none %}
+                  <code>{{ "%+.2f"|format(regime.hy_oas_zscore|float) }}</code>
+                  (rolling 252-day mean / std)
+                {% else %}
+                  <span class="text-ink-400">—</span>
+                {% endif %}
+              </li>
+              <li>
+                Credit-stress flag (separate, discrete): fires when rank &gt; 0.85
+                <em>and</em> spreads are rising over the last 5 days. When set, all sizes
+                are halved and new long entries are blocked entirely — that's the
+                tail-risk circuit breaker, orthogonal to this smooth credit_score.
+              </li>
+              <li>Score formula: <code>1 - rolling_pct_rank(HY OAS, 252)</code>.</li>
+            </ul>
+          {% endset %}
+          {{ component_row("Credit", "HY OAS", credit_value, regime.hy_oas_pct_rank, regime.credit_score, "15%", credit_explanation) }}
+
+        </div>
       </div>
+
+      <!-- Legacy ADX/SMA detail — collapsed below the table since composite owns the headline now. -->
+      <details class="mt-4 text-xs text-ink-500">
+        <summary class="cursor-pointer hover:text-ink-700">Legacy ADX/SMA detail (drives the discrete label)</summary>
+        <div class="mt-2 pl-2 font-mono">
+          ADX(14) {{ "%.1f"|format(regime.adx|float) }}
+          · SPY close {{ "%.2f"|format(regime.spy_close|float) }}
+          / SMA200 {{ "%.2f"|format(regime.spy_sma200|float) }}
+        </div>
+      </details>
 
       <!-- Per-strategy effective sizing -->
       {% if strategy_factors %}
-        <div class="mt-3 pt-3 border-t border-ink-300/30">
+        <div class="mt-5 pt-4 border-t border-ink-300/40">
           <div class="text-xs text-ink-500 uppercase tracking-wide font-medium mb-2">Strategy sizing today</div>
-          <div class="overflow-x-auto -mx-1">
-            <table class="w-full text-xs min-w-[480px]">
-              <thead class="text-ink-500">
+          <div class="overflow-x-auto -mx-4">
+            <table class="w-full text-sm min-w-[520px]">
+              <thead class="text-xs text-ink-500 border-b border-ink-300/40">
                 <tr class="text-left">
-                  <th class="px-1 py-1 font-medium">Strategy</th>
-                  <th class="px-1 py-1 font-medium text-right">Affinity</th>
-                  <th class="px-1 py-1 font-medium text-right">Composite ×</th>
-                  <th class="px-1 py-1 font-medium text-right">Stress ×</th>
-                  <th class="px-1 py-1 font-medium text-right">Effective</th>
+                  <th class="px-4 py-2 font-medium">Strategy</th>
+                  <th class="px-2 py-2 font-medium text-right">Affinity</th>
+                  <th class="px-2 py-2 font-medium text-right">Composite ×</th>
+                  <th class="px-2 py-2 font-medium text-right">Stress ×</th>
+                  <th class="px-2 py-2 font-medium text-right">Effective</th>
                 </tr>
               </thead>
               <tbody>
                 {% for sf in strategy_factors %}
                   {% set eff = sf.effective | float %}
-                  <tr class="border-t border-ink-300/30">
-                    <td class="px-1 py-1.5 font-medium text-ink-700">{{ sf.cls.display_name }}</td>
-                    <td class="px-1 py-1.5 text-right font-mono text-ink-700">{{ "%.2f"|format(sf.affinity|float) }}</td>
-                    <td class="px-1 py-1.5 text-right font-mono text-ink-500">{{ "%.2f"|format(sf.composite_mult|float) }}</td>
-                    <td class="px-1 py-1.5 text-right font-mono {{ 'text-bad-600 font-semibold' if sf.stress_mult|float < 1.0 else 'text-ink-500' }}">{{ "%.2f"|format(sf.stress_mult|float) }}</td>
-                    <td class="px-1 py-1.5 text-right font-mono font-semibold {% if eff >= 0.66 %}text-ok-600{% elif eff >= 0.33 %}text-warn-600{% elif eff > 0 %}text-bad-600{% else %}text-ink-400{% endif %}">{{ "%.2f"|format(eff) }}</td>
+                  <tr class="border-b border-ink-300/30 last:border-b-0">
+                    <td class="px-4 py-2 font-medium text-ink-700">{{ sf.cls.display_name }}</td>
+                    <td class="px-2 py-2 text-right font-mono text-ink-700">{{ "%.2f"|format(sf.affinity|float) }}</td>
+                    <td class="px-2 py-2 text-right font-mono text-ink-500">{{ "%.2f"|format(sf.composite_mult|float) }}</td>
+                    <td class="px-2 py-2 text-right font-mono {{ 'text-bad-600 font-semibold' if sf.stress_mult|float < 1.0 else 'text-ink-500' }}">{{ "%.2f"|format(sf.stress_mult|float) }}</td>
+                    <td class="px-2 py-2 text-right font-mono font-semibold {{ score_health_class(eff) }}">{{ "%.2f"|format(eff) }}</td>
                   </tr>
                 {% endfor %}
               </tbody>
             </table>
           </div>
+          <div class="text-xs text-ink-500 mt-2">
+            Final qty = base × affinity × composite × stress, rounded.
+            Affinity is per-strategy; composite and stress apply uniformly.
+          </div>
         </div>
       {% endif %}
     {% endif %}
-  </div>
+  {% endcall %}
 
   <!-- Latest signals -->
   {% call card(title="Latest signals", subtitle="Most recent 25 across all strategies") %}
