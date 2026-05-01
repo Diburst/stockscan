@@ -118,12 +118,21 @@ def get_bars(
 
 
 def latest_bar_date(symbol: str, *, session: Session | None = None) -> date | None:
-    """Return the date of the most recent stored bar for `symbol`, or None."""
-    sql = text("SELECT MAX(bar_ts)::date AS d FROM bars WHERE symbol = :symbol AND interval='1d'")
+    """Return the date of the most recent stored bar for `symbol`, or None.
+
+    Uses positional row access (``row[0]``) rather than attribute access on
+    the aliased ``AS d`` column — SQLAlchemy 2.x's Row attribute lookup
+    behaves inconsistently with short/aggregate aliases (sometimes returns
+    the Row itself, breaking downstream f-string formatting).
+    """
+    sql = text("SELECT MAX(bar_ts)::date FROM bars WHERE symbol = :symbol AND interval='1d'")
 
     def _run(s: Session) -> date | None:
         row = s.execute(sql, {"symbol": symbol}).first()
-        return row.d if row and row.d else None
+        if row is None:
+            return None
+        val = row[0]
+        return val if val is not None else None
 
     if session is not None:
         return _run(session)

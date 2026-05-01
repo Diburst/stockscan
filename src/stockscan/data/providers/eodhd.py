@@ -14,7 +14,7 @@ Rate limits depend on the plan. We use httpx with tenacity retries on 5xx.
 from __future__ import annotations
 
 import logging
-from datetime import date, datetime, timezone
+from datetime import UTC, date, datetime
 from decimal import Decimal
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -129,7 +129,7 @@ class EODHDProvider(DataProvider):
             out.append(
                 BarRow(
                     symbol=symbol,
-                    bar_ts=ts.astimezone(timezone.utc),
+                    bar_ts=ts.astimezone(UTC),
                     interval="1d",
                     open=self._to_decimal(r.get("open")),
                     high=self._to_decimal(r.get("high")),
@@ -254,6 +254,54 @@ class EODHDProvider(DataProvider):
         return data
 
     # ------------------------------------------------------------------
+    # News (DESIGN §news / TODO §news)
+    # ------------------------------------------------------------------
+    def get_news(
+        self,
+        symbol: str | None = None,
+        tag: str | None = None,
+        from_date: date | None = None,
+        to_date: date | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]:
+        """Fetch financial news from EODHD's ``/news`` endpoint.
+
+        Pass ``symbol`` for per-instrument news, ``tag`` for topic-tagged
+        news, or neither for the broadest feed. EODHD accepts ONE filter
+        per call; the refresh layer is responsible for orchestrating
+        multiple pulls when the general-market feed spans many symbols
+        or tags.
+
+        Returns the raw JSON payload as ``list[dict]`` — the news store
+        layer handles mapping to canonical ``NewsArticle`` form. We keep
+        provider methods schema-free so a future Bloomberg/Tiingo backend
+        only has to remap into the same shape.
+
+        Soft-fails on HTTP error: returns ``[]`` and logs a warning.
+        Doesn't raise — news is non-load-bearing.
+        """
+        params: dict[str, Any] = {"limit": limit, "offset": offset}
+        if symbol:
+            # EODHD wants the .US suffix on the symbol filter.
+            params["s"] = symbol if "." in symbol else f"{symbol}.US"
+        if tag:
+            params["t"] = tag
+        if from_date:
+            params["from"] = from_date.isoformat()
+        if to_date:
+            params["to"] = to_date.isoformat()
+        try:
+            data = self._get("/news", **params)
+        except EODHDError as exc:
+            log.warning("news: pull failed (symbol=%s tag=%s): %s", symbol, tag, exc)
+            return []
+        if not isinstance(data, list):
+            log.warning("news: unexpected payload shape (not a list)")
+            return []
+        return data
+
+    # ------------------------------------------------------------------
     # Bulk EOD — DESIGN §4.1 daily refresh path
     # ------------------------------------------------------------------
     def get_eod_bulk(
@@ -293,7 +341,7 @@ class EODHDProvider(DataProvider):
             out.append(
                 BarRow(
                     symbol=code,
-                    bar_ts=ts.astimezone(timezone.utc),
+                    bar_ts=ts.astimezone(UTC),
                     interval="1d",
                     open=self._to_decimal(r.get("open")),
                     high=self._to_decimal(r.get("high")),

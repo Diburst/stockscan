@@ -31,6 +31,7 @@ log = logging.getLogger(__name__)
 # Dataclasses
 # ---------------------------------------------------------------------------
 
+
 @dataclass(frozen=True, slots=True)
 class NewsArticle:
     article_id: str
@@ -58,6 +59,7 @@ class NewsFeedConfig:
 # ---------------------------------------------------------------------------
 # article_id generation
 # ---------------------------------------------------------------------------
+
 
 def make_article_id(link: str) -> str:
     """SHA-256 of the article URL — stable, URL-safe, collision-proof for our scale."""
@@ -142,6 +144,7 @@ def upsert_articles(
 # Queries
 # ---------------------------------------------------------------------------
 
+
 def _rows_to_articles(rows: list) -> list[NewsArticle]:
     def _dec(v: object) -> Decimal | None:
         return Decimal(str(v)) if v is not None else None
@@ -204,49 +207,101 @@ def recent_general(
     *,
     config: NewsFeedConfig | None = None,
     session: Session | None = None,
+    fallback_to_recent: bool = True,
 ) -> list[NewsArticle]:
     """Return the N most-recent articles matching the general-market feed config.
 
-    Matches articles whose symbol set overlaps config.symbols OR whose tags
-    overlap config.tags.
+    Strict match: an article passes if its symbol set overlaps
+    ``config.symbols`` OR its tags overlap ``config.tags``.
+
+    Empty result fallback: if the strict match returns nothing AND
+    ``fallback_to_recent`` is True (the default), return the N most-recent
+    articles regardless of feed config. This avoids the "I just refreshed
+    and the dashboard is empty" failure mode when EODHD's payload tags
+    don't line up with the configured filter.
+
+    Implementation note: uses a scalar subquery for the symbol list rather
+    than a LEFT JOIN + window function. The earlier DISTINCT ON + window
+    combination produced empty results in some Postgres + SQLAlchemy
+    parameter-binding scenarios. Explicit ``CAST(:p AS TEXT[])`` casts
+    are belt-and-suspenders for the array operators.
     """
+
     def _run(sess: Session) -> list[NewsArticle]:
         cfg = config or get_feed_config(session=sess)
         if not cfg.symbols and not cfg.tags:
-            return []
-        sql = text(
+            return _recent_any(sess, limit) if fallback_to_recent else []
+
+        strict_sql = text(
             """
-            SELECT DISTINCT ON (a.published_at, a.article_id)
-                   a.article_id, a.published_at, a.title, a.snippet, a.link,
+            SELECT a.article_id, a.published_at, a.title, a.snippet, a.link,
                    a.source, a.sentiment_polarity, a.sentiment_pos,
                    a.sentiment_neg, a.sentiment_neu, a.tags,
-                   array_agg(DISTINCT s.symbol) FILTER (WHERE s.symbol IS NOT NULL)
-                       OVER (PARTITION BY a.article_id) AS symbols
+                   COALESCE(
+                       (SELECT array_agg(symbol ORDER BY symbol)
+                        FROM news_article_symbols
+                        WHERE article_id = a.article_id),
+                       ARRAY[]::TEXT[]
+                   ) AS symbols
             FROM news_articles a
-            LEFT JOIN news_article_symbols s ON s.article_id = a.article_id
             WHERE (
                 EXISTS (
                     SELECT 1 FROM news_article_symbols ns
                     WHERE ns.article_id = a.article_id
-                      AND ns.symbol = ANY(:syms)
+                      AND ns.symbol = ANY(CAST(:syms AS TEXT[]))
                 )
-                OR a.tags && :tags
+                OR a.tags && CAST(:tags AS TEXT[])
             )
-            ORDER BY a.published_at DESC, a.article_id
+            ORDER BY a.published_at DESC
             LIMIT :lim
             """
         )
-        rows = sess.execute(sql, {
-            "syms": cfg.symbols,
-            "tags": cfg.tags,
-            "lim": limit,
-        }).all()
-        return _rows_to_articles(rows)
+        rows = sess.execute(
+            strict_sql,
+            {"syms": list(cfg.symbols), "tags": list(cfg.tags), "lim": limit},
+        ).all()
+        if rows or not fallback_to_recent:
+            return _rows_to_articles(rows)
+        # Strict match returned nothing — fall back to the most recent N
+        # so the dashboard shows *something* after a successful refresh.
+        log.info(
+            "news.recent_general: feed-config strict match empty; "
+            "falling back to most-recent regardless of filter"
+        )
+        return _recent_any(sess, limit)
 
     if session is not None:
         return _run(session)
     with session_scope() as s:
         return _run(s)
+
+
+def _recent_any(sess: Session, limit: int) -> list[NewsArticle]:
+    """Most-recent N articles ignoring the feed config.
+
+    Used as a fallback by :func:`recent_general` when the strict match
+    yields nothing, so the dashboard surfaces *some* news after a
+    successful refresh rather than an empty card. Also useful directly
+    for the (future) ``/news`` page chronological feed.
+    """
+    sql = text(
+        """
+        SELECT a.article_id, a.published_at, a.title, a.snippet, a.link,
+               a.source, a.sentiment_polarity, a.sentiment_pos,
+               a.sentiment_neg, a.sentiment_neu, a.tags,
+               COALESCE(
+                   (SELECT array_agg(symbol ORDER BY symbol)
+                    FROM news_article_symbols
+                    WHERE article_id = a.article_id),
+                   ARRAY[]::TEXT[]
+               ) AS symbols
+        FROM news_articles a
+        ORDER BY a.published_at DESC
+        LIMIT :lim
+        """
+    )
+    rows = sess.execute(sql, {"lim": limit}).all()
+    return _rows_to_articles(rows)
 
 
 def fts_search(
@@ -372,10 +427,22 @@ def list_articles(
 # ---------------------------------------------------------------------------
 
 _DEFAULT_SYMBOLS = [
-    "SPY", "QQQ", "DIA", "IWM",
-    "XLK", "SOXX", "SMH",
-    "AAPL", "MSFT", "NVDA", "GOOGL",
-    "META", "AMZN", "AMD", "TSM", "ASML",
+    "SPY",
+    "QQQ",
+    "DIA",
+    "IWM",
+    "XLK",
+    "SOXX",
+    "SMH",
+    "AAPL",
+    "MSFT",
+    "NVDA",
+    "GOOGL",
+    "META",
+    "AMZN",
+    "AMD",
+    "TSM",
+    "ASML",
 ]
 _DEFAULT_TAGS = [
     "monetary-policy",
@@ -404,6 +471,7 @@ _UPSERT_CONFIG_SQL = text(
 
 def get_feed_config(*, session: Session | None = None) -> NewsFeedConfig:
     """Return the feed config, seeding defaults if none exists."""
+
     def _run(sess: Session) -> NewsFeedConfig:
         row = sess.execute(_GET_CONFIG_SQL).first()
         if row is None:
@@ -453,6 +521,7 @@ def save_feed_config(
 # news_alerts_sent
 # ---------------------------------------------------------------------------
 
+
 def mark_alert_sent(
     article_id: str,
     channel: str,
@@ -477,6 +546,76 @@ def mark_alert_sent(
         _run(s)
 
 
+def last_fetched_at(*, session: Session | None = None) -> datetime | None:
+    """Return ``MAX(fetched_at)`` across all news articles, or None if empty.
+
+    Used by the dashboard to show "last refresh: 14m ago" so the user
+    knows whether the feed is stale.
+
+    Implementation note: we use positional row access (``row[0]``) rather
+    than attribute access (``row.t``) here. SQLAlchemy 2.x's ``Row``
+    objects behave inconsistently for attribute access on short or
+    aggregate column names — `row.t` was returning the Row itself in
+    practice, which then blew up downstream f-string formatting with
+    ``Row.__format__``. Positional access bypasses the attribute logic
+    and returns the column value directly.
+    """
+    sql = text("SELECT MAX(fetched_at) FROM news_articles")
+
+    def _run(sess: Session) -> datetime | None:
+        row = sess.execute(sql).first()
+        if row is None:
+            return None
+        val = row[0]
+        return val if val is not None else None
+
+    if session is not None:
+        return _run(session)
+    with session_scope() as s:
+        return _run(s)
+
+
+def get_article(
+    article_id: str,
+    *,
+    session: Session | None = None,
+) -> NewsArticle | None:
+    """Fetch a single article by its hashed-link id, or None if not found.
+
+    Used by the on-demand reader: when the user expands an article in the
+    dashboard, we re-fetch its body from the provider, but we still need
+    the canonical metadata (link, published_at, symbols, tags) from our
+    store to drive the re-fetch query.
+    """
+    sql = text(
+        """
+        SELECT a.article_id, a.published_at, a.title, a.snippet, a.link,
+               a.source, a.sentiment_polarity, a.sentiment_pos,
+               a.sentiment_neg, a.sentiment_neu, a.tags,
+               COALESCE(
+                   (SELECT array_agg(symbol ORDER BY symbol)
+                    FROM news_article_symbols
+                    WHERE article_id = a.article_id),
+                   ARRAY[]::TEXT[]
+               ) AS symbols
+        FROM news_articles a
+        WHERE a.article_id = :aid
+        LIMIT 1
+        """
+    )
+
+    def _run(sess: Session) -> NewsArticle | None:
+        row = sess.execute(sql, {"aid": article_id}).first()
+        if row is None:
+            return None
+        return _rows_to_articles([row])[0]
+
+    if session is not None:
+        return _run(session)
+    with session_scope() as s:
+        return _run(s)
+
+
 def alerts_already_sent(
     article_ids: list[str],
     channel: str,
@@ -487,8 +626,7 @@ def alerts_already_sent(
     if not article_ids:
         return set()
     sql = text(
-        "SELECT article_id FROM news_alerts_sent "
-        "WHERE article_id = ANY(:ids) AND channel = :ch"
+        "SELECT article_id FROM news_alerts_sent WHERE article_id = ANY(:ids) AND channel = :ch"
     )
 
     def _run(sess: Session) -> set[str]:

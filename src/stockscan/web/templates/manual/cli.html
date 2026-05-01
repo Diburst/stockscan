@@ -1,0 +1,112 @@
+{% extends "base.html" %}
+
+{% block title %}CLI Reference{% endblock %}
+
+{% block head_extra %}
+<style>
+  /* Scope code-block styling locally — same dark-on-light look the
+     markdown render uses, so the page feels consistent. */
+  .cli-help {
+    background: #0f172a;
+    color: #f1f5f9;
+    padding: 1rem;
+    border-radius: 0.5rem;
+    overflow-x: auto;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 0.85rem;
+    line-height: 1.5;
+    white-space: pre;
+    margin: 0.5rem 0 0;
+  }
+  /* TOC sidebar — same look as the markdown render. */
+  .cli-toc a {
+    color: #475569;
+    text-decoration: none;
+    display: block;
+    padding: 0.15rem 0.5rem;
+    font-size: 0.85rem;
+    line-height: 1.35;
+    border-left: 2px solid transparent;
+  }
+  .cli-toc a:hover { color: #0f172a; border-left-color: #cbd5e1; }
+  .cli-toc .lvl-2 { padding-left: 0.5rem; }
+  .cli-toc .lvl-3 { padding-left: 1.4rem; font-size: 0.8rem; color: #64748b; }
+  .cli-anchor-target { scroll-margin-top: 5rem; }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="grid grid-cols-1 lg:grid-cols-[16rem_1fr] gap-6">
+
+  <aside class="lg:sticky lg:top-20 lg:self-start lg:max-h-[calc(100vh-6rem)] lg:overflow-y-auto">
+    <div class="text-xs uppercase tracking-wide text-ink-500 mb-1.5">Docs</div>
+    <ul class="text-sm space-y-0.5 mb-4">
+      <li>
+        <a href="/docs/cli"
+           class="block py-1 px-2 rounded bg-ink-900 text-white">⚡ CLI Reference</a>
+      </li>
+      <li><a href="/docs" class="block py-1 px-2 rounded hover:bg-ink-100">← Doc index</a></li>
+    </ul>
+
+    <div class="text-xs uppercase tracking-wide text-ink-500 mb-1.5">Commands</div>
+    <nav class="cli-toc">
+      {% for s in sections %}
+        <a class="lvl-{{ s.level }}" href="#{{ s.anchor }}">
+          {%- if s.level == 1 -%}
+            ⚡ {{ s.name }}
+          {%- elif s.level == 2 -%}
+            {{ s.name }}{% if s.is_group %} <span class="text-ink-400">/</span>{% endif %}
+          {%- else -%}
+            {{ s.name }}
+          {%- endif -%}
+        </a>
+      {% endfor %}
+    </nav>
+  </aside>
+
+  <main class="min-w-0 space-y-5">
+    <div class="mb-3 text-xs text-ink-500 flex flex-wrap items-center gap-2">
+      <a href="/docs" class="underline">Documentation</a>
+      <span>/</span>
+      <span>CLI Reference</span>
+    </div>
+
+    <div class="bg-white rounded-xl shadow-sm border border-ink-300/40 p-5">
+      <h1 class="text-2xl font-semibold mb-1">CLI Reference</h1>
+      <p class="text-sm text-ink-500">
+        Auto-generated from the live Typer command tree. Same output you'd
+        get at the terminal with
+        <code class="bg-ink-100 px-1 rounded text-xs">stockscan &lt;cmd&gt; --help</code>.
+        If something here looks wrong, the source of truth is
+        <code class="bg-ink-100 px-1 rounded text-xs">src/stockscan/cli.py</code>
+        — update there and this page updates automatically on next request.
+      </p>
+    </div>
+
+    {% if not sections %}
+      <div class="bg-bad-100 text-bad-600 border border-bad-600/30 rounded p-4 text-sm">
+        ⚠ Couldn't introspect the CLI tree. Check the FastAPI logs for the
+        underlying error.
+      </div>
+    {% endif %}
+
+    {% for s in sections %}
+      <section id="{{ s.anchor }}" class="bg-white rounded-xl shadow-sm border border-ink-300/40 p-5 cli-anchor-target">
+        <div class="flex items-baseline justify-between flex-wrap gap-2 mb-2">
+          <h2 class="font-semibold {% if s.level == 1 %}text-xl{% elif s.level == 2 %}text-lg{% else %}text-base{% endif %}">
+            <a href="#{{ s.anchor }}" class="hover:underline">
+              <span class="font-mono">{{ s.name }}</span>
+            </a>
+          </h2>
+          <span class="text-xs text-ink-500">
+            {% if s.level == 1 %}root
+            {% elif s.is_group %}group
+            {% else %}command{% endif %}
+          </span>
+        </div>
+        <pre class="cli-help">{{ s.help_text }}</pre>
+      </section>
+    {% endfor %}
+  </main>
+</div>
+{% endblock %}

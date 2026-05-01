@@ -21,6 +21,7 @@ Workflow per run:
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import logging
 from dataclasses import dataclass
@@ -35,6 +36,7 @@ from sqlalchemy.orm import Session
 from stockscan.config import settings
 from stockscan.data.store import get_bars
 from stockscan.db import session_scope
+from stockscan.ml.predict import score_signal as ml_score_signal
 from stockscan.regime import detect_regime
 from stockscan.risk.filters import FilterChain, PortfolioContext
 from stockscan.risk.sizer import position_size
@@ -48,6 +50,25 @@ from stockscan.technical import compute_technical_score, upsert_score
 from stockscan.universe import current_constituents, members_as_of
 
 log = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class _RegimeShim:
+    """Duck-typed stand-in for ``MarketRegime`` used by the meta-label
+    feature builder.
+
+    The full ``MarketRegime`` row carries a dozen percentile-rank
+    columns that ``build_features`` doesn't read. Rather than
+    round-trip the DB inside the scoring loop, we forward the three
+    attributes the feature block actually consumes (regime label,
+    composite score, credit-stress flag) using the same attribute
+    names. The feature builder uses ``getattr(..., default)`` so any
+    extra attributes a real ``MarketRegime`` would have stay dormant.
+    """
+
+    regime: str
+    composite_score: float | None
+    credit_stress_flag: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -181,6 +202,19 @@ class ScanRunner:
             bars_cache[symbol] = bars
             raw_sigs = strategy.signals(bars, as_of)
             for sig in raw_sigs:
+                # Strategy-emitted pre-rejection. Strategies that need
+                # to surface a contextual rejection reason (e.g., the
+                # Turtle 1L skip-after-winner filter, which depends on
+                # PRIOR signal outcomes the FilterChain can't see)
+                # populate ``metadata['_strategy_reject_reason']`` on the
+                # emitted signal. We route those straight to the
+                # rejected list so they appear in the dashboard's
+                # Rejected Signals card with the strategy's own reason.
+                pre_reject = (sig.metadata or {}).get("_strategy_reject_reason")
+                if pre_reject:
+                    rejected.append((sig, 0, str(pre_reject)))
+                    continue
+
                 base_qty = self._size(sig)
                 if base_qty <= 0:
                     rejected.append((sig, 0, "qty_zero"))
@@ -203,6 +237,21 @@ class ScanRunner:
                     passing.append((sig, qty))
                 else:
                     rejected.append((sig, qty, result.reason or "filter_rejected"))
+
+        # 4b. Meta-label scoring pass (advisory only — never rejects).
+        #     Loads the trained XGBoost model for this strategy (None
+        #     if none exists yet), scores each passing signal, and
+        #     attaches the probability into ``signal.metadata`` under
+        #     ``meta_label_proba``. RawSignal is frozen so we rebuild
+        #     each entry via ``dataclasses.replace`` rather than mutate.
+        #
+        #     Soft-fails per signal: a model exception logs at warning
+        #     level and the signal is persisted without a score. The
+        #     score-only integration mode means we never block a trade
+        #     on a missing or low score — operators decide based on
+        #     accumulated data once they're ready to flip on hard
+        #     filtering (TODO: meta-label rejection threshold).
+        passing = self._meta_score_pass(passing, bars_cache, as_of, strategy_cls, regime_factor)
 
         # 5. Persist signals, then technical scores for each.
         run_id = self._persist_run(
@@ -365,6 +414,95 @@ class ScanRunner:
             high_water_mark=hwm,
             open_positions=open_positions,
             earnings_within_5d=earnings,
+        )
+
+    def _meta_score_pass(
+        self,
+        passing: list[tuple[RawSignal, int]],
+        bars_cache: dict[str, pd.DataFrame],
+        as_of: date,
+        strategy_cls: type[Strategy],
+        regime_factor: RegimeFactor,
+    ) -> list[tuple[RawSignal, int]]:
+        """Attach meta-label probability to each passing signal's metadata.
+
+        Score-only integration: never rejects, never alters qty. The
+        probability is round-tripped through ``signal.metadata`` so the
+        downstream persistence layer stores it under the JSONB
+        ``metadata.meta_label_proba`` key for inspection in the
+        Signals UI and for later threshold tuning.
+
+        We piggy-back on the regime row already fetched in
+        ``_resolve_regime_factor`` rather than re-querying — see
+        :meth:`_regime_for_scoring`. If the model isn't trained yet
+        :func:`ml_score_signal` returns ``None`` and we skip the
+        metadata patch entirely, leaving the signal unchanged.
+        """
+        if not passing:
+            return passing
+        regime = self._regime_for_scoring(as_of, regime_factor)
+        out: list[tuple[RawSignal, int]] = []
+        scored = 0
+        for sig, qty in passing:
+            bars = bars_cache.get(sig.symbol)
+            if bars is None or bars.empty:
+                out.append((sig, qty))
+                continue
+            try:
+                proba = ml_score_signal(
+                    strategy_name=strategy_cls.name,
+                    bars=bars,
+                    as_of=as_of,
+                    signal_metadata=sig.metadata,
+                    signal_score=float(sig.score) if sig.score is not None else None,
+                    regime=regime,
+                )
+            except Exception as exc:  # never break a scan on ML
+                log.warning(
+                    "meta-score: %s/%s scoring raised: %s",
+                    strategy_cls.name,
+                    sig.symbol,
+                    exc,
+                )
+                out.append((sig, qty))
+                continue
+            if proba is None:
+                out.append((sig, qty))
+                continue
+            new_md = {**sig.metadata, "meta_label_proba": round(proba, 4)}
+            new_sig = dataclasses.replace(sig, metadata=new_md)
+            out.append((new_sig, qty))
+            scored += 1
+        if scored:
+            log.info(
+                "meta-score: %s — %d/%d signals scored",
+                strategy_cls.name,
+                scored,
+                len(passing),
+            )
+        return out
+
+    @staticmethod
+    def _regime_for_scoring(_as_of: date, factor: RegimeFactor) -> Any:
+        """Return a MarketRegime-shaped object for the meta-label features.
+
+        ``RegimeFactor`` carries the multiplier and label/composite/
+        credit-stress fields that the feature builder needs. We pack
+        them into a duck-typed shim with the attribute names the
+        feature builder expects (``regime``, ``composite_score``,
+        ``credit_stress_flag``) so we don't have to round-trip the
+        DB. The shim doesn't claim to be a full ``MarketRegime`` and
+        :func:`build_features` only reads the attributes it cares about.
+
+        ``_as_of`` is intentionally accepted but unused for now — when
+        we promote scoring to read the per-day regime row from the DB
+        rather than reusing the once-per-scan ``RegimeFactor``, this
+        argument carries the lookup key.
+        """
+        return _RegimeShim(
+            regime=factor.label or "",
+            composite_score=factor.composite_score,
+            credit_stress_flag=factor.credit_stress_flag,
         )
 
     def _resolve_regime_factor(

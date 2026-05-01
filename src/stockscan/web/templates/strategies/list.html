@@ -3,23 +3,77 @@
 
 {% block title %}Strategies{% endblock %}
 
+{# Tiny helper: render a "model status" chip per strategy card. Three
+   states the user cares about, all visible at a glance:
+
+     - Untrained: grey, italics, points at the CLI command to fix it.
+     - Trained, fresh (<7d): green chip with AUC + age.
+     - Trained, stale (>=7d): warn-yellow chip suggesting re-train.
+
+   Color comes from the holdout AUC rather than age: AUC < 0.55 stays
+   yellow even fresh, because that means the model has limited signal.
+#}
+{% macro _model_chip(artifact) %}
+  {%- if artifact is none -%}
+    <span class="inline-flex items-center gap-1 text-xs px-2 py-0.5 rounded border bg-ink-100 text-ink-500 border-ink-300/60">
+      no model
+    </span>
+  {%- else -%}
+    {%- set holdout_auc = artifact.holdout_metrics.get("auc") -%}
+    {%- set days_old = ((now_utc() - artifact.fit_at).total_seconds() // 86400) | int -%}
+    {%- if holdout_auc is none or holdout_auc < 0.55 -%}
+      {%- set kind = "warn" -%}
+    {%- elif days_old > 30 -%}
+      {%- set kind = "warn" -%}
+    {%- else -%}
+      {%- set kind = "ok" -%}
+    {%- endif -%}
+    {%- set classes = {
+        'ok':   'bg-ok-100 text-ok-600 border-ok-600/30',
+        'warn': 'bg-warn-100 text-warn-600 border-warn-600/30',
+    } -%}
+    <span class="inline-flex items-center gap-1.5 text-xs px-2 py-0.5 rounded border {{ classes[kind] }}"
+          title="Trained {{ artifact.fit_at.strftime('%Y-%m-%d %H:%M UTC') }} on {{ artifact.n_train_rows }} rows">
+      <span>model</span>
+      {% if holdout_auc is not none %}
+        <span class="font-mono">AUC {{ '%.2f'|format(holdout_auc) }}</span>
+      {% endif %}
+      <span class="text-ink-500">·</span>
+      <span>
+        {%- if days_old < 1 -%}today
+        {%- elif days_old == 1 -%}1d ago
+        {%- elif days_old < 30 -%}{{ days_old }}d ago
+        {%- else -%}{{ (days_old // 30) }}mo ago
+        {%- endif -%}
+      </span>
+    </span>
+  {%- endif -%}
+{% endmacro %}
+
 {% block content %}
 <div class="space-y-4">
   <h1 class="text-2xl font-semibold">Strategies</h1>
-  <p class="text-sm text-ink-500">{{ strategies|length }} registered. Drop a Python file in <code>src/stockscan/strategies/</code> and restart to add more.</p>
+  <p class="text-sm text-ink-500">
+    {{ strategies|length }} registered. Drop a Python file in
+    <code>src/stockscan/strategies/</code> and restart to add more.
+    Meta-label model status is shown per card; click through for full
+    metrics and the re-train button.
+  </p>
 
   {% if strategies %}
     <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
       {% for s in strategies %}
+        {%- set artifact = models_by_strategy.get(s.name) -%}
         <a href="/strategies/{{ s.name }}"
            class="bg-white rounded-xl shadow-sm border border-ink-300/40 p-4 hover:bg-ink-100 block">
-          <div class="flex items-baseline justify-between mb-1">
+          <div class="flex items-baseline justify-between mb-1 gap-2">
             <h2 class="font-semibold">{{ s.display_name }}</h2>
             <span class="text-xs text-ink-500 font-mono">v{{ s.version }}</span>
           </div>
           <p class="text-sm text-ink-700 mb-3">{{ s.description or "" }}</p>
-          <div class="flex flex-wrap gap-1">
+          <div class="flex flex-wrap items-center gap-1.5">
             {% for tag in s.tags %}{{ badge(tag, "neutral") }}{% endfor %}
+            <span class="ml-auto">{{ _model_chip(artifact) }}</span>
           </div>
         </a>
       {% endfor %}

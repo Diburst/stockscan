@@ -3,44 +3,493 @@
 
 {% block title %}Signal {{ signal.symbol if signal else "?" }}{% endblock %}
 
+{# Helpers — small reusable formatters used throughout the page. #}
+
+{# Pretty-print a metadata value: floats with sensible precision,
+   percent-like values rendered as percent, dollar-like as $. We
+   key the formatting on the metadata key when possible to choose
+   the right display form. #}
+{% macro _format_value(key, value) -%}
+  {%- if value is none -%}
+    <span class="text-ink-400">—</span>
+  {%- elif key in ('closeness_52w', 'slope_quality', 'meta_label_proba',
+                    'composite_score', 'vol_score', 'trend_score',
+                    'breadth_score', 'credit_score') -%}
+    {# 0..1 ratios — show as both fraction (4dp) and percent. #}
+    <span class="font-mono">{{ "%.4f"|format(value|float) }}</span>
+    <span class="text-ink-500 text-xs">({{ "%.1f%%"|format(100 * value|float) }})</span>
+  {%- elif key in ('atr', 'max_close_52w', 'prior_max_close', 'spy_close',
+                    'spy_sma200', 'vix_level') -%}
+    {# Dollar-ish prices. #}
+    <span class="font-mono">${{ "%.2f"|format(value|float) }}</span>
+  {%- elif key == 'adx' or key == 'rsi' or key == 'rsi_2' -%}
+    {# 0..100 oscillators. #}
+    <span class="font-mono">{{ "%.2f"|format(value|float) }}</span>
+  {%- elif value is mapping or value is sequence and value is not string -%}
+    <code class="text-xs bg-ink-100 px-1 rounded">{{ value|tojson }}</code>
+  {%- elif value is number -%}
+    <span class="font-mono">{{ "%.4f"|format(value|float) }}</span>
+  {%- else -%}
+    <span>{{ value }}</span>
+  {%- endif -%}
+{%- endmacro %}
+
+{# Render a labeled stat with optional explanation tooltip. #}
+{% macro _stat_row(label, value, explanation=None) -%}
+  <div class="flex items-baseline justify-between gap-3 py-1.5 border-b border-ink-300/30 last:border-b-0">
+    <div class="min-w-0">
+      <div class="text-sm text-ink-700 font-medium">{{ label }}</div>
+      {% if explanation %}
+        <div class="text-xs text-ink-500 mt-0.5 leading-snug">{{ explanation }}</div>
+      {% endif %}
+    </div>
+    <div class="text-sm flex-shrink-0 text-right">{{ value }}</div>
+  </div>
+{%- endmacro %}
+
+{# Discrete regime label as a colored chip. #}
+{% macro _regime_label(label) -%}
+  {%- if label == 'trending_up' -%}{{ badge("trending up", "ok") }}
+  {%- elif label == 'trending_down' -%}{{ badge("trending down", "bad") }}
+  {%- elif label == 'choppy' -%}{{ badge("choppy", "warn") }}
+  {%- elif label == 'transitioning' -%}{{ badge("transitioning", "neutral") }}
+  {%- else -%}{{ badge(label or "?", "neutral") }}
+  {%- endif %}
+{%- endmacro %}
+
 {% block content %}
 {% if not signal %}
   {{ empty("Signal not found.", "❓") }}
 {% else %}
+
+{# ---- Pre-compute a few derived quantities used in multiple cards. ---- #}
+{%- set entry = signal.suggested_entry|float -%}
+{%- set stop  = signal.suggested_stop|float -%}
+{%- set risk_per_share = (entry - stop) if (entry > stop) else 0 -%}
+{%- set risk_pct = (risk_per_share / entry * 100) if entry > 0 else 0 -%}
+{%- set md = signal.metadata or {} -%}
+{%- set humanized = signal.metadata|humanize_metadata -%}
+
 <div class="space-y-4">
+
+  {# ---- Header ---- #}
   <div class="flex items-baseline justify-between flex-wrap gap-2">
     <h1 class="text-2xl font-semibold">
       <span class="font-mono">{{ signal.symbol }}</span>
-      <span class="text-base text-ink-500">· {{ signal.strategy_name }} v{{ signal.strategy_version }}</span>
+      <span class="text-base text-ink-500">·
+        {% if strategy_cls %}{{ strategy_cls.display_name }}{% else %}{{ signal.strategy_name }}{% endif %}
+        v{{ signal.strategy_version }}
+      </span>
     </h1>
-    {% if signal.status == 'new' %}{{ badge("passing", "ok") }}{% elif signal.status == 'rejected' %}{{ badge("rejected", "warn") }}{% else %}{{ badge(signal.status) }}{% endif %}
+    <div class="flex items-center gap-2">
+      {% if signal.status == 'new' %}{{ badge("passing", "ok") }}
+      {% elif signal.status == 'rejected' %}{{ badge("rejected", "warn") }}
+      {% else %}{{ badge(signal.status) }}{% endif %}
+      <span class="text-xs text-ink-500">signal #{{ signal.signal_id }}</span>
+    </div>
   </div>
 
-  {% call card(title="Signal") %}
-    <dl class="grid grid-cols-2 sm:grid-cols-3 gap-x-6 gap-y-2 text-sm">
-      <div><dt class="text-ink-500">Side</dt><dd class="font-semibold">{{ signal.side }}</dd></div>
-      <div><dt class="text-ink-500">As of</dt><dd>{{ signal.as_of_date }}</dd></div>
-      <div><dt class="text-ink-500">Score</dt><dd>{{ "%.4f"|format(signal.score|float) if signal.score else "—" }}</dd></div>
-      <div><dt class="text-ink-500">Suggested entry</dt><dd class="font-mono">${{ "%.2f"|format(signal.suggested_entry|float) }}</dd></div>
-      <div><dt class="text-ink-500">Suggested stop</dt><dd class="font-mono text-bad-600">${{ "%.2f"|format(signal.suggested_stop|float) }}</dd></div>
-      <div><dt class="text-ink-500">Suggested qty</dt><dd>{{ signal.suggested_qty or "—" }}</dd></div>
-      {% if signal.rejected_reason %}
-        <div class="col-span-full"><dt class="text-ink-500">Rejection reason</dt><dd class="text-warn-600">{{ signal.rejected_reason }}</dd></div>
+  {# ---- Outcome ---- #}
+  {% call card(title="Outcome", subtitle="What the runner produced") %}
+    <dl class="grid grid-cols-2 sm:grid-cols-4 gap-x-6 gap-y-3 text-sm">
+      <div>
+        <dt class="text-xs text-ink-500 uppercase tracking-wide">Side</dt>
+        <dd class="font-semibold">{{ signal.side }}</dd>
+      </div>
+      <div>
+        <dt class="text-xs text-ink-500 uppercase tracking-wide">As of</dt>
+        <dd>{{ signal.as_of_date }}</dd>
+      </div>
+      <div>
+        <dt class="text-xs text-ink-500 uppercase tracking-wide">Strategy score</dt>
+        <dd class="font-mono">{{ "%.4f"|format(signal.score|float) if signal.score else "—" }}</dd>
+      </div>
+      <div>
+        <dt class="text-xs text-ink-500 uppercase tracking-wide">Suggested qty</dt>
+        <dd class="font-semibold">{{ signal.suggested_qty or "—" }} shares</dd>
+      </div>
+      <div>
+        <dt class="text-xs text-ink-500 uppercase tracking-wide">Entry</dt>
+        <dd class="font-mono">${{ "%.2f"|format(entry) }}</dd>
+      </div>
+      <div>
+        <dt class="text-xs text-ink-500 uppercase tracking-wide">Stop</dt>
+        <dd class="font-mono text-bad-600">${{ "%.2f"|format(stop) }}</dd>
+        <dd class="text-xs text-ink-500 mt-0.5">−{{ "%.2f%%"|format(risk_pct) }} from entry</dd>
+      </div>
+      <div>
+        <dt class="text-xs text-ink-500 uppercase tracking-wide">Risk per share</dt>
+        <dd class="font-mono">${{ "%.2f"|format(risk_per_share) }}</dd>
+      </div>
+      {% if signal.suggested_qty and risk_per_share > 0 %}
+        <div>
+          <dt class="text-xs text-ink-500 uppercase tracking-wide">Total risk</dt>
+          <dd class="font-mono">${{ "%.2f"|format(risk_per_share * signal.suggested_qty) }}</dd>
+          <dd class="text-xs text-ink-500 mt-0.5">notional ${{ "{:,.0f}".format(entry * signal.suggested_qty) }}</dd>
+        </div>
       {% endif %}
     </dl>
-    {% if signal.metadata %}
-      <details class="mt-4 text-xs">
-        <summary class="text-ink-500 cursor-pointer">Strategy metadata</summary>
-        <pre class="mt-2 bg-ink-100 p-2 rounded text-xs overflow-auto">{{ signal.metadata|tojson(indent=2) }}</pre>
-      </details>
+    {% if signal.rejected_reason %}
+      {%- set reason = signal.rejected_reason | humanize_rejection_reason -%}
+      <div class="mt-3 px-3 py-2 rounded bg-warn-100 text-warn-600 border border-warn-600/30 text-sm">
+        <div>
+          <span class="font-semibold">Rejected:</span> {{ reason.label }}
+          {% if not reason.is_known %}
+            <span class="text-xs text-ink-500 font-mono">({{ reason.code }})</span>
+          {% endif %}
+        </div>
+        {% if reason.explanation %}
+          <div class="mt-1 text-xs text-ink-700 leading-snug">{{ reason.explanation }}</div>
+        {% endif %}
+      </div>
     {% endif %}
   {% endcall %}
 
-  <div class="flex gap-3">
+  {# ---- Score derivation: strategy-emitted metadata ---- #}
+  {% call card(
+       title="Score derivation",
+       subtitle="The intermediate values the strategy computed at scan time",
+  ) %}
+    {% if not humanized %}
+      <p class="text-sm text-ink-500 italic">
+        No structured intermediate values were persisted for this signal.
+      </p>
+    {% else %}
+      <div class="divide-y divide-ink-300/30 -mt-1">
+        {% for row in humanized %}
+          {% if row.key != 'meta_label_proba' %}
+            {{ _stat_row(row.label, _format_value(row.key, row.value), row.explanation) }}
+          {% endif %}
+        {% endfor %}
+      </div>
+      {% if signal.score %}
+        <p class="text-xs text-ink-500 mt-3 italic">
+          The "Strategy score" ({{ "%.4f"|format(signal.score|float) }}) shown above is
+          the strategy's own composite of the values in this card. Higher is better;
+          values are bounded to [0, 1]. The exact formula is in the strategy's manual
+          on its <a href="/strategies/{{ signal.strategy_name }}" class="underline">detail page</a>.
+        </p>
+      {% endif %}
+    {% endif %}
+  {% endcall %}
+
+  {# ---- Position sizing derivation ---- #}
+  {% if sizing_breakdown %}
+    {% call card(
+         title="Position sizing",
+         subtitle="How regime context modified the base position size",
+    ) %}
+      <p class="text-sm text-ink-700 mb-3">
+        The runner scales the base risk-targeted quantity by a regime
+        multiplier composed of three factors. The final qty is rounded
+        to integer shares.
+      </p>
+      <div class="bg-ink-100 rounded p-3 font-mono text-sm overflow-x-auto">
+        qty = base × <span class="text-ok-600">affinity</span> ×
+        <span class="text-ok-600">composite_mult</span> ×
+        <span class="text-ok-600">stress_mult</span><br>
+        &nbsp;&nbsp;&nbsp;&nbsp;= base ×
+        {{ "%.3f"|format(sizing_breakdown.affinity) }} ×
+        {{ "%.3f"|format(sizing_breakdown.composite_mult) }} ×
+        {{ "%.3f"|format(sizing_breakdown.stress_mult) }}<br>
+        &nbsp;&nbsp;&nbsp;&nbsp;= base × <span class="font-bold">{{ "%.3f"|format(sizing_breakdown.multiplier) }}</span>
+      </div>
+      <div class="divide-y divide-ink-300/30 mt-3">
+        {{ _stat_row(
+            "Strategy affinity for regime",
+            ('<span class="font-mono">%s</span> · %s'|format("%.3f"|format(sizing_breakdown.affinity), _regime_label(sizing_breakdown.regime_label)))|safe,
+            "How much this strategy 'wants' to operate in the current discrete regime label, in [0, 1]. 1.0 = full size; 0 = sit out. Each strategy declares its own affinity table."
+        ) }}
+        {{ _stat_row(
+            "Composite multiplier",
+            '<span class="font-mono">%.3f</span>'|format(sizing_breakdown.composite_mult)|safe,
+            "Continuous health multiplier: 0.5 + 0.5 x composite_score. The conservative form ensures we never zero out exposure on the composite alone — it scales between 0.5 (worst regime) and 1.0 (best)."
+        ) }}
+        {{ _stat_row(
+            "Credit-stress multiplier",
+            '<span class="font-mono">%.3f</span>'|format(sizing_breakdown.stress_mult)|safe,
+            "0.5 if the HY OAS credit-stress flag is on; 1.0 otherwise. Tail-risk circuit breaker — when high-yield credit spreads spike, equity drawdowns historically follow within 1-3 days."
+        ) }}
+        {{ _stat_row(
+            "Final multiplier",
+            '<span class="font-mono font-bold">%.3f</span>'|format(sizing_breakdown.multiplier)|safe
+        ) }}
+      </div>
+      {% if sizing_breakdown.block_new_longs %}
+        <div class="mt-3 px-3 py-2 rounded bg-bad-100 text-bad-600 border border-bad-600/30 text-sm">
+          ⚠ Credit stress was active and the side is "long" — new longs are
+          additionally hard-blocked regardless of the multiplier.
+        </div>
+      {% endif %}
+    {% endcall %}
+  {% endif %}
+
+  {# ---- Market regime context ---- #}
+  {% if regime %}
+    {% call card(
+         title="Market regime context",
+         subtitle="The state of the broader market on " ~ regime.as_of_date,
+    ) %}
+      <div class="flex items-center gap-3 mb-4">
+        <span class="text-sm text-ink-500">Discrete label:</span>
+        {{ _regime_label(regime.regime) }}
+        {% if regime.credit_stress_flag %}
+          {{ badge("credit stress", "bad") }}
+        {% endif %}
+        {% if regime.composite_score is not none %}
+          <span class="text-sm text-ink-500 ml-auto">
+            Composite:
+            <span class="font-mono font-semibold text-ink-900">
+              {{ "%.3f"|format(regime.composite_score|float) }}
+            </span>
+            <span class="text-xs text-ink-500">
+              ({{ "%.0f%%"|format(100 * regime.composite_score|float) }})
+            </span>
+          </span>
+        {% endif %}
+      </div>
+
+      <div class="grid grid-cols-1 sm:grid-cols-2 gap-x-6 gap-y-2">
+        {# Vol component #}
+        {% if regime.vol_score is not none %}
+          {{ _stat_row(
+              "Vol score",
+              _format_value("vol_score", regime.vol_score|float),
+              "Inverse of VIX percentile rank: 1.0 when VIX is at a 1-year low, 0.0 at a 1-year high. Captures market-wide risk-on / risk-off."
+          ) }}
+        {% endif %}
+        {% if regime.vix_level is not none %}
+          {{ _stat_row(
+              "VIX level",
+              ('<span class="font-mono">%.2f</span> <span class="text-xs text-ink-500">(rank %.0f%%)</span>'|format(regime.vix_level|float, 100 * (regime.vix_pct_rank|float)))|safe if regime.vix_pct_rank is not none else _format_value("vix_level", regime.vix_level|float),
+              "VIX is the CBOE Volatility Index — implied 30-day vol on S&P options. Rank is its percentile vs the trailing 252-day distribution."
+          ) }}
+        {% endif %}
+
+        {# Trend component #}
+        {% if regime.trend_score is not none %}
+          {{ _stat_row(
+              "Trend score",
+              _format_value("trend_score", regime.trend_score|float),
+              "Combines SPY's distance-above-SMA(200) with the slope of SMA(200) over the last 20 days. High = trending up smoothly."
+          ) }}
+        {% endif %}
+        {% if regime.spy_close is not none and regime.spy_sma200 is not none %}
+          {%- set spy_above = (regime.spy_close|float / regime.spy_sma200|float - 1) * 100 -%}
+          {{ _stat_row(
+              "SPY vs SMA(200)",
+              ('<span class="font-mono">$%.2f</span> <span class="text-xs %s">(%+.2f%%)</span>'|format(regime.spy_close|float, "text-ok-600" if spy_above >= 0 else "text-bad-600", spy_above))|safe,
+              "SPY's close vs its own 200-day moving average. Above SMA(200) = long-term uptrend; below = downtrend."
+          ) }}
+        {% endif %}
+        {% if regime.spy_sma200_slope_20d is not none %}
+          {{ _stat_row(
+              "SMA(200) slope (20d)",
+              ('<span class="font-mono">%+.4f%%/day</span>'|format(100 * regime.spy_sma200_slope_20d|float))|safe,
+              "Daily slope of SMA(200) over the last 20 trading days. Positive = trend strengthening; negative = rolling over."
+          ) }}
+        {% endif %}
+
+        {# Breadth component #}
+        {% if regime.breadth_score is not none %}
+          {{ _stat_row(
+              "Breadth score",
+              _format_value("breadth_score", regime.breadth_score|float),
+              "Equal-weight S&P 500 (RSP) vs market-cap-weight (SPY) ratio. High = small/mid-cap names participating in the rally; low = mega-cap concentration only."
+          ) }}
+        {% endif %}
+        {% if regime.rsp_spy_ratio is not none %}
+          {{ _stat_row(
+              "RSP/SPY ratio",
+              _format_value("rsp_spy_ratio", regime.rsp_spy_ratio|float),
+              "Equal-weight ETF (RSP) divided by cap-weight (SPY). Trending up = breadth is improving."
+          ) }}
+        {% endif %}
+        {% if regime.breadth_rel_gap is not none %}
+          {{ _stat_row(
+              "Breadth 20d-vs-200d gap",
+              ('<span class="font-mono">%+.4f</span>'|format(regime.breadth_rel_gap|float))|safe,
+              "How much the 20-day breadth ratio sits above (positive) or below (negative) its 200-day baseline. Positive = breadth is currently above trend."
+          ) }}
+        {% endif %}
+
+        {# Credit component #}
+        {% if regime.credit_score is not none %}
+          {{ _stat_row(
+              "Credit score",
+              _format_value("credit_score", regime.credit_score|float),
+              "Inverse of HY OAS percentile rank. 1.0 = high-yield spreads at a 1-year low (markets calm); 0.0 = at a 1-year high (stress)."
+          ) }}
+        {% endif %}
+        {% if regime.hy_oas_level is not none %}
+          {{ _stat_row(
+              "HY OAS",
+              ('<span class="font-mono">%.0f bp</span> <span class="text-xs text-ink-500">(rank %.0f%%)</span>'|format(100 * regime.hy_oas_level|float, 100 * (regime.hy_oas_pct_rank|float)))|safe if regime.hy_oas_pct_rank is not none else _format_value("hy_oas_level", regime.hy_oas_level|float),
+              "ICE BofA US High Yield OAS — option-adjusted spread on junk-bond credit. Spikes in this metric typically lead equity drawdowns by 1-3 trading days."
+          ) }}
+        {% endif %}
+        {% if regime.hy_oas_zscore is not none %}
+          {{ _stat_row(
+              "HY OAS z-score",
+              _format_value("hy_oas_zscore", regime.hy_oas_zscore|float),
+              "Standard deviations from the 252-day mean. Z-scores above ~1.5 paired with high percentile rank trigger the credit-stress flag."
+          ) }}
+        {% endif %}
+
+        {# Legacy ADX (always present) #}
+        {{ _stat_row(
+            "ADX(14) — SPY",
+            _format_value("adx", regime.adx|float),
+            "Legacy v1 trend-strength filter. Above 25 = strong trend; below 18 = chop. Carried for back-compat with v1 strategies."
+        ) }}
+      </div>
+
+      <p class="text-xs text-ink-500 mt-4 italic">
+        Methodology v{{ regime.methodology_version }}. Composite score
+        weights vol/trend/breadth/credit at 40%/25%/20%/15% per the research
+        doc, renormalized over non-NaN components on data-source outages.
+      </p>
+    {% endcall %}
+  {% else %}
+    <div class="px-4 py-3 bg-warn-100 text-warn-600 border border-warn-600/30 rounded text-sm">
+      ⚠ No regime row found for {{ signal.as_of_date }}. Sizing was computed at neutral
+      multiplier (1.0). Run <code>stockscan refresh macro</code> + a regime detection pass to backfill.
+    </div>
+  {% endif %}
+
+  {# ---- Technical confirmation score ---- #}
+  {% if tech_score is not none %}
+    {%- set tech_val = tech_score.score|float -%}
+    {%- set tech_color = 'ok-600' if tech_val > 0.05 else ('bad-600' if tech_val < -0.05 else 'ink-500') -%}
+    {% call card(
+         title="Technical confirmation",
+         subtitle="Independent score evaluating whether technicals support the setup",
+    ) %}
+      <div class="flex items-baseline gap-3">
+        <div class="text-3xl font-mono font-semibold text-{{ tech_color }}">
+          {{ "%+.3f"|format(tech_val) }}
+        </div>
+        <div class="text-sm text-ink-500">
+          On a [-1, +1] scale. Positive = technicals confirm the setup;
+          negative = they contradict it; near zero = neutral.
+        </div>
+      </div>
+      {% if tech_score.breakdown %}
+        <details class="mt-3 text-xs">
+          <summary class="text-ink-500 cursor-pointer">Per-indicator breakdown</summary>
+          <pre class="mt-2 bg-ink-100 p-2 rounded overflow-auto">{{ tech_score.breakdown|tojson(indent=2) }}</pre>
+        </details>
+      {% endif %}
+      <p class="text-xs text-ink-500 mt-2">
+        Computed at {{ tech_score.computed_at.strftime('%Y-%m-%d %H:%M UTC') }}.
+      </p>
+    {% endcall %}
+  {% endif %}
+
+  {# ---- Meta-label score ---- #}
+  {% if md.get('meta_label_proba') is not none %}
+    {%- set proba = md.meta_label_proba|float -%}
+    {%- set proba_color = 'ok-600' if proba >= 0.55 else ('warn-600' if proba >= 0.50 else 'bad-600') -%}
+    {% call card(
+         title="Meta-label probability",
+         subtitle="XGBoost classifier — advisory only, never blocks trades",
+    ) %}
+      <div class="flex items-baseline gap-3">
+        <div class="text-3xl font-mono font-semibold text-{{ proba_color }}">
+          {{ "%.1f%%"|format(100 * proba) }}
+        </div>
+        <div class="text-sm text-ink-500">
+          The model's confidence that this signal will hit its profit-take
+          barrier (entry + 2 × ATR) within 20 trading days, before the
+          stop or time barrier.
+        </div>
+      </div>
+      <p class="text-xs text-ink-500 mt-3">
+        50% = no opinion · 55%+ = model has signal · 65%+ = high
+        confidence. The score is not a return forecast.
+        See <a href="/strategies/{{ signal.strategy_name }}" class="underline">strategy detail</a>
+        for holdout AUC and base rate.
+      </p>
+    {% endcall %}
+  {% endif %}
+
+  {# ---- Strategy parameters used at scan time ---- #}
+  {% if signal.params_json %}
+    {% call card(
+         title="Strategy parameters",
+         subtitle="The exact config the strategy used when this signal fired",
+    ) %}
+      <p class="text-sm text-ink-500 mb-2">
+        These are the per-strategy knobs (lookback windows, thresholds, ATR
+        multipliers) that fed the calculation. Pinned by ``params_hash``
+        so a strategy-level config change doesn't retroactively change
+        what this signal "meant."
+      </p>
+      <pre class="text-xs bg-ink-100 p-3 rounded overflow-auto">{{ signal.params_json|tojson(indent=2) }}</pre>
+      {% if signal.params_hash %}
+        <p class="text-xs text-ink-500 mt-2">
+          Params hash: <code class="font-mono">{{ signal.params_hash[:16] }}…</code>
+        </p>
+      {% endif %}
+    {% endcall %}
+  {% endif %}
+
+  {# ---- Run context ---- #}
+  {% if signal.run_id %}
+    {% call card(title="Scan-run context", subtitle="The batch this signal came from") %}
+      <dl class="grid grid-cols-2 sm:grid-cols-4 gap-x-6 gap-y-2 text-sm">
+        <div>
+          <dt class="text-xs text-ink-500 uppercase tracking-wide">Run ID</dt>
+          <dd class="font-mono">#{{ signal.run_id }}</dd>
+        </div>
+        {% if signal.universe_size %}
+          <div>
+            <dt class="text-xs text-ink-500 uppercase tracking-wide">Universe</dt>
+            <dd>{{ signal.universe_size }} symbols</dd>
+          </div>
+        {% endif %}
+        {% if signal.signals_emitted is not none %}
+          <div>
+            <dt class="text-xs text-ink-500 uppercase tracking-wide">Run signals (passed)</dt>
+            <dd>{{ signal.signals_emitted }}</dd>
+          </div>
+        {% endif %}
+        {% if signal.rejected_count is not none %}
+          <div>
+            <dt class="text-xs text-ink-500 uppercase tracking-wide">Run signals (rejected)</dt>
+            <dd>{{ signal.rejected_count }}</dd>
+          </div>
+        {% endif %}
+        {% if signal.run_at %}
+          <div class="col-span-2 sm:col-span-4">
+            <dt class="text-xs text-ink-500 uppercase tracking-wide">Run at</dt>
+            <dd class="text-xs text-ink-700">{{ signal.run_at.strftime('%Y-%m-%d %H:%M UTC') }}</dd>
+          </div>
+        {% endif %}
+      </dl>
+    {% endcall %}
+  {% endif %}
+
+  {# ---- Raw metadata dump (kept as a fall-through) ---- #}
+  {% if signal.metadata %}
+    <details class="text-xs px-4">
+      <summary class="text-ink-500 cursor-pointer">Raw signal.metadata JSON</summary>
+      <pre class="mt-2 bg-ink-100 p-3 rounded overflow-auto">{{ signal.metadata|tojson(indent=2) }}</pre>
+    </details>
+  {% endif %}
+
+  {# ---- Footer actions ---- #}
+  <div class="flex flex-wrap gap-3 pt-2">
     <a href="/signals/{{ signal.signal_id }}/base-rates"
        class="inline-flex items-center px-4 py-2 rounded bg-ink-900 text-white text-sm">
       📊 View base rates
     </a>
+    {% if strategy_cls %}
+      <a href="/strategies/{{ signal.strategy_name }}"
+         class="inline-flex items-center px-4 py-2 rounded border border-ink-300 text-sm">
+        🧩 Strategy reference
+      </a>
+    {% endif %}
     <a href="/signals" class="inline-flex items-center px-4 py-2 rounded border border-ink-300 text-sm">
       ← Back to signals
     </a>

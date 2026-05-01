@@ -568,9 +568,20 @@ Both strategies are documented in the literature and have decades of out-of-samp
 
 ### 6.2 Trend Following: Donchian Channel Breakout (Turtle-style)
 
-**Source:** Richard Dennis's Turtle Traders rules, simplified.
+**Source:** Richard Dennis's Turtle Traders rules + modern equity-trend literature (Greyserman & Kaminski 2014; Hurst 2017 / AQR; Clenow 2015; Larry Williams 1999). Implementation version: **v1.1.0**.
 
-**Entry:** When today's close is the highest close of the trailing **20 trading days**, enter long at tomorrow's open.
+**Entry:** Multi-window ensemble. The strategy evaluates each `entry_periods` window (default `[20, 55]`) longest-first and emits ONE signal at the longest qualifying window. The 20-day window is Turtle "System 1" (sensitive); the 55-day window is "System 2" (more confirmed) and serves as the failsafe whenever the 1L filter blocks a 20-day signal. Enter long at tomorrow's open at today's close.
+
+**Setup filters (all must pass):**
+- **ADX(14) ≥ 18** at entry (no trend → no breakout).
+- **Volume confirmation**: today's volume ≥ `volume_mult` × trailing 20-day mean volume (default `1.5×`). Genuine institutional accumulation produces volume; thin-tape false breakouts don't.
+- **Volatility expansion** (Larry Williams): today's true range ≥ ATR(14). Filters out wick-touch breakouts that closed at the high but had no real intraday range.
+- **Relative strength**: stock's trailing 60-day return > SPY's trailing 60-day return. Adds cross-sectional momentum on top of the absolute breakout signal.
+- Skip if avg dollar volume (20d) < $100M (portfolio-level filter).
+- Skip if name reports earnings within 5 trading days (portfolio-level filter; avoids gap risk).
+- Skip if intended position size > 5% of 20d ADV (portfolio-level filter).
+
+**Turtle 1L filter (System 1 only):** When the qualifying window is the 20-day one, the strategy walks back through the bar history to the most recent prior 20-day breakout for the same symbol and simulates its outcome under the same exit rules (10-day low confirming exit OR 2× ATR(20) stop, whichever fires first, capped at 60 trading days). If that prior signal would have been a winner, **today's 20-day breakout is rejected** with reason `turtle_1l_skip_after_winner` — visible in the dashboard's "Rejected signals" card. The 55-day window is always taken regardless of recent history (Turtle System 2 acts as the failsafe). Rationale per Faith's *Way of the Turtle*: big sustained trends usually start AFTER a cluster of small false breakouts.
 
 **Initial stop:** `entry_price − 2 × ATR(20)`.
 
@@ -578,15 +589,13 @@ Both strategies are documented in the literature and have decades of out-of-samp
 
 **Exit confirmation:** Close < 10-day low triggers exit at next open (Turtle "S1" exit rule).
 
-**Position sizing:** 0.75% equity risked (wider stops mean more positions; lower risk-per-trade keeps total portfolio risk reasonable).
+**Position sizing:** 0.75% equity risked (wider stops mean more positions; lower risk-per-trade keeps total portfolio risk reasonable). Modulated by the regime composite multiplier (`affinity × (0.5 + 0.5 × composite_score) × stress_mult`) per §4.7.
 
-**Filters:**
-- Skip if avg dollar volume (20d) < $100M (TF holds longer; bigger names move less violently).
-- Skip if ADX(14) < 18 at entry (no trend → don't chase a breakout).
-- **Skip if name reports earnings within 5 trading days** (avoids gap risk on entry; existing TF positions ride through earnings as the trailing stop intends).
-- Skip if intended position size > 5% of 20d ADV.
+**Backward compatibility:** All five v1.1 filters are individually toggleable (`volume_mult=1.0`, `require_vol_expansion=False`, `enable_turtle_1l=False`, `enable_relative_strength=False`, `entry_periods=[20]`) so backtests can ablate any subset to A/B their contributions. The v1.0 behavior is recoverable by setting all of these.
 
-**Expected behavior:** Few trades, long holds (avg weeks–months), low win rate (35–45%), large avg win/loss ratio. Edge comes from letting winners run.
+**Persisted intermediate values** (visible on signal-detail page via the metadata humanizer): `breakout_window` (20 or 55), `prior_max_close`, `atr`, `adx`, `volume_mult_actual`, `vol_expansion_ratio`, `rs_60d_diff`, `prior_signal_outcome` (winner/loser/none for the 1L filter).
+
+**Expected behavior:** Substantially fewer trades than v1.0 — the volume + RS + 1L filters together cut signal frequency by ~50–70%. Each surviving trade has a higher win rate (~45–55% vs v1.0's 35–45%), at the cost of smaller asymmetry between wins and losses. Long holds (avg weeks–months) when the trend is real. Edge still comes from letting winners run via the trailing chandelier stop.
 
 ### 6.3 Counter-Trend: Largecap Rebound
 
@@ -1112,10 +1121,19 @@ A nightly `stockscan export bars` job dumps `bars` to partitioned Parquet under 
 | **Technical Confirmation Score** | ✅ Done | Plugin system mirroring strategies, RSI(14) + MACD(12,26,9) with tag-aware scoring, `technical_scores` table (migration 0004), persisted by ScanRunner, displayed on Signals + Watchlist, `stockscan technical backfill/recompute`. |
 | **Fundamentals Layer** | ✅ Done | `fundamentals_snapshot` (migration 0005), 38 typed columns + raw JSONB, `market_cap_percentile` helper, `stockscan refresh fundamentals`. |
 | **Largecap Rebound strategy** | ✅ Done | Counter-trend long entries on top-quintile-by-market-cap names below SMA(200) confirmed by RSI + MACD turning bullish (§6.3). |
+| **Market Regime v2 (composite)** | ✅ Done | Continuous vol/trend/breadth/credit composite (40/25/20/15) with HY OAS credit-stress flag. `regime_affinity` mapping on Strategy + soft per-strategy sizing multiplier replaces v1 hard regime gates. FRED provider, `macro_series` table (migration 0010), regime intermediate signals (migration 0011). Dashboard shows full component breakdown with per-component dropdown explanations. |
+| **News integration** | ✅ Done | `news_articles` + symbols/tags/feed_config/alerts (migration 0009), EODHD `/news` for general feed + watchlist, sentiment-aware ranking, sentiment-threshold alerts. Dashboard news card with **on-demand article reader** (each row expands → re-fetches body from provider, never persisted; no content-rights concerns). CLI `refresh news`. |
+| **52-Week-High Momentum strategy** | ✅ Done | George-Hwang style. Score = close / 252-day max, gated to within 5% of 52w high. Clenow regression-slope tiebreak. Time-based 60-day exit matching the original study. Regime affinity favors trending markets, cuts hard in chop. |
+| **Donchian v1.1** | ✅ Done | Multi-window ensemble (entry_periods=[20, 55] — Turtle System 1 + 2 in parallel). Volume confirmation (>=1.5×). Volatility-expansion gate (TR ≥ ATR(14)). Turtle 1L skip-after-winner filter on the 20-day window (tracked as `turtle_1l_skip_after_winner` rejected signal in the runner). Relative-strength filter vs SPY (60d). Each filter individually toggleable for backtest A/B. |
+| **Meta-labeling layer** | ✅ Done | Optional `[ml]` extra (xgboost + scikit-learn). Per-strategy XGBoost binary classifier trained on triple-barrier labels (Lopez de Prado). 17 engineered features (returns/vol/setup-quality/regime). On-disk pickle store under `./models/<strategy>/`. CLI `ml train` / `ml status`. `signals backfill` populates training data; chronological train/holdout split. **Score-only integration**: scan runner's meta-score pass attaches `meta_label_proba` to `signal.metadata`; never blocks trades. Strategy detail page shows model-status panel; strategy list shows per-card chip. |
+| **Signal-detail full attribution** | ✅ Done | Outcome (entry/stop/qty/risk/notional), Score derivation (humanized strategy metadata with one-line tooltips per indicator), Position sizing math (`base × affinity × composite_mult × stress_mult`), Market regime context (every component + percentile rank + intermediate signal), Technical confirmation breakdown, Meta-label probability with interpretation guide, Strategy params used at scan time, raw JSONB fallback. Curated humanizer dict (`web/deps.py:_METADATA_LABELS`) — adding a new strategy means appending entries there. |
+| **Signals freshness + Fetch Latest** | ✅ Done | `signals_freshness()` helper queries MAX(strategy_runs.run_at), MAX(bars.bar_ts), today's signal count. Header strip on `/signals` shows "Last scan: Xh ago" + "Bars current through: YYYY-MM-DD [fresh/Nd behind]" badge. POST `/signals/refresh` button: `refresh_signals()` orchestrator runs 7-day bulk-EOD bars catch-up (`/eod-bulk-last-day` — one API call per day, not per symbol) + re-runs every registered strategy via HTMX swap. |
 | **4 — E*TRADE Integration** | Pending | OAuth handshake UI, `ETradeBroker` against sandbox, integration tests, paper-money rehearsal. |
-| **5 — Hardening** | Pending | Reconciliation loop, drift alerts, error handling, performance reporting, weekly journal export, signal-detail tech-score breakdown view, true historical fundamentals (point-in-time per quarter). |
+| **5 — Hardening** | Pending | Reconciliation loop, drift alerts, error handling, performance reporting, weekly journal export, true historical fundamentals (point-in-time per quarter). |
+| **Strategy optimizer** | Deferred | See `TODO.md §High-impact`. Bayesian search (Optuna) + walk-forward + held-out validation + deflated Sharpe (Lopez de Prado 2014) + per-trial persistence. The single most landmine-laden feature in retail quant; documented anti-overfitting hygiene baked into the report. |
+| **Vol-targeting overlay** | Deferred | See `TODO.md §Medium-impact`. Moreira-Muir (JF 2017) — scale every strategy's position size inversely to its own recent realized vol. Two open design questions: composition with the regime composite multiplier (likely take MIN, not product); per-strategy vs portfolio-level targeting. |
 
-**Critical milestone reached:** at end of "Phase 3 + Watchlist + Tech Score + Fundamentals + Largecap Rebound", you can run the scanner nightly, get an email/Discord summary of ranked ideas augmented with technical confirmation scores, alert on price targets for watched names, and execute manually. That's a usable product end-to-end. E*TRADE auto-execution is the next enhancement.
+**Critical milestone reached:** at end of "Phase 3 + Watchlist + Tech Score + Fundamentals + Largecap Rebound + Regime v2 + News + Meta-labeling + 52w-high + Donchian v1.1 + Signal-detail attribution", you can run the scanner nightly, get an email/Discord summary of ranked ideas augmented with technical confirmation scores AND meta-label probabilities, alert on price targets for watched names, expand any signal to see its full attribution chain, and execute manually. That's a usable product end-to-end. E*TRADE auto-execution is the next enhancement.
 
 ---
 

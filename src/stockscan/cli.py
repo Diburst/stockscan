@@ -1,16 +1,64 @@
 """`stockscan` command-line interface.
 
-Phase 0 commands:
-  stockscan health                    — DB + provider connectivity
-  stockscan db migrate                — apply Alembic migrations
-  stockscan db status                 — current schema revision
-  stockscan refresh universe          — pull S&P 500 membership from EODHD
-  stockscan refresh bars [SYMBOL...]  — backfill bars
-  stockscan refresh macro [SERIES...] — backfill FRED macro series (HY OAS)
-  stockscan strategies list           — print registered strategies
-  stockscan strategies show NAME      — print strategy metadata + params schema
+Top-level commands:
+  stockscan health                       — DB + provider + strategies connectivity
+  stockscan version                      — print app version
 
-Phase 1+ will extend this with: scan run, backtest run, trade list, etc.
+Database:
+  stockscan db migrate                   — apply pending SQL migrations
+  stockscan db status                    — show applied + pending migrations
+  stockscan db verify                    — detect checksum drift on applied migrations
+
+Data refresh (provider → local store):
+  stockscan refresh universe             — pull S&P 500 membership from EODHD
+  stockscan refresh bars [SYMBOL...]     — backfill bars (per-symbol or all-members)
+  stockscan refresh daily --days N       — bulk-EOD recent-N-day catch-up
+  stockscan refresh macro [SERIES...]    — backfill FRED macro series (HY OAS, etc.)
+  stockscan refresh fundamentals         — pull EODHD fundamentals (38 cols + raw JSONB)
+  stockscan refresh news                 — pull EODHD news for general feed + watchlist
+
+Strategies:
+  stockscan strategies list              — registered strategy names
+  stockscan strategies show NAME         — strategy metadata + Pydantic params schema
+
+Scanning + signals (live signal generation, persistence, version-aware admin):
+  stockscan scan run STRATEGY [--all]    — run a single strategy or every registered one
+  stockscan signals backfill STRATEGY    — replay scans across a date range. Skip-query
+                                            is version-aware: dates last scanned under an
+                                            older strategy_version get re-scanned. Default
+                                            range: last 365 days, weekdays only, resumable.
+  stockscan signals delete -s NAME -v V  — explicitly delete signals + strategy_runs for
+                                            (strategy, version). Optional --start/--end
+                                            date range. Confirms unless --yes.
+
+Meta-labeling (XGBoost classifier scoring P(profit-take) per signal):
+  stockscan ml train STRATEGY            — fit + pickle the model under ./models/. Filters
+                                            training data to the CURRENT strategy_version
+                                            by default; pass --strategy-version X.Y.Z to
+                                            override (re-train on historical-version data).
+  stockscan ml status                    — list trained models with holdout AUC
+
+Version semantics:
+  After a strategy version bump, web tools (Dashboard, /signals) AND ml train all default
+  to the new version. Older-version signals are preserved in the database but inert on
+  the live UI. Use ``stockscan signals delete`` with explicit --version to clean up
+  prior-version data when desired.
+
+Watchlist + technical:
+  stockscan watchlist list               — current watch entries
+  stockscan watchlist add SYMBOL         — add with optional --target / --direction
+  stockscan watchlist remove ID
+  stockscan watchlist check-alerts       — fire any pending price-target alerts now
+  stockscan technical list               — registered technical indicators
+  stockscan technical backfill           — fill missing scores for past signals
+  stockscan technical recompute --since  — overwrite existing scores from a date
+
+Backtesting:
+  stockscan backtest run STRATEGY        — event-driven backtest, persists results
+  stockscan backtest list                — saved backtest runs
+
+Scheduled jobs (production: invoked by launchd):
+  stockscan jobs nightly-scan            — refresh + scan + alerts + notify
 """
 
 from __future__ import annotations
@@ -52,6 +100,11 @@ scan_app = typer.Typer(help="Run live or backdated scans.", no_args_is_help=True
 jobs_app = typer.Typer(help="Scheduled job orchestration.", no_args_is_help=True)
 watchlist_app = typer.Typer(help="Manage the watchlist.", no_args_is_help=True)
 technical_app = typer.Typer(help="Technical-confirmation scoring.", no_args_is_help=True)
+ml_app = typer.Typer(help="Meta-labeling: train + inspect XGBoost models.", no_args_is_help=True)
+signals_app = typer.Typer(
+    help="Signal-table operations (e.g., backfill historical scans).",
+    no_args_is_help=True,
+)
 app.add_typer(db_app, name="db")
 app.add_typer(refresh_app, name="refresh")
 app.add_typer(strat_app, name="strategies")
@@ -60,6 +113,8 @@ app.add_typer(scan_app, name="scan")
 app.add_typer(jobs_app, name="jobs")
 app.add_typer(watchlist_app, name="watchlist")
 app.add_typer(technical_app, name="technical")
+app.add_typer(ml_app, name="ml")
+app.add_typer(signals_app, name="signals")
 
 
 # ----------------------------------------------------------------------
@@ -409,6 +464,51 @@ def refresh_macro_cmd(
     if failed:
         console.print(f"[yellow]{len(failed)} series failed: {', '.join(failed)}[/yellow]")
     console.print(f"[green]✓[/green] {total:,} total observations upserted")
+
+
+@refresh_app.command("news")
+def refresh_news_cmd(
+    days_back: int = typer.Option(
+        7,
+        "--days-back",
+        help="How many days of history to pull on each call",
+    ),
+) -> None:
+    """Pull recent financial news from EODHD into the local store.
+
+    Pulls the configured general-market feed (symbols + tags from
+    ``news_feed_config``, auto-seeded with sensible defaults if you've
+    never edited it) plus any watchlist symbols not already covered.
+    Idempotent — re-running on the same day re-upserts articles with a
+    refreshed ``fetched_at`` timestamp.
+
+    Suggested cadence: daily after the nightly scan. Add to launchd or
+    fold into the existing nightly job.
+    """
+    from stockscan.news import refresh_news
+    from stockscan.watchlist import watchlist_symbols
+
+    fred_unused = (
+        settings  # silence "imported but unused" if needed; settings is already used elsewhere
+    )
+    del fred_unused
+
+    api_key = settings.eodhd_api_key.get_secret_value()
+    if not api_key:
+        console.print("[red]✗[/red] EODHD_API_KEY is not set. Add it to your .env to fetch news.")
+        raise typer.Exit(1)
+
+    console.print(f"[cyan]→[/cyan] refreshing news (last {days_back} days)")
+    with EODHDProvider(api_key=api_key) as p:
+        result = refresh_news(p, days_back=days_back, watchlist_symbols=watchlist_symbols())
+
+    console.print(
+        f"[green]✓[/green] {result.articles_upserted:,} articles upserted "
+        f"({result.api_calls} API calls, {result.failures} failures, "
+        f"took {(result.finished_at - result.started_at).total_seconds():.1f}s)"
+    )
+    if result.last_fetched_at:
+        console.print(f"  last fetch timestamp: {result.last_fetched_at:%Y-%m-%d %H:%M UTC}")
 
 
 # ----------------------------------------------------------------------
@@ -916,6 +1016,502 @@ def _provider_ctx() -> Iterator[DataProvider]:
         close = getattr(p, "close", None)
         if callable(close):
             close()
+
+
+# ----------------------------------------------------------------------
+# Meta-labeling (ml) commands
+# ----------------------------------------------------------------------
+@ml_app.command("train")
+def ml_train_cmd(
+    strategy: str = typer.Argument(..., help="Strategy name to train a model for"),
+    holding_days: int = typer.Option(
+        20, "--holding-days", help="Triple-barrier max holding window (trading days)"
+    ),
+    profit_take_atr_mult: float = typer.Option(
+        2.0, "--pt-atr", help="Profit-take barrier in ATR multiples"
+    ),
+    holdout_fraction: float = typer.Option(
+        0.2, "--holdout", help="Newest fraction reserved as holdout"
+    ),
+    min_rows: int = typer.Option(
+        100, "--min-rows", help="Minimum labeled rows required to fit"
+    ),
+    model_version: str = typer.Option(
+        "1.0.0",
+        "--model-version",
+        help="Tag stamped into the model artifact. Bump when feature schema changes.",
+    ),
+    strategy_version: str | None = typer.Option(
+        None,
+        "--strategy-version",
+        help=(
+            "Filter training data to this strategy version. Default = current "
+            "registered version (so re-training after a strategy upgrade ignores "
+            "older-version signals automatically). Pass an explicit version to "
+            "re-fit a model on historical-version signals."
+        ),
+    ),
+) -> None:
+    """Train (or re-train) the XGBoost meta-labeling classifier for a strategy.
+
+    Pulls every persisted signal for the strategy, builds features from the
+    bars store, applies the triple-barrier label, and fits XGBoost. The
+    pickled artifact lands in ``./models/<strategy>/`` and is picked up
+    automatically by the next scan run.
+
+    Requires the ``[ml]`` extra: ``uv sync --extra ml``.
+    """
+    from stockscan.ml import train_model
+    from stockscan.ml.predict import clear_cache
+
+    discover_strategies()
+    if strategy not in STRATEGY_REGISTRY.names():
+        console.print(
+            f"[red]✗[/red] Unknown strategy {strategy!r}. "
+            f"Registered: {', '.join(STRATEGY_REGISTRY.names())}"
+        )
+        raise typer.Exit(1)
+
+    resolved_strategy_v = (
+        strategy_version
+        if strategy_version is not None
+        else STRATEGY_REGISTRY.get(strategy).version
+    )
+    console.print(
+        f"[cyan]→[/cyan] training meta-label model for "
+        f"[bold]{strategy}[/bold] v{resolved_strategy_v}…"
+    )
+    try:
+        result = train_model(
+            strategy,
+            model_version=model_version,
+            strategy_version=strategy_version,
+            holding_days=holding_days,
+            profit_take_atr_mult=profit_take_atr_mult,
+            holdout_fraction=holdout_fraction,
+            min_rows=min_rows,
+        )
+    except RuntimeError as exc:
+        msg = str(exc)
+        console.print(f"[red]✗[/red] {msg}")
+        # Specific actionable hint for the most common failure: not
+        # enough labeled rows. We guide the user straight at the
+        # backfill command rather than leaving them to figure it out.
+        if "usable rows" in msg or "No historical signals" in msg:
+            console.print(
+                f"\n[cyan]→[/cyan] To populate historical signals, run:\n"
+                f"    [bold]stockscan signals backfill {strategy}[/bold]\n"
+                f"  (default: 1 year of daily scans, resumable, ~250 runs)\n"
+            )
+        raise typer.Exit(1) from exc
+
+    # Drop any cached model in the predict layer so the next call sees the
+    # freshly-saved artifact without an app restart.
+    clear_cache()
+
+    table = Table(title=f"Meta-label trained: {strategy}")
+    table.add_column("Metric", style="cyan")
+    table.add_column("Value", justify="right")
+    table.add_row("Signals seen", f"{result.n_signals_seen:,}")
+    table.add_row("Train rows", f"{result.n_train_rows:,}")
+    table.add_row("Holdout rows", f"{result.n_holdout_rows:,}")
+    table.add_row("Base rate (winners)", f"{result.base_rate:.1%}")
+    table.add_row(
+        "Train AUC", f"[bold]{result.train_auc:.3f}[/bold]"
+    )
+    holdout_color = "green" if result.usable else "yellow"
+    table.add_row(
+        "Holdout AUC",
+        f"[bold {holdout_color}]{result.holdout_auc:.3f}[/bold {holdout_color}]",
+    )
+    table.add_row("Artifact", result.artifact_path)
+    console.print(table)
+
+    if not result.usable:
+        console.print(
+            "[yellow]⚠ Holdout AUC ≤ 0.55 — the model has limited statistical "
+            "power. Consider widening the backtest window before relying on "
+            "the meta-label score.[/yellow]"
+        )
+
+
+@ml_app.command("status")
+def ml_status_cmd() -> None:
+    """List trained meta-label models with timestamps and metrics."""
+    from stockscan.ml import list_models
+
+    models = list_models()
+    if not models:
+        console.print(
+            "[yellow]No trained models found.[/yellow] "
+            "Run `stockscan ml train <strategy>` to fit one."
+        )
+        return
+
+    table = Table(title="Meta-label models")
+    table.add_column("Strategy", style="cyan")
+    table.add_column("Version")
+    table.add_column("Fit at", style="dim")
+    table.add_column("Train rows", justify="right")
+    table.add_column("Base rate", justify="right")
+    table.add_column("Holdout AUC", justify="right")
+    for a in models:
+        holdout_auc = a.holdout_metrics.get("auc")
+        auc_str = f"{holdout_auc:.3f}" if holdout_auc is not None else "—"
+        # Color holdout AUC as a quick eyeball signal.
+        if holdout_auc is None or holdout_auc < 0.50:
+            auc_str = f"[red]{auc_str}[/red]"
+        elif holdout_auc < 0.55:
+            auc_str = f"[yellow]{auc_str}[/yellow]"
+        else:
+            auc_str = f"[green]{auc_str}[/green]"
+        table.add_row(
+            a.strategy_name,
+            a.model_version,
+            a.fit_at.strftime("%Y-%m-%d %H:%M UTC"),
+            f"{a.n_train_rows:,}",
+            f"{a.base_rate:.1%}",
+            auc_str,
+        )
+    console.print(table)
+
+
+# ----------------------------------------------------------------------
+# Signals (backfill) commands
+# ----------------------------------------------------------------------
+@signals_app.command("backfill")
+def signals_backfill_cmd(
+    strategy: str = typer.Argument(
+        ...,
+        help="Strategy to backfill (or 'all' for every registered strategy)",
+    ),
+    start: str | None = typer.Option(
+        None,
+        "--start",
+        help="ISO start date; default = today minus 365 days",
+    ),
+    end: str | None = typer.Option(
+        None,
+        "--end",
+        help="ISO end date; default = today",
+    ),
+    every: int = typer.Option(
+        1,
+        "--every",
+        min=1,
+        max=30,
+        help="Run a scan every N business days (1 = every weekday)",
+    ),
+    force: bool = typer.Option(
+        False,
+        "--force",
+        help="Re-run scans for dates that already have a strategy_runs row",
+    ),
+) -> None:
+    """Backfill historical signals for a strategy by replaying scans across a date range.
+
+    Walks weekdays in [start, end], skipping dates that already have a
+    strategy_runs row (use --force to override). For each missing date,
+    runs the same scanner the live nightly job uses, persisting passing
+    and rejected signals to the signals table.
+
+    Resumable: kill the command and restart it; only the missing dates
+    will be processed.
+
+    Default range is one calendar year ending today. With ~250 weekdays
+    per year and a ~5-30s per-symbol scan run, expect 30-90 minutes
+    per strategy on first invocation. The `signals` table is the input
+    to ``stockscan ml train``, so backfilling is a prerequisite for
+    fitting a meta-label model on a brand-new strategy.
+
+    Examples:
+        stockscan signals backfill donchian_trend
+        stockscan signals backfill all --start 2024-01-01
+        stockscan signals backfill rsi2_meanrev --every 5    # weekly Wed scans
+    """
+    from datetime import date as _date
+    from datetime import timedelta as _td
+
+    from rich.progress import (
+        BarColumn,
+        Progress,
+        SpinnerColumn,
+        TextColumn,
+    )
+    from sqlalchemy import text
+
+    from stockscan.db import session_scope
+    from stockscan.scan import ScanRunner
+
+    discover_strategies()
+
+    # Resolve target strategies
+    if strategy == "all":
+        targets = STRATEGY_REGISTRY.names()
+    elif strategy in STRATEGY_REGISTRY.names():
+        targets = [strategy]
+    else:
+        console.print(
+            f"[red]✗[/red] Unknown strategy {strategy!r}. "
+            f"Registered: {', '.join(STRATEGY_REGISTRY.names())}"
+        )
+        raise typer.Exit(1)
+
+    # Resolve date range. Default: 1 year daily.
+    end_d = _date.fromisoformat(end) if end else _date.today()
+    start_d = _date.fromisoformat(start) if start else (end_d - _td(days=365))
+    if start_d > end_d:
+        console.print(
+            f"[red]✗[/red] --start ({start_d}) is after --end ({end_d})."
+        )
+        raise typer.Exit(1)
+
+    # Build the candidate date list: weekdays only, every Nth.
+    candidates: list[_date] = []
+    cursor = start_d
+    counter = 0
+    while cursor <= end_d:
+        if cursor.weekday() < 5:  # Mon-Fri
+            if counter % every == 0:
+                candidates.append(cursor)
+            counter += 1
+        cursor += _td(days=1)
+
+    if not candidates:
+        console.print("[yellow]No weekdays in the requested range.[/yellow]")
+        return
+
+    runner = ScanRunner()
+
+    for tgt in targets:
+        # Resolve the strategy's CURRENT version. Skipping is keyed on
+        # (strategy_name, strategy_version) so that bumping a strategy's
+        # version invalidates prior scans and they get re-run automatically
+        # — without --force AND without duplicating already-current dates.
+        # Older-version rows stay in the DB intentionally for comparison;
+        # use ``stockscan signals delete`` to remove them when desired.
+        try:
+            current_version = STRATEGY_REGISTRY.get(tgt).version
+        except KeyError:
+            console.print(f"[red]✗[/red] Strategy {tgt!r} not registered.")
+            continue
+
+        if not force:
+            with session_scope() as s:
+                existing_rows = s.execute(
+                    text(
+                        """
+                        SELECT as_of_date FROM strategy_runs
+                        WHERE strategy_name = :n
+                          AND strategy_version = :v
+                          AND as_of_date BETWEEN :s AND :e
+                        """
+                    ),
+                    {"n": tgt, "v": current_version, "s": start_d, "e": end_d},
+                ).all()
+                existing = {r[0] for r in existing_rows}
+        else:
+            existing = set()
+
+        to_run = [d for d in candidates if d not in existing]
+        skipped = len(candidates) - len(to_run)
+
+        console.print(
+            f"[cyan]→[/cyan] [bold]{tgt}[/bold] v{current_version}: "
+            f"{len(to_run)} dates to scan "
+            f"(skipping {skipped} at current version, range {start_d}..{end_d})"
+        )
+
+        if not to_run:
+            console.print(f"  [green]✓[/green] {tgt} already complete in range")
+            continue
+
+        # Rich progress bar for the inner loop. Each iteration is one
+        # scan run (per-strategy, per-date), which itself loops the
+        # universe — so this is a coarse-grained progress indicator.
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TextColumn("{task.completed}/{task.total}"),
+            TextColumn("•"),
+            TextColumn("[cyan]{task.fields[stats]}[/cyan]"),
+            console=console,
+        ) as progress:
+            task = progress.add_task(
+                f"{tgt}", total=len(to_run), stats="0 signals"
+            )
+            total_signals = 0
+            failures = 0
+            for as_of in to_run:
+                try:
+                    summary = runner.run(tgt, as_of)
+                    total_signals += summary.signals_emitted
+                except Exception as exc:  # soft-fail per date
+                    failures += 1
+                    log.warning(
+                        "signals backfill: %s @ %s failed: %s", tgt, as_of, exc
+                    )
+                progress.update(
+                    task,
+                    advance=1,
+                    stats=f"{total_signals} signals"
+                    + (f" · {failures} failed" if failures else ""),
+                )
+
+        console.print(
+            f"  [green]✓[/green] {tgt} done: {total_signals} signals across "
+            f"{len(to_run) - failures} successful scans"
+            + (f" ({failures} failed)" if failures else "")
+        )
+
+
+@signals_app.command("delete")
+def signals_delete_cmd(
+    strategy: str = typer.Option(
+        ..., "--strategy", "-s", help="Strategy name to delete signals for"
+    ),
+    version: str = typer.Option(
+        ...,
+        "--version",
+        "-v",
+        help=(
+            "Strategy version to delete (e.g. '1.0.0'). Required — this command "
+            "is intentionally explicit so you can't accidentally wipe the "
+            "current version's signals."
+        ),
+    ),
+    start: str | None = typer.Option(
+        None,
+        "--start",
+        help="ISO start date (inclusive). Default: no lower bound.",
+    ),
+    end: str | None = typer.Option(
+        None,
+        "--end",
+        help="ISO end date (inclusive). Default: no upper bound.",
+    ),
+    yes: bool = typer.Option(
+        False, "--yes", "-y", help="Skip the interactive confirmation prompt."
+    ),
+) -> None:
+    """Delete signals + strategy_runs for a specific (strategy, version).
+
+    Use this to clean up data from a prior strategy version after a
+    backfill under the new version. The signal-detail page, signals
+    list, dashboard, and meta-label trainer all default to the
+    current registered version, so older-version signals are inert
+    once the strategy has been bumped — but they still occupy space
+    and can complicate ad-hoc analytics queries. This command is the
+    explicit way to remove them.
+
+    The deletion respects the foreign-key relationship: signals are
+    deleted first, then their parent strategy_runs rows. Both counts
+    are reported.
+
+    Examples:
+        stockscan signals delete --strategy donchian_trend --version 1.0.0
+        stockscan signals delete -s donchian_trend -v 1.0.0 --start 2020-01-01 --end 2024-12-31
+        stockscan signals delete -s rsi2_meanrev -v 1.0.0 --yes      # script-friendly
+    """
+    from datetime import date as _date
+
+    from sqlalchemy import text
+
+    from stockscan.db import session_scope
+
+    discover_strategies()
+
+    # Build optional date-range params.
+    params: dict[str, object] = {"n": strategy, "v": version}
+    date_clause = ""
+    if start:
+        params["s"] = _date.fromisoformat(start)
+        date_clause += " AND as_of_date >= :s"
+    if end:
+        params["e"] = _date.fromisoformat(end)
+        date_clause += " AND as_of_date <= :e"
+
+    # Count what would be deleted before doing anything destructive.
+    with session_scope() as sess:
+        run_count = sess.execute(
+            text(
+                f"""
+                SELECT COUNT(*) FROM strategy_runs
+                WHERE strategy_name = :n
+                  AND strategy_version = :v
+                  {date_clause}
+                """
+            ),
+            params,
+        ).scalar_one()
+        signal_count = sess.execute(
+            text(
+                f"""
+                SELECT COUNT(*) FROM signals
+                WHERE strategy_name = :n
+                  AND strategy_version = :v
+                  {date_clause}
+                """
+            ),
+            params,
+        ).scalar_one()
+
+    if run_count == 0 and signal_count == 0:
+        console.print(
+            f"[yellow]Nothing to delete[/yellow] for "
+            f"{strategy!r} v{version}"
+            + (f" in [{start or '*'}..{end or '*'}]" if start or end else "")
+            + "."
+        )
+        return
+
+    console.print(
+        f"[bold]Will delete[/bold]: {signal_count:,} signals + "
+        f"{run_count:,} strategy_runs for "
+        f"[cyan]{strategy}[/cyan] [magenta]v{version}[/magenta]"
+        + (f" in [{start or '*'}..{end or '*'}]" if start or end else "")
+        + "."
+    )
+
+    if not yes:
+        confirm = typer.confirm(
+            "Proceed? This is permanent.", default=False
+        )
+        if not confirm:
+            console.print("[yellow]Aborted.[/yellow]")
+            raise typer.Exit(1)
+
+    # Delete signals first to respect the FK from signals.run_id ->
+    # strategy_runs.run_id (no ON DELETE CASCADE in 0001_initial_schema).
+    with session_scope() as sess:
+        sess.execute(
+            text(
+                f"""
+                DELETE FROM signals
+                WHERE strategy_name = :n
+                  AND strategy_version = :v
+                  {date_clause}
+                """
+            ),
+            params,
+        )
+        sess.execute(
+            text(
+                f"""
+                DELETE FROM strategy_runs
+                WHERE strategy_name = :n
+                  AND strategy_version = :v
+                  {date_clause}
+                """
+            ),
+            params,
+        )
+
+    console.print(
+        f"[green]✓[/green] Deleted {signal_count:,} signals + "
+        f"{run_count:,} strategy_runs."
+    )
 
 
 def main() -> None:

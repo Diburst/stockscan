@@ -9,9 +9,15 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from stockscan.db import healthcheck
+from stockscan.news import last_fetched_at as news_last_fetched_at
+from stockscan.news import recent_general as recent_news
 from stockscan.positions import list_open_trades
 from stockscan.regime import latest_regime
-from stockscan.strategies import STRATEGY_REGISTRY, discover_strategies
+from stockscan.strategies import (
+    STRATEGY_REGISTRY,
+    current_version_filter,
+    discover_strategies,
+)
 from stockscan.watchlist import watchlist_symbols
 from stockscan.web.deps import get_session, render
 
@@ -30,19 +36,25 @@ async def dashboard(request: Request, s: Session = Depends(get_session)):
         )
     ).first()
 
-    # Latest signals across all strategies
+    # Latest signals across all strategies — filtered to the CURRENT
+    # registered version of each strategy. Older-version signals stay
+    # in the DB for offline comparison but the live dashboard never
+    # mixes them with current-version signals.
+    version_clause, version_params = current_version_filter(prefix="s")
     sig_rows = s.execute(
         text(
-            """
-            SELECT signal_id, strategy_name, symbol, side, score, status,
-                   suggested_entry, suggested_stop, rejected_reason, as_of_date
-            FROM signals
-            WHERE as_of_date >= :d
-            ORDER BY as_of_date DESC, score DESC NULLS LAST
+            f"""
+            SELECT s.signal_id, s.strategy_name, s.symbol, s.side, s.score,
+                   s.status, s.suggested_entry, s.suggested_stop,
+                   s.rejected_reason, s.as_of_date
+            FROM signals s
+            WHERE s.as_of_date >= :d
+              AND {version_clause}
+            ORDER BY s.as_of_date DESC, s.score DESC NULLS LAST
             LIMIT 25
             """
         ),
-        {"d": date.today().replace(day=1)},
+        {"d": date.today().replace(day=1), **version_params},
     ).all()
 
     open_trades = list_open_trades(session=s)
@@ -92,6 +104,25 @@ async def dashboard(request: Request, s: Session = Depends(get_session)):
         active_strategies = all_strategies
         inactive_strategies = []
 
+    # ---- News card data ----
+    # Soft-fail per call (independent try/except per fetch) so an issue
+    # with one query doesn't blank out the whole card. Log the actual
+    # exception at warning level — the previous bare-except was swallowing
+    # errors silently and made debugging painful.
+    import logging
+
+    _log = logging.getLogger(__name__)
+    try:
+        news_articles = recent_news(limit=10, session=s)
+    except Exception as exc:
+        _log.warning("dashboard: recent_news() failed: %s", exc, exc_info=True)
+        news_articles = []
+    try:
+        news_last_fetched = news_last_fetched_at(session=s)
+    except Exception as exc:
+        _log.warning("dashboard: news_last_fetched_at() failed: %s", exc, exc_info=True)
+        news_last_fetched = None
+
     return render(
         request,
         "dashboard.html",
@@ -105,4 +136,8 @@ async def dashboard(request: Request, s: Session = Depends(get_session)):
         strategy_factors=strategy_factors,
         regime=regime,
         watching=watching,
+        news_articles=news_articles,
+        news_last_fetched=news_last_fetched,
+        news_refresh_error=None,
+        news_refresh_summary=None,
     )

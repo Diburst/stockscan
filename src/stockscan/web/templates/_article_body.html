@@ -1,0 +1,47 @@
+{# In-app article reader body — returned as an HTML fragment by
+   GET /news/{article_id}/content and HTMX-swapped into the .article-body
+   div inside _news_card.html.
+
+   This template never persists content. The body is re-fetched from
+   the provider each time the user expands an article (HTMX `once`
+   trigger keeps it to one fetch per page-load, but a full reload pulls
+   it fresh again).
+
+   Inputs:
+     article  — NewsArticle (always present; carries link/source/published_at)
+     content  — str | None: full article body, or None if the re-fetch
+                miss-matched / returned empty / errored. We render a
+                graceful fallback in the None case.
+     error    — str | None: human-readable error string for unexpected
+                failures (provider hard-down, etc.). Distinct from a
+                clean None-content miss.
+#}
+<div class="text-sm text-ink-800 leading-relaxed space-y-3">
+  {% if error %}
+    <div class="px-3 py-2 rounded bg-bad-100 text-bad-600 border border-bad-600/30 text-xs">
+      ⚠ Couldn't load article body: {{ error }}
+    </div>
+  {% elif content %}
+    {# EODHD's content field is plain text with double-newlines as paragraph
+       breaks. Split on blank lines, escape each chunk, and wrap in <p>. #}
+    {% for para in content.split("\n\n") %}
+      {%- set chunk = para.strip() -%}
+      {%- if chunk -%}
+        <p class="whitespace-pre-line">{{ chunk }}</p>
+      {%- endif -%}
+    {% endfor %}
+  {% else %}
+    <div class="text-xs text-ink-500 italic">
+      Full body not available from the provider for this article.
+      Use the source link below to read it on the publisher's site.
+    </div>
+  {% endif %}
+
+  {# Always include a link to the source as a fallback / attribution. #}
+  <div class="pt-2 border-t border-ink-300/40 text-xs">
+    <a href="{{ article.link }}" target="_blank" rel="noopener noreferrer"
+       class="text-ink-700 hover:text-ink-900 underline">
+      View on {% if article.source %}{{ article.source }}{% else %}source{% endif %} →
+    </a>
+  </div>
+</div>

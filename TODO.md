@@ -291,6 +291,78 @@ Estimated effort: ~3–4 days. UI is the bulk of the work (per-symbol expandable
 
 ## Medium-impact
 
+### Volatility-managed sizing overlay (Moreira-Muir 2017)
+
+**Idea:** Scale every strategy's position size *inversely* to its own recent realized volatility instead of holding constant notional. A position taken when realized vol is double the long-run average gets sized at half. Empirically increases Sharpe across virtually every strategy class — value, momentum, profitability, investment, FX carry — in the original Moreira & Muir (Journal of Finance, 2017) paper, with replications across SSRN since.
+
+**The intuition:** during high-vol regimes, drawdowns are violent and Sharpe is bad even when expected returns are positive; during low-vol regimes, drawdowns are mild and Sharpe is good. So if you lever up in calm and de-lever in storms — without any explicit market-timing signal — you mechanically harvest the inverse correlation between vol and Sharpe. It's free Sharpe lift from a sizing rule alone.
+
+**The skeptical 2020 follow-up (Cederburg, O'Doherty, Wang).** Across 103 anomalies, vol-managed portfolios DON'T systematically beat their unmanaged versions on average — though they DO produce significant spanning-regression alpha. Read: vol management is alpha-additive (the residual after subtracting the original) but not a free lunch when measured against absolute return. For our use case the alpha-additive interpretation is the relevant one — we're not replacing Donchian, we're scaling it.
+
+**Concrete shape:**
+
+- Add a `VolTargetSizer` step to the runner that runs AFTER the base sizer but BEFORE the FilterChain. Computes:
+    ```
+    realized_vol_21d = std(daily log returns, 21d) * sqrt(252)
+    multiplier        = clip(target_vol / realized_vol_21d, 0.25, 2.0)
+    qty_after_vol    = round(qty_before_vol * multiplier)
+    ```
+    where `target_vol` is a global setting (default ~15% annualised — close to long-run S&P realized) and the clip keeps it from going to zero (no signal) or unbounded (leverage blowup).
+
+- Persists the multiplier and the realized vol into `signals.metadata` so the dashboard can show it ("sized at 0.6× — vol elevated") and so backtests can ablate the overlay later.
+
+- Per-strategy override: each `Strategy` subclass gets an optional `vol_target: ClassVar[float | None] = None`. None = use the global default; a float = override (e.g., RSI2 might run hotter at 18%, Donchian cooler at 12%). Strategies opt INTO the overlay rather than out — keeps the existing strategy bodies untouched at first.
+
+- A new column on `signals.metadata`: `realized_vol_21d` and `vol_target_multiplier`, indexed for the dashboard backfill.
+
+**Two open questions Thomas wants to think about before implementing:**
+
+1. **Does vol-targeting compose with the regime composite multiplier?** We already scale by `affinity × (0.5 + 0.5 × composite_score) × stress_mult`. Vol-targeting is multiplicatively independent in theory, but stacked with the regime multiplier could over-adjust during high-vol stress (when both shrink the position). Probably want to use the MIN of the two scalars rather than the product, or apply vol-target AFTER all other sizing rules so it has the final word.
+
+2. **Per-strategy vs portfolio-level vol targeting.** Two distinct things:
+    - *Per-strategy:* every signal sized to deliver target vol on its own. The original Moreira-Muir paper's framing.
+    - *Portfolio-level:* compute realized portfolio vol from the actual P&L track record and scale ALL new positions accordingly. Closer to what real CTAs do (de Prado's vol-scaling).
+    The portfolio version captures correlation effects (a basket of correlated trend trades has more vol than the per-position math implies); the per-strategy version is simpler to implement and easier to backtest without a full portfolio model. MVP should be per-strategy; portfolio version is a follow-up.
+
+**References:**
+- Moreira, A. & Muir, T. (2017). "Volatility-Managed Portfolios." *Journal of Finance* 72(4): 1611–1644.
+- Cederburg, S., O'Doherty, M. S., Wang, F. (2020). "On the performance of volatility-managed portfolios." *Journal of Financial Economics* 138(1): 95–117. (The skeptical replication.)
+- Harvey, C. R. et al. (2018). "The Impact of Volatility Targeting." *Journal of Portfolio Management* 45(1): 14–33. (Industry-practitioner perspective.)
+
+**Effort estimate:** half a day for the per-strategy MVP. Most of the work is the metadata round-trip and a fair backtest framework that can A/B with-and-without the overlay on the existing strategies.
+
+---
+
+### Meta-label features: consume strategy-emitted metadata
+
+**Idea:** Extend `stockscan.ml.features.FEATURE_COLUMNS` so the meta-label classifier can see the per-strategy intermediate values that already get persisted to `signals.metadata`. Right now the feature builder reads only one strategy-specific key (`closeness_52w` for the 52w-high strategy); every other field — `volume_mult_actual`, `vol_expansion_ratio`, `rs_60d_diff`, `breakout_window`, `prior_signal_outcome` for Donchian v1.1; `slope_quality` for momentum_52w_high; `adx` for both — gets discarded. That's leaving signal on the table because those are exactly the kind of values XGBoost would split on most readily.
+
+**Why it matters:** the v1.0 holdout AUC of 0.523 on Donchian was likely held back by missing volume features (we recommended adding volume in the strategy review). With Donchian v1.1 emitting `volume_mult_actual` directly into metadata, surfacing it as a model input is now a one-line change rather than a re-derivation.
+
+**Concrete shape:**
+
+- Append to `FEATURE_COLUMNS` (in canonical order, at the end so existing pickled models continue to load with a clear schema-mismatch warning rather than silent column reordering):
+  - `signal_volume_ratio` — pulled from `signal_metadata.get("volume_mult_actual")`. Default fill: 1.0 (neutral).
+  - `signal_vol_expansion` — from `signal_metadata.get("vol_expansion_ratio")`. Default fill: 1.0.
+  - `signal_rs_60d_diff` — from `signal_metadata.get("rs_60d_diff")`. Default fill: 0.0.
+  - `signal_slope_quality` — from `signal_metadata.get("slope_quality")` (momentum_52w_high). Default fill: 0.5.
+  - `signal_strategy_adx` — from `signal_metadata.get("adx")`. Default fill: 20.0.
+  - `signal_breakout_window` — from `signal_metadata.get("breakout_window")`. Default fill: 0 (means "not a Donchian breakout signal"). Encoded as integer; XGBoost handles it natively without one-hot.
+
+- These are STRATEGY-OPTIONAL. A signal from a strategy that doesn't emit `volume_mult_actual` (e.g., RSI(2)) gets the neutral fill (1.0) — which means the feature contributes nothing to that strategy's model splits, exactly the desired behavior. **No per-strategy feature pipeline needed.**
+
+- Bump `_DEFAULT_HYPERPARAMS["max_depth"]` from 4 to 5 — slightly deeper trees to use the additional features. Keep the remaining hyperparameters conservative.
+
+- Bump `train_model`'s default `model_version` from `"1.0.0"` to `"2.0.0"`. The feature schema check in `predict.py` (`tuple(artifact.feature_columns) != tuple(FEATURE_COLUMNS)`) will then refuse to load v1.0.0 artifacts against the new schema, forcing a clean re-train rather than silent misalignment.
+
+- Re-train every strategy after the change (`stockscan ml train donchian_trend`, etc.) and verify the holdout AUC moves. Donchian should benefit most.
+
+**Effort estimate:** an hour to write + re-train. The change is mostly mechanical — six new keys in `_NEUTRAL_FILLS`, six new columns in `FEATURE_COLUMNS`, six lookups in `build_features`. Add a tiny unit test that feeds a synthetic Donchian-v1.1 metadata dict through `build_features` and asserts the new features round-trip.
+
+**Why it's medium-impact, not high:** the existing 17 features cover the broad surface (regime, returns, vol, RSI, closeness-to-high). The additions are incremental signal-strength on top. They could easily move holdout AUC from 0.52 → 0.58, but it's a refinement, not a fundamental capability.
+
+---
+
 ### True historical fundamentals (point-in-time per quarter)
 
 **Current state:** `fundamentals_snapshot` holds the *latest* snapshot per symbol. Backtests apply today's market-cap percentiles to historical bars.

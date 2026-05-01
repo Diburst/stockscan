@@ -1,0 +1,55 @@
+{% extends "base.html" %}
+{% from "_macros.html" import card %}
+
+{% block title %}Documentation{% endblock %}
+
+{% block content %}
+<div class="space-y-6">
+  <div>
+    <h1 class="text-2xl font-semibold">Documentation</h1>
+    <p class="text-sm text-ink-500 mt-1">
+      Project docs rendered from the markdown sources in the repo, plus an
+      auto-generated CLI reference. Single source of truth — these pages
+      reflect whatever's in the source tree right now.
+    </p>
+  </div>
+
+  <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+    {# CLI reference is the most action-oriented page; pin it first. #}
+    <a href="/docs/cli"
+       class="bg-white rounded-xl shadow-sm border border-ink-300/40 p-4 hover:bg-ink-100 block">
+      <div class="flex items-baseline justify-between mb-1 gap-2">
+        <h2 class="font-semibold flex items-center gap-2">
+          <span aria-hidden="true">⚡</span> CLI Reference
+        </h2>
+        <span class="text-xs text-ink-500">auto-generated</span>
+      </div>
+      <p class="text-sm text-ink-700">
+        Every <code class="bg-ink-100 px-1 rounded text-xs">stockscan ...</code>
+        command, its options, and its <code class="bg-ink-100 px-1 rounded text-xs">--help</code>
+        text. Walks the Typer command tree and captures
+        the same output you'd see at the terminal.
+      </p>
+    </a>
+
+    {% for d in docs %}
+      <a href="/docs/{{ d.slug }}"
+         class="bg-white rounded-xl shadow-sm border border-ink-300/40 p-4 hover:bg-ink-100 block">
+        <div class="flex items-baseline justify-between mb-1 gap-2">
+          <h2 class="font-semibold flex items-center gap-2">
+            <span aria-hidden="true">📘</span> {{ d.title }}
+          </h2>
+          <span class="text-xs text-ink-500 font-mono">{{ d.filename }}</span>
+        </div>
+        <p class="text-sm text-ink-700">{{ d.subtitle }}</p>
+      </a>
+    {% endfor %}
+  </div>
+
+  <p class="text-xs text-ink-500 mt-4">
+    The FastAPI Swagger UI moved to
+    <a href="/api-docs" class="underline">/api-docs</a>.
+    OpenAPI JSON is at <a href="/api-openapi.json" class="underline font-mono">/api-openapi.json</a>.
+  </p>
+</div>
+{% endblock %}

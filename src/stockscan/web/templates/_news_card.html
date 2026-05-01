@@ -1,0 +1,156 @@
+{# Market News card — rendered both on dashboard initial load and as the
+   target of POST /news/refresh (HTMX swap). The outer <div> carries the
+   #news-card id so HTMX can target it for outerHTML replacement.
+
+   Inputs:
+     news_articles      — list[NewsArticle], most recent first (already limited)
+     news_last_fetched  — datetime | None, MAX(fetched_at) across all articles
+     news_refresh_error — str | None, error message from a failed manual refresh
+     news_refresh_summary — dict | None, "{articles_upserted, api_calls, failures}"
+                            from a successful refresh (shown briefly as feedback)
+#}
+{% from "_macros.html" import card, badge, empty %}
+
+{% macro _sentiment_dot(polarity) %}
+  {%- if polarity is none -%}
+    <span class="inline-block w-2 h-2 rounded-full bg-ink-300" title="no sentiment data"></span>
+  {%- else -%}
+    {%- set p = polarity | float -%}
+    {%- if p >= 0.5 -%}
+      <span class="inline-block w-2 h-2 rounded-full bg-ok-600" title="strongly positive ({{ '%.2f'|format(p) }})"></span>
+    {%- elif p >= 0.1 -%}
+      <span class="inline-block w-2 h-2 rounded-full bg-ok-600/50" title="mildly positive ({{ '%.2f'|format(p) }})"></span>
+    {%- elif p > -0.1 -%}
+      <span class="inline-block w-2 h-2 rounded-full bg-ink-300" title="neutral ({{ '%.2f'|format(p) }})"></span>
+    {%- elif p > -0.5 -%}
+      <span class="inline-block w-2 h-2 rounded-full bg-bad-600/50" title="mildly negative ({{ '%.2f'|format(p) }})"></span>
+    {%- else -%}
+      <span class="inline-block w-2 h-2 rounded-full bg-bad-600" title="strongly negative ({{ '%.2f'|format(p) }})"></span>
+    {%- endif -%}
+  {%- endif -%}
+{% endmacro %}
+
+{# Format the last-fetched timestamp as a relative ago string + absolute
+   tooltip. Pure Jinja so it doesn't depend on JS. #}
+{% macro _time_ago(dt) %}
+  {%- if dt is none -%}
+    <span class="text-ink-400">never</span>
+  {%- else -%}
+    {%- set delta = (now_utc() - dt).total_seconds() | int -%}
+    {%- if delta < 60 -%}
+      {%- set ago = "just now" -%}
+    {%- elif delta < 3600 -%}
+      {%- set ago = (delta // 60) ~ "m ago" -%}
+    {%- elif delta < 86400 -%}
+      {%- set ago = (delta // 3600) ~ "h ago" -%}
+    {%- elif delta < 604800 -%}
+      {%- set ago = (delta // 86400) ~ "d ago" -%}
+    {%- else -%}
+      {%- set ago = (delta // 604800) ~ "w ago" -%}
+    {%- endif -%}
+    <span title="{{ dt.strftime('%Y-%m-%d %H:%M UTC') }}">{{ ago }}</span>
+  {%- endif -%}
+{% endmacro %}
+
+<div id="news-card">
+  {% call card(
+       title="Market News",
+       subtitle="General-feed headlines (configured symbols + tags). Click a row to expand the full article inline.",
+  ) %}
+    <!-- Header strip: last-fetched + refresh button -->
+    <div class="flex items-center justify-between gap-3 flex-wrap mb-3 -mt-1">
+      <div class="text-xs text-ink-500">
+        Last fetch: {{ _time_ago(news_last_fetched) }}
+        {% if news_refresh_summary %}
+          <span class="ml-2 text-ok-600">
+            ✓ +{{ news_refresh_summary.articles_upserted }} articles
+            ({{ news_refresh_summary.api_calls }} API calls{% if news_refresh_summary.failures %}, {{ news_refresh_summary.failures }} failed{% endif %})
+          </span>
+        {% endif %}
+      </div>
+      <form
+        hx-post="/news/refresh"
+        hx-target="#news-card"
+        hx-swap="outerHTML"
+        hx-disabled-elt="this"
+      >
+        <button
+          type="submit"
+          class="inline-flex items-center gap-1.5 text-xs px-3 py-1.5 rounded border border-ink-300 hover:bg-ink-100 transition-colors min-h-[36px] disabled:opacity-50 disabled:cursor-wait"
+          title="Pull the latest news from EODHD"
+        >
+          ⟳ Fetch latest
+        </button>
+      </form>
+    </div>
+
+    {% if news_refresh_error %}
+      <div class="mb-3 px-3 py-2 rounded bg-bad-100 text-bad-600 border border-bad-600/30 text-xs">
+        ⚠ {{ news_refresh_error }}
+      </div>
+    {% endif %}
+
+    {% if not news_articles %}
+      {{ empty(
+            "No news yet — click 'Fetch latest' to populate from EODHD." if news_last_fetched is none
+            else "No articles match the configured general-market feed yet.",
+            "📰",
+      ) }}
+    {% else %}
+      <ul class="divide-y divide-ink-300/40 -mx-4">
+        {% for art in news_articles %}
+          <li class="px-4 py-2.5">
+            {# Each article is a <details> so the expand/collapse state
+               is owned by the browser. HTMX hangs off the <details>
+               itself: the `toggle` DOM event fires on open AND close,
+               so the `[target.open]` filter restricts the request to
+               opens; `once` keeps a second open from re-fetching after
+               the user collapses and re-expands the same row.
+
+               The body slot inside is what gets swapped — a snippet
+               preview + a "Loading…" indicator that disappears once
+               the swap completes. #}
+            <details
+              class="group hover:bg-ink-50 -mx-2 px-2 py-1 rounded transition-colors"
+              hx-get="/news/{{ art.article_id }}/content"
+              hx-trigger="toggle[target.open] once"
+              hx-target="find .article-body"
+              hx-swap="innerHTML"
+              hx-indicator="find .article-loading"
+            >
+              <summary class="cursor-pointer list-none flex items-start gap-2 outline-none">
+                <span class="mt-1.5 flex-shrink-0">{{ _sentiment_dot(art.sentiment_polarity) }}</span>
+                <div class="min-w-0 flex-1">
+                  <div class="text-sm text-ink-900 leading-snug">{{ art.title }}</div>
+                  <div class="text-xs text-ink-500 mt-0.5 truncate">
+                    {% if art.source %}{{ art.source }}{% else %}EODHD{% endif %}
+                    · {{ _time_ago(art.published_at) }}
+                    {% if art.symbols %}
+                      ·
+                      {% for s in art.symbols[:4] %}
+                        <span class="font-mono text-ink-700">{{ s }}</span>{% if not loop.last %},{% endif %}
+                      {% endfor %}
+                      {% if art.symbols | length > 4 %}<span class="text-ink-400">+{{ art.symbols | length - 4 }}</span>{% endif %}
+                    {% endif %}
+                  </div>
+                </div>
+                <span class="text-ink-400 text-xs mt-1 select-none transition-transform group-open:rotate-90">▸</span>
+              </summary>
+              <div class="mt-3 ml-4 pl-3 border-l-2 border-ink-300/60">
+                <div class="article-body">
+                  {% if art.snippet %}
+                    {# Snippet preview shown before the full body loads. #}
+                    <div class="text-sm text-ink-700 italic">{{ art.snippet }}…</div>
+                  {% endif %}
+                </div>
+                <span class="article-loading htmx-indicator text-xs text-ink-500 italic mt-2 inline-block">
+                  Loading full article…
+                </span>
+              </div>
+            </details>
+          </li>
+        {% endfor %}
+      </ul>
+    {% endif %}
+  {% endcall %}
+</div>

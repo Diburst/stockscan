@@ -21,6 +21,102 @@
     <p class="text-xs text-ink-500 mt-3">Default risk per trade: {{ "{:.2%}".format(strategy.default_risk_pct) }}</p>
   {% endcall %}
 
+  {# Meta-label model panel — present whether or not a model has been
+     trained, so the user always sees the actionable next step. #}
+  {% call card(
+       title="Meta-label model",
+       subtitle="XGBoost classifier scoring P(profit-take) per signal. Score-only — never blocks trades.",
+  ) %}
+    {% if model is none %}
+      <div class="text-sm text-ink-700">
+        <p class="mb-2">No model trained for this strategy yet.</p>
+        <p class="text-xs text-ink-500">
+          To train: ensure historical signals exist
+          (<code class="bg-ink-100 px-1 rounded">stockscan signals backfill {{ strategy.name }}</code>),
+          then fit the model
+          (<code class="bg-ink-100 px-1 rounded">stockscan ml train {{ strategy.name }}</code>).
+        </p>
+      </div>
+    {% else %}
+      {%- set holdout_auc = model.holdout_metrics.get("auc") -%}
+      {%- set days_old = ((now_utc() - model.fit_at).total_seconds() // 86400) | int -%}
+
+      <div class="grid grid-cols-2 sm:grid-cols-4 gap-4 text-sm">
+        <div>
+          <div class="text-xs text-ink-500 uppercase tracking-wide">Trained</div>
+          <div class="font-semibold">
+            {%- if days_old < 1 -%}today
+            {%- elif days_old == 1 -%}1 day ago
+            {%- elif days_old < 30 -%}{{ days_old }} days ago
+            {%- else -%}{{ (days_old // 30) }} mo ago
+            {%- endif -%}
+          </div>
+          <div class="text-xs text-ink-500 mt-0.5">
+            {{ model.fit_at.strftime('%Y-%m-%d %H:%M UTC') }}
+          </div>
+        </div>
+        <div>
+          <div class="text-xs text-ink-500 uppercase tracking-wide">Train rows</div>
+          <div class="font-semibold">{{ "{:,}".format(model.n_train_rows) }}</div>
+          <div class="text-xs text-ink-500 mt-0.5">
+            base rate {{ "%.1f%%"|format(100 * model.base_rate) }}
+          </div>
+        </div>
+        <div>
+          <div class="text-xs text-ink-500 uppercase tracking-wide">Holdout AUC</div>
+          {% if holdout_auc is not none %}
+            {%- set auc_color = 'text-ok-600' if holdout_auc >= 0.55
+                else ('text-warn-600' if holdout_auc >= 0.50 else 'text-bad-600') -%}
+            <div class="font-semibold {{ auc_color }} font-mono">{{ "%.3f"|format(holdout_auc) }}</div>
+            <div class="text-xs text-ink-500 mt-0.5">
+              {%- if holdout_auc >= 0.55 -%}signal present
+              {%- elif holdout_auc >= 0.50 -%}weak / noisy
+              {%- else -%}inverted (needs investigation)
+              {%- endif -%}
+            </div>
+          {% else %}
+            <div class="font-semibold text-ink-500">—</div>
+          {% endif %}
+        </div>
+        <div>
+          <div class="text-xs text-ink-500 uppercase tracking-wide">Version</div>
+          <div class="font-mono font-semibold">{{ model.model_version }}</div>
+        </div>
+      </div>
+
+      {# Holdout-thresholded precision/recall, if computed by training. #}
+      {% set extra_metrics = [] %}
+      {% for k, v in model.holdout_metrics.items() %}
+        {% if k != 'auc' %}{% set _ = extra_metrics.append((k, v)) %}{% endif %}
+      {% endfor %}
+      {% if extra_metrics %}
+        <div class="mt-4 pt-3 border-t border-ink-300/40">
+          <div class="text-xs text-ink-500 uppercase tracking-wide mb-1">Threshold metrics (holdout)</div>
+          <div class="flex flex-wrap gap-x-4 gap-y-1 text-xs font-mono">
+            {% for k, v in extra_metrics %}
+              <span><span class="text-ink-500">{{ k }}:</span> {{ "%.3f"|format(v|float) }}</span>
+            {% endfor %}
+          </div>
+        </div>
+      {% endif %}
+
+      {% if days_old > 30 %}
+        <div class="mt-3 px-3 py-2 rounded bg-warn-100 text-warn-600 border border-warn-600/30 text-xs">
+          ⚠ Model is {{ days_old }} days old. Consider re-training:
+          <code class="font-mono">stockscan ml train {{ strategy.name }}</code>
+        </div>
+      {% endif %}
+
+      <div class="mt-4 text-xs text-ink-500">
+        To re-train:
+        <code class="bg-ink-100 px-1 rounded">stockscan ml train {{ strategy.name }}</code>
+        — overwrites
+        <code class="bg-ink-100 px-1 rounded">latest.pkl</code>
+        and clears the predictor cache.
+      </div>
+    {% endif %}
+  {% endcall %}
+
   {% if strategy.manual %}
     {% call card(title="How this strategy works", subtitle="Beginner-friendly walkthrough") %}
       <article class="max-w-none whitespace-pre-wrap leading-relaxed text-sm text-ink-900">{{ strategy.manual|md_lite }}</article>

@@ -374,6 +374,10 @@
     {% endif %}
   {% endcall %}
 
+  <!-- Market News card (rendered as a partial so the same template is used
+       both on initial page load and as the HTMX target of POST /news/refresh) -->
+  {% include "_news_card.html" %}
+
   <!-- Latest signals -->
   {% call card(title="Latest signals", subtitle="Most recent 25 across all strategies") %}
     {% if signals %}

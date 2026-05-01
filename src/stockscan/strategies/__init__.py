@@ -23,17 +23,19 @@ from stockscan.strategies.base import (
     Strategy,
     StrategyParams,
 )
+from stockscan.strategies.versions import current_version_filter
 
 log = logging.getLogger(__name__)
 
 __all__ = [
     "STRATEGY_REGISTRY",
-    "Strategy",
-    "StrategyParams",
-    "RawSignal",
     "ExitDecision",
     "PositionSnapshot",
+    "RawSignal",
     "Side",
+    "Strategy",
+    "StrategyParams",
+    "current_version_filter",
     "discover_strategies",
 ]
 
@@ -47,7 +49,7 @@ def discover_strategies() -> int:
     Returns the number of registered strategies after discovery.
     """
     pkg_path = Path(__file__).parent
-    skip = {"__init__", "_signals", "base"}
+    skip = {"__init__", "_signals", "base", "versions"}
     for module_info in pkgutil.iter_modules([str(pkg_path)]):
         if module_info.name.startswith("_") or module_info.name in skip:
             continue
