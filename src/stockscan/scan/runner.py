@@ -186,9 +186,29 @@ class ScanRunner:
         # 4. Run signals + sizer + filters per symbol.
         # We cache bars per symbol so the technical-score step can reuse them
         # without a second DB roundtrip per signal.
+        #
+        # Two passes by design:
+        #
+        #   Pass A — generate + size: for each symbol, generate signals
+        #     and apply the cheap, signal-local checks (pre-reject from
+        #     strategy metadata, qty_zero, credit_stress_long_block,
+        #     regime_zero_size). Anything killed at this stage is
+        #     specific to one signal and doesn't depend on what other
+        #     candidates exist, so order doesn't matter here.
+        #
+        #   Pass B — filter chain: sort the surviving (sig, qty) list
+        #     by sig.score DESCENDING, then run the FilterChain. The
+        #     chain enforces portfolio-level caps (max_positions,
+        #     max_sector_pct, etc.) where contention exists between
+        #     candidates — and the strongest-scoring candidates should
+        #     win the slot, not the alphabetically-first ones. Stable
+        #     sort keeps ties deterministic.
         bars_cache: dict[str, pd.DataFrame] = {}
         passing: list[tuple[RawSignal, int]] = []
         rejected: list[tuple[RawSignal, int, str]] = []
+        # Eligible-for-filter-chain queue, populated in Pass A and
+        # sorted before Pass B.
+        chain_eligible: list[tuple[RawSignal, int]] = []
         for symbol in symbols:
             try:
                 bars = get_bars(symbol, as_of.replace(year=as_of.year - 5), as_of, session=s)
@@ -232,11 +252,28 @@ class ScanRunner:
                 if qty <= 0:
                     rejected.append((sig, 0, "regime_zero_size"))
                     continue
-                result = chain.evaluate(sig, qty, ctx)
-                if result.passed:
-                    passing.append((sig, qty))
-                else:
-                    rejected.append((sig, qty, result.reason or "filter_rejected"))
+
+                # Pass-A survivor — defer filter-chain evaluation to
+                # the sorted Pass B below.
+                chain_eligible.append((sig, qty))
+
+        # ---- Pass B: score-sort, then filter-chain. ----
+        # Highest-scoring candidates first. ``None`` scores sink to
+        # the bottom (treated as -inf). Ties fall back to insertion
+        # order (alphabetical from the universe iteration), keeping
+        # behavior deterministic.
+        chain_eligible.sort(
+            key=lambda pair: (
+                float(pair[0].score) if pair[0].score is not None else float("-inf")
+            ),
+            reverse=True,
+        )
+        for sig, qty in chain_eligible:
+            result = chain.evaluate(sig, qty, ctx)
+            if result.passed:
+                passing.append((sig, qty))
+            else:
+                rejected.append((sig, qty, result.reason or "filter_rejected"))
 
         # 4b. Meta-label scoring pass (advisory only — never rejects).
         #     Loads the trained XGBoost model for this strategy (None

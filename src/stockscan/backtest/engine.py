@@ -226,6 +226,27 @@ class BacktestEngine:
         if not signals:
             return
 
+        # Sort signals by strategy-emitted score (descending). Without
+        # this sort, signals are processed in symbol-alphabetical
+        # order (the order they were collected from `universe`). When
+        # the filter chain's max_positions / sector caps create
+        # contention for limited slots, alphabetically-first symbols
+        # would consistently win — which has nothing to do with signal
+        # quality and silently biases backtest results. Sorting puts
+        # the strongest candidates at the front so they claim the open
+        # slots first.
+        #
+        # Stable sort: ties (same score) fall back to insertion order
+        # (alphabetical from `universe`), keeping behavior
+        # deterministic. Signals with no numeric score sink to the
+        # bottom by treating ``None`` as -inf.
+        signals.sort(
+            key=lambda pair: (
+                float(pair[0].score) if pair[0].score is not None else float("-inf")
+            ),
+            reverse=True,
+        )
+
         ctx = self._portfolio_context(today)
         for sig, qty in signals:
             result = self.filter_chain.evaluate(sig, qty, ctx)

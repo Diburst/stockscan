@@ -8,6 +8,7 @@ from fastapi import APIRouter, Depends, Request
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from stockscan.cycles import compute_calendar_state
 from stockscan.db import healthcheck
 from stockscan.news import last_fetched_at as news_last_fetched_at
 from stockscan.news import recent_general as recent_news
@@ -18,6 +19,7 @@ from stockscan.strategies import (
     current_version_filter,
     discover_strategies,
 )
+from stockscan.structure import compute_index_structure
 from stockscan.watchlist import watchlist_symbols
 from stockscan.web.deps import get_session, render
 
@@ -123,6 +125,22 @@ async def dashboard(request: Request, s: Session = Depends(get_session)):
         _log.warning("dashboard: news_last_fetched_at() failed: %s", exc, exc_info=True)
         news_last_fetched = None
 
+    # ---- Calendar & Cycles card data ----
+    # Soft-fails wholesale: if every indicator inside compute_calendar_state
+    # failed AND the orchestrator itself raised, we just hide the card.
+    try:
+        calendar_state = compute_calendar_state(session=s)
+    except Exception as exc:
+        _log.warning("dashboard: compute_calendar_state() failed: %s", exc, exc_info=True)
+        calendar_state = None
+
+    # ---- Index Structure card data (SPY ADX + Bollinger) ----
+    try:
+        structure_state = compute_index_structure(session=s)
+    except Exception as exc:
+        _log.warning("dashboard: compute_index_structure() failed: %s", exc, exc_info=True)
+        structure_state = None
+
     return render(
         request,
         "dashboard.html",
@@ -140,4 +158,6 @@ async def dashboard(request: Request, s: Session = Depends(get_session)):
         news_last_fetched=news_last_fetched,
         news_refresh_error=None,
         news_refresh_summary=None,
+        calendar_state=calendar_state,
+        structure_state=structure_state,
     )
