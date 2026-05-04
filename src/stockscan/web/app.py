@@ -13,6 +13,7 @@ from stockscan import __version__
 from stockscan.db import healthcheck
 from stockscan.strategies import STRATEGY_REGISTRY, discover_strategies
 from stockscan.web.routes import (
+    analysis,
     backtests,
     base_rates,
     dashboard,
@@ -68,6 +69,7 @@ def create_app() -> FastAPI:
     app.include_router(watchlist.router)
     app.include_router(news.router)
     app.include_router(manual.router)
+    app.include_router(analysis.router)
 
     return app
 

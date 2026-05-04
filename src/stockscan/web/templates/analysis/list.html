@@ -1,0 +1,130 @@
+{% extends "base.html" %}
+{% from "_macros.html" import card, badge, empty %}
+
+{% block title %}Analysis{% endblock %}
+
+{% macro _trend_chip(trend) %}
+  {%- if trend.bucket == 'strong_up' -%}{{ badge(trend.label, "ok") }}
+  {%- elif trend.bucket == 'up' -%}{{ badge(trend.label, "ok") }}
+  {%- elif trend.bucket == 'down' -%}{{ badge(trend.label, "bad") }}
+  {%- elif trend.bucket == 'strong_down' -%}{{ badge(trend.label, "bad") }}
+  {%- elif trend.bucket == 'neutral' -%}{{ badge(trend.label, "neutral") }}
+  {%- else -%}{{ badge("?", "neutral") }}
+  {%- endif -%}
+{% endmacro %}
+
+{% macro _vol_chip(vol) %}
+  {%- if vol.bucket in ('low', 'normal') -%}{{ badge(vol.label, "ok") }}
+  {%- elif vol.bucket == 'elevated' -%}{{ badge(vol.label, "warn") }}
+  {%- elif vol.bucket == 'high' -%}{{ badge(vol.label, "bad") }}
+  {%- else -%}{{ badge("?", "neutral") }}
+  {%- endif -%}
+{% endmacro %}
+
+{% block content %}
+<div class="space-y-4">
+  <div class="flex items-baseline justify-between flex-wrap gap-3">
+    <div>
+      <h1 class="text-2xl font-semibold">Analysis</h1>
+      <p class="text-sm text-ink-500 mt-1">
+        Per-symbol technical analysis for every watched name.
+        Click any card for the full breakdown with a larger chart.
+      </p>
+    </div>
+    <div class="text-xs text-ink-500">
+      {{ cards|length }} watched
+    </div>
+  </div>
+
+  {% if not cards %}
+    {{ empty(
+       "Nothing on the watchlist yet — add symbols on the Watchlist page first.",
+       "📈",
+    ) }}
+  {% else %}
+    <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
+      {% for c in cards %}
+        {%- set a = c.analysis -%}
+        <a href="/analysis/{{ a.symbol }}"
+           class="bg-white rounded-xl shadow-sm border border-ink-300/40 p-4 hover:shadow-md transition-shadow block">
+
+          {# Header row: ticker + trend chip + vol chip + last close #}
+          <div class="flex items-baseline justify-between gap-2 mb-2 flex-wrap">
+            <div class="flex items-baseline gap-3">
+              <h2 class="font-mono font-semibold text-xl">{{ a.symbol }}</h2>
+              {% if a.last_close %}
+                <span class="font-mono text-lg">${{ "%.2f"|format(a.last_close) }}</span>
+              {% endif %}
+            </div>
+            <div class="flex items-center gap-1.5 flex-wrap">
+              {% if a.trend.available %}{{ _trend_chip(a.trend) }}{% endif %}
+              {% if a.volatility.available %}{{ _vol_chip(a.volatility) }}{% endif %}
+              {% if a.options_context.earnings_warning %}
+                {{ badge("earnings " ~ a.options_context.days_to_earnings ~ "d", "bad") }}
+              {% endif %}
+            </div>
+          </div>
+
+          {# Mini chart #}
+          <div class="mb-3 -mx-1">
+            {{ c.chart_svg }}
+          </div>
+
+          {# Key numeric summary: 7d/30d expected ranges + nearest S/R #}
+          {% if a.available %}
+            <div class="grid grid-cols-2 sm:grid-cols-4 gap-3 text-xs">
+              {% if a.volatility.expected_7d %}
+                {%- set er = a.volatility.expected_7d -%}
+                <div>
+                  <div class="text-ink-500 uppercase tracking-wide">7-day ±1σ</div>
+                  <div class="font-mono font-semibold">${{ "%.0f"|format(er.low) }}–${{ "%.0f"|format(er.high) }}</div>
+                  <div class="text-ink-500">±{{ "%.1f%%"|format(er.sigma_pct) }}</div>
+                </div>
+              {% endif %}
+              {% if a.volatility.expected_30d %}
+                {%- set er = a.volatility.expected_30d -%}
+                <div>
+                  <div class="text-ink-500 uppercase tracking-wide">30-day ±1σ</div>
+                  <div class="font-mono font-semibold">${{ "%.0f"|format(er.low) }}–${{ "%.0f"|format(er.high) }}</div>
+                  <div class="text-ink-500">±{{ "%.1f%%"|format(er.sigma_pct) }}</div>
+                </div>
+              {% endif %}
+              {% if a.options_context.nearest_support %}
+                {%- set s = a.options_context.nearest_support -%}
+                <div>
+                  <div class="text-ink-500 uppercase tracking-wide">Support</div>
+                  <div class="font-mono font-semibold text-ok-600">${{ "%.2f"|format(s.price) }}</div>
+                  <div class="text-ink-500">{{ "%.1f%%"|format(a.options_context.pct_to_support) }} below</div>
+                </div>
+              {% endif %}
+              {% if a.options_context.nearest_resistance %}
+                {%- set r = a.options_context.nearest_resistance -%}
+                <div>
+                  <div class="text-ink-500 uppercase tracking-wide">Resistance</div>
+                  <div class="font-mono font-semibold text-bad-600">${{ "%.2f"|format(r.price) }}</div>
+                  <div class="text-ink-500">{{ "%.1f%%"|format(a.options_context.pct_to_resistance) }} above</div>
+                </div>
+              {% endif %}
+            </div>
+
+            {# First curated observation surfaces here as the headline #}
+            {% if a.options_context.observations %}
+              <p class="text-xs text-ink-700 mt-3 leading-snug border-t border-ink-300/40 pt-2">
+                {{ a.options_context.observations[0] }}
+              </p>
+            {% endif %}
+          {% else %}
+            <div class="text-xs text-warn-600 italic">
+              {% if a.failures %}
+                Analysis unavailable: {{ a.failures[0] }}
+              {% else %}
+                Analysis unavailable.
+              {% endif %}
+            </div>
+          {% endif %}
+        </a>
+      {% endfor %}
+    </div>
+  {% endif %}
+</div>
+{% endblock %}

@@ -11,7 +11,10 @@ Database:
 
 Data refresh (provider → local store):
   stockscan refresh universe             — pull S&P 500 membership from EODHD
-  stockscan refresh bars [SYMBOL...]     — backfill bars (per-symbol or all-members)
+  stockscan refresh bars SYMBOL [...]    — backfill bars for one or more tickers
+                                            (e.g. for a new watchlist name); omit
+                                            args to backfill the full S&P 500 universe.
+                                            Incremental on re-run.
   stockscan refresh daily --days N       — bulk-EOD recent-N-day catch-up
   stockscan refresh macro [SERIES...]    — backfill FRED macro series (HY OAS, etc.)
   stockscan refresh fundamentals         — pull EODHD fundamentals (38 cols + raw JSONB)
@@ -105,6 +108,10 @@ signals_app = typer.Typer(
     help="Signal-table operations (e.g., backfill historical scans).",
     no_args_is_help=True,
 )
+analysis_app = typer.Typer(
+    help="Per-symbol technical analysis: levels, trend, vol, options context.",
+    no_args_is_help=True,
+)
 app.add_typer(db_app, name="db")
 app.add_typer(refresh_app, name="refresh")
 app.add_typer(strat_app, name="strategies")
@@ -115,6 +122,7 @@ app.add_typer(watchlist_app, name="watchlist")
 app.add_typer(technical_app, name="technical")
 app.add_typer(ml_app, name="ml")
 app.add_typer(signals_app, name="signals")
+app.add_typer(analysis_app, name="analysis")
 
 
 # ----------------------------------------------------------------------
@@ -348,7 +356,11 @@ def typedelta_days(n: int):
 @refresh_app.command("bars")
 def refresh_bars_cmd(
     symbols: list[str] = typer.Argument(
-        None, help="Symbols to refresh; default = ALL members ever"
+        None,
+        help=(
+            "One or more symbols to backfill (e.g. 'AAPL' or 'AAPL MSFT NVDA'). "
+            "Omit to backfill the entire historical S&P 500 universe."
+        ),
     ),
     start: str = typer.Option("2007-01-01", "--start", help="ISO date for initial backfill"),
     end: str | None = typer.Option(None, "--end", help="ISO date; default = today"),
@@ -363,11 +375,28 @@ def refresh_bars_cmd(
         help="EODHD exchange suffix (e.g., 'US' for equities, 'INDX' for cash indices like VIX)",
     ),
 ) -> None:
-    """Backfill / incrementally update bars.
+    """Backfill / incrementally update daily OHLCV bars from the provider.
 
-    Default behavior fetches bars for **every symbol ever in the S&P 500**,
-    so backtests of historical periods have data for companies that have
-    since been removed (survivorship-bias correction).
+    Two modes:
+
+    * **Per-symbol** — pass one or more tickers as positional args. This is
+      the right command when you want bars for a name you're watching or
+      analyzing but haven't necessarily wired into a scanner. No strategy
+      runs, no signals are generated — just OHLCV into the local ``bars``
+      table, which then feeds the watchlist, technical analysis, and
+      backtest tooling.
+          stockscan refresh bars AAPL
+          stockscan refresh bars AAPL MSFT NVDA --start 2015-01-01
+
+    * **Universe-wide** — omit the positional args to backfill every symbol
+      ever in the S&P 500 (current + historical members). Restoring
+      historical members eliminates survivorship bias on backtests.
+          stockscan refresh bars                        # all ever-members
+          stockscan refresh bars --current-only         # current ~500 only
+
+    All invocations are **incremental** on re-run: per symbol, only the
+    window from ``last_cached_date - 5 days`` to ``end`` is re-fetched,
+    so a daily refresh after the initial backfill takes seconds.
 
     Use ``--exchange INDX`` for cash indices like VIX:
         stockscan refresh bars VIX --exchange INDX
@@ -385,6 +414,17 @@ def refresh_bars_cmd(
         console.print(
             f"[cyan]→[/cyan] backfilling {len(symbols)} symbols ({scope}) "
             f"from {start_d} to {end_d} (exchange={exchange})"
+        )
+    else:
+        # Normalise + de-dup user-supplied tickers; provider expects upper-case.
+        symbols = sorted({s.strip().upper() for s in symbols if s and s.strip()})
+        if not symbols:
+            console.print("[yellow]No valid symbols provided.[/yellow]")
+            raise typer.Exit(1)
+        console.print(
+            f"[cyan]→[/cyan] backfilling {len(symbols)} symbol(s) "
+            f"({', '.join(symbols)}) from {start_d} to {end_d} "
+            f"(exchange={exchange}, incremental on re-run)"
         )
     with _provider_ctx() as p:
         results = backfill_universe(p, symbols, start=start_d, end=end_d, exchange=exchange)
@@ -1512,6 +1552,103 @@ def signals_delete_cmd(
         f"[green]✓[/green] Deleted {signal_count:,} signals + "
         f"{run_count:,} strategy_runs."
     )
+
+
+# ----------------------------------------------------------------------
+# Analysis commands
+# ----------------------------------------------------------------------
+@analysis_app.command("run")
+def analysis_run_cmd(
+    symbol: str | None = typer.Option(
+        None, "--symbol", "-s", help="Single ticker to analyze"
+    ),
+    all_watched: bool = typer.Option(
+        False, "--all-watched", help="Analyze every symbol on the watchlist"
+    ),
+) -> None:
+    """Generate technical analysis for one symbol or every watched name.
+
+    Outputs a Rich table summarizing the trend, volatility, expected
+    7d/30d ranges, and a few of the curated options-context observations.
+    Doesn't render charts (those live on the web UI).
+    """
+    from stockscan.analysis import analyze_symbol, analyze_watchlist
+
+    if not symbol and not all_watched:
+        console.print(
+            "[red]✗[/red] Specify either --symbol TICKER or --all-watched."
+        )
+        raise typer.Exit(1)
+
+    if symbol:
+        analyses = [analyze_symbol(symbol.upper().strip())]
+    else:
+        analyses = analyze_watchlist()
+
+    if not analyses:
+        console.print("[yellow]No analyses generated (empty watchlist?).[/yellow]")
+        return
+
+    for a in analyses:
+        if not a.available:
+            console.print(
+                f"[yellow]⚠ {a.symbol}: unavailable[/yellow]"
+                + (f" — {a.failures[0]}" if a.failures else "")
+            )
+            continue
+        table = Table(title=f"Analysis: {a.symbol} (as of {a.as_of})")
+        table.add_column("Field", style="cyan")
+        table.add_column("Value", justify="right")
+        if a.last_close:
+            table.add_row("Last close", f"${a.last_close:.2f}")
+        if a.trend.available:
+            table.add_row("Trend", a.trend.label)
+        if a.volatility.available:
+            table.add_row("Volatility regime", a.volatility.label)
+            if a.volatility.realized_vol_21d_pct is not None:
+                table.add_row("HV (21d annualised)", f"{a.volatility.realized_vol_21d_pct:.1f}%")
+            if a.volatility.hv_percentile is not None:
+                table.add_row("HV percentile (1y)", f"{a.volatility.hv_percentile:.0f}%")
+            if a.volatility.expected_7d:
+                er = a.volatility.expected_7d
+                table.add_row(
+                    "7-day ±1σ",
+                    f"${er.low:.2f}–${er.high:.2f} (±{er.sigma_pct:.1f}%)",
+                )
+            if a.volatility.expected_30d:
+                er = a.volatility.expected_30d
+                table.add_row(
+                    "30-day ±1σ",
+                    f"${er.low:.2f}–${er.high:.2f} (±{er.sigma_pct:.1f}%)",
+                )
+        if a.momentum.available:
+            if a.momentum.rsi_14 is not None:
+                table.add_row("RSI(14)", f"{a.momentum.rsi_14:.1f} ({a.momentum.rsi_label})")
+            if a.momentum.macd_line is not None:
+                table.add_row("MACD state", a.momentum.macd_label)
+        if a.options_context.nearest_support:
+            ns = a.options_context.nearest_support
+            table.add_row(
+                "Nearest support",
+                f"${ns.price:.2f} ({a.options_context.pct_to_support:.2f}% below)",
+            )
+        if a.options_context.nearest_resistance:
+            nr = a.options_context.nearest_resistance
+            table.add_row(
+                "Nearest resistance",
+                f"${nr.price:.2f} ({a.options_context.pct_to_resistance:.2f}% above)",
+            )
+        if a.options_context.days_to_earnings is not None:
+            table.add_row(
+                "Days to earnings",
+                f"{a.options_context.days_to_earnings}",
+            )
+        console.print(table)
+        if a.options_context.observations:
+            console.print("[bold cyan]Observations:[/bold cyan]")
+            for obs in a.options_context.observations:
+                console.print(f"  • {obs}")
+            console.print()
 
 
 def main() -> None:

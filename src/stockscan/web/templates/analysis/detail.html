@@ -1,0 +1,278 @@
+{% extends "base.html" %}
+{% from "_macros.html" import card, badge, empty %}
+
+{% block title %}{{ analysis.symbol if analysis else "?" }} · Analysis{% endblock %}
+
+{% block content %}
+{% if not analysis or not analysis.available %}
+  {{ empty("Analysis unavailable for this symbol.", "📊") }}
+  <div class="mt-3">
+    <a href="/analysis" class="inline-flex items-center px-4 py-2 rounded border border-ink-300 text-sm">← Back to analysis</a>
+  </div>
+{% else %}
+{%- set a = analysis -%}
+{%- set t = a.trend -%}
+{%- set v = a.volatility -%}
+{%- set m = a.momentum -%}
+{%- set o = a.options_context -%}
+<div class="space-y-4">
+
+  <!-- Header -->
+  <div class="flex items-baseline justify-between flex-wrap gap-2">
+    <h1 class="text-2xl font-semibold">
+      <span class="font-mono">{{ a.symbol }}</span>
+      <span class="text-base text-ink-500">· technical analysis as of {{ a.as_of }}</span>
+    </h1>
+    <div class="flex items-baseline gap-3">
+      {% if a.last_close %}
+        <span class="font-mono text-2xl">${{ "%.2f"|format(a.last_close) }}</span>
+      {% endif %}
+    </div>
+  </div>
+
+  <!-- Big chart -->
+  {% call card(title="Price & projection", subtitle="Last 90 days · SMA(20) + SMA(50) overlays · S/R levels · forward ±1σ bands at 7d / 30d") %}
+    <div class="-mx-2">
+      {{ chart_svg }}
+    </div>
+  {% endcall %}
+
+  <!-- Headline summary cards: trend / vol / momentum -->
+  <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+
+    {# TREND #}
+    <div class="bg-white rounded-xl border border-ink-300/40 p-4">
+      <div class="flex items-baseline justify-between mb-1 gap-2">
+        <div class="text-xs uppercase tracking-wide text-ink-500">Trend</div>
+        {%- if t.bucket in ('strong_up', 'up') -%}{{ badge(t.label, "ok") }}
+        {%- elif t.bucket in ('strong_down', 'down') -%}{{ badge(t.label, "bad") }}
+        {%- else -%}{{ badge(t.label, "neutral") }}
+        {%- endif -%}
+      </div>
+      {% if t.available %}
+        <dl class="text-xs grid grid-cols-2 gap-x-3 gap-y-1 mt-2">
+          {% if t.return_5d is not none %}<dt class="text-ink-500">5-day return</dt>
+          <dd class="font-mono">{{ "%+.2f%%"|format(t.return_5d) }}</dd>{% endif %}
+          {% if t.return_21d is not none %}<dt class="text-ink-500">21-day return</dt>
+          <dd class="font-mono">{{ "%+.2f%%"|format(t.return_21d) }}</dd>{% endif %}
+          {% if t.return_63d is not none %}<dt class="text-ink-500">63-day return</dt>
+          <dd class="font-mono">{{ "%+.2f%%"|format(t.return_63d) }}</dd>{% endif %}
+          {% if t.adx_14 is not none %}<dt class="text-ink-500">ADX(14)</dt>
+          <dd class="font-mono">{{ "%.1f"|format(t.adx_14) }}</dd>{% endif %}
+          {% if t.pct_above_sma20 is not none %}<dt class="text-ink-500">vs SMA(20)</dt>
+          <dd class="font-mono">{{ "%+.2f%%"|format(t.pct_above_sma20) }}</dd>{% endif %}
+          {% if t.pct_above_sma50 is not none %}<dt class="text-ink-500">vs SMA(50)</dt>
+          <dd class="font-mono">{{ "%+.2f%%"|format(t.pct_above_sma50) }}</dd>{% endif %}
+          {% if t.pct_above_sma200 is not none %}<dt class="text-ink-500">vs SMA(200)</dt>
+          <dd class="font-mono">{{ "%+.2f%%"|format(t.pct_above_sma200) }}</dd>{% endif %}
+        </dl>
+        <p class="text-xs text-ink-700 mt-3 leading-snug">{{ t.explanation }}</p>
+      {% endif %}
+    </div>
+
+    {# VOLATILITY #}
+    <div class="bg-white rounded-xl border border-ink-300/40 p-4">
+      <div class="flex items-baseline justify-between mb-1 gap-2">
+        <div class="text-xs uppercase tracking-wide text-ink-500">Volatility</div>
+        {%- if v.bucket in ('low','normal') -%}{{ badge(v.label, "ok") }}
+        {%- elif v.bucket == 'elevated' -%}{{ badge(v.label, "warn") }}
+        {%- elif v.bucket == 'high' -%}{{ badge(v.label, "bad") }}
+        {%- else -%}{{ badge("?", "neutral") }}
+        {%- endif -%}
+      </div>
+      {% if v.available %}
+        <dl class="text-xs grid grid-cols-2 gap-x-3 gap-y-1 mt-2">
+          {% if v.realized_vol_21d_pct is not none %}<dt class="text-ink-500">HV (21d ann.)</dt>
+          <dd class="font-mono">{{ "%.1f%%"|format(v.realized_vol_21d_pct) }}</dd>{% endif %}
+          {% if v.realized_vol_63d_pct is not none %}<dt class="text-ink-500">HV (63d ann.)</dt>
+          <dd class="font-mono">{{ "%.1f%%"|format(v.realized_vol_63d_pct) }}</dd>{% endif %}
+          {% if v.hv_percentile is not none %}<dt class="text-ink-500">HV percentile</dt>
+          <dd class="font-mono">{{ "%.0f%%"|format(v.hv_percentile) }}</dd>{% endif %}
+          {% if v.atr_14 is not none %}<dt class="text-ink-500">ATR(14)</dt>
+          <dd class="font-mono">${{ "%.2f"|format(v.atr_14) }} ({{ "%.1f%%"|format(v.atr_pct_of_price) }})</dd>{% endif %}
+          {% if v.bb_width_pct is not none %}<dt class="text-ink-500">BB width</dt>
+          <dd class="font-mono">{{ "%.1f%%"|format(v.bb_width_pct) }}</dd>{% endif %}
+        </dl>
+        {% if v.expected_7d %}
+          <div class="mt-3 grid grid-cols-2 gap-2 text-xs">
+            <div class="bg-ok-100/40 rounded p-2">
+              <div class="text-ink-500 uppercase tracking-wide">7-day ±1σ</div>
+              <div class="font-mono font-semibold">${{ "%.2f"|format(v.expected_7d.low) }}–${{ "%.2f"|format(v.expected_7d.high) }}</div>
+              <div class="text-ink-500">±{{ "%.1f%%"|format(v.expected_7d.sigma_pct) }} (±${{ "%.2f"|format(v.expected_7d.sigma_dollars) }})</div>
+            </div>
+            {% if v.expected_30d %}
+              <div class="bg-warn-100/40 rounded p-2">
+                <div class="text-ink-500 uppercase tracking-wide">30-day ±1σ</div>
+                <div class="font-mono font-semibold">${{ "%.2f"|format(v.expected_30d.low) }}–${{ "%.2f"|format(v.expected_30d.high) }}</div>
+                <div class="text-ink-500">±{{ "%.1f%%"|format(v.expected_30d.sigma_pct) }} (±${{ "%.2f"|format(v.expected_30d.sigma_dollars) }})</div>
+              </div>
+            {% endif %}
+          </div>
+        {% endif %}
+        <p class="text-xs text-ink-700 mt-3 leading-snug">{{ v.explanation }}</p>
+      {% endif %}
+    </div>
+
+    {# MOMENTUM #}
+    <div class="bg-white rounded-xl border border-ink-300/40 p-4">
+      <div class="flex items-baseline justify-between mb-1 gap-2">
+        <div class="text-xs uppercase tracking-wide text-ink-500">Momentum</div>
+        {%- if m.rsi_bucket == 'oversold' -%}{{ badge(m.rsi_label, "ok") }}
+        {%- elif m.rsi_bucket == 'overbought' -%}{{ badge(m.rsi_label, "warn") }}
+        {%- else -%}{{ badge(m.rsi_label, "neutral") }}
+        {%- endif -%}
+      </div>
+      {% if m.available %}
+        <dl class="text-xs grid grid-cols-2 gap-x-3 gap-y-1 mt-2">
+          {% if m.rsi_14 is not none %}<dt class="text-ink-500">RSI(14)</dt>
+          <dd class="font-mono">{{ "%.1f"|format(m.rsi_14) }}</dd>{% endif %}
+          {% if m.macd_line is not none %}<dt class="text-ink-500">MACD line</dt>
+          <dd class="font-mono">{{ "%+.3f"|format(m.macd_line) }}</dd>{% endif %}
+          {% if m.macd_signal is not none %}<dt class="text-ink-500">MACD signal</dt>
+          <dd class="font-mono">{{ "%+.3f"|format(m.macd_signal) }}</dd>{% endif %}
+          {% if m.macd_histogram is not none %}<dt class="text-ink-500">Histogram</dt>
+          <dd class="font-mono">{{ "%+.3f"|format(m.macd_histogram) }}</dd>{% endif %}
+          {% if m.macd_state %}<dt class="text-ink-500">MACD state</dt>
+          <dd>{{ m.macd_label }}</dd>{% endif %}
+        </dl>
+        <p class="text-xs text-ink-700 mt-3 leading-snug">{{ m.explanation }}</p>
+      {% endif %}
+    </div>
+  </div>
+
+  <!-- Levels detail -->
+  {% if a.levels %}
+    {% call card(title="Support & resistance levels", subtitle="Role assigned from current price (above current = resistance, below = support); pivot origin shown when role has flipped — broken-resistance-now-support and broken-support-now-resistance are notable polarity setups") %}
+      <div class="overflow-x-auto -mx-4">
+        <table class="w-full text-sm min-w-[500px]">
+          <thead class="text-xs uppercase text-ink-500 border-b border-ink-300/40">
+            <tr>
+              <th class="text-left px-4 py-2">Role</th>
+              <th class="text-right px-4 py-2">Price</th>
+              <th class="text-right px-4 py-2">Distance</th>
+              <th class="text-right px-4 py-2">Strength</th>
+              <th class="text-right px-4 py-2">Touches</th>
+              <th class="text-right px-4 py-2">Last touch</th>
+            </tr>
+          </thead>
+          <tbody class="divide-y divide-ink-300/40">
+            {% for lv in a.levels %}
+              <tr>
+                <td class="px-4 py-2">
+                  <div class="flex flex-wrap items-center gap-1.5">
+                    {%- if lv.kind == 'support' -%}{{ badge("support", "ok") }}
+                    {%- else -%}{{ badge("resistance", "bad") }}{%- endif -%}
+                    {%- if lv.is_flipped -%}
+                      {%- if lv.origin == 'pivot_high' -%}
+                        <span title="This level was a swing high (resistance) that price has since broken through; it now acts as support — a polarity flip, often a strong continuation setup."
+                              class="text-[10px] uppercase tracking-wide px-1.5 py-0.5 rounded bg-ink-100 text-ink-600 border border-ink-300/60">
+                          ex-resistance
+                        </span>
+                      {%- else -%}
+                        <span title="This level was a swing low (support) that price has since broken below; it now acts as resistance — a polarity flip, often a strong continuation setup."
+                              class="text-[10px] uppercase tracking-wide px-1.5 py-0.5 rounded bg-ink-100 text-ink-600 border border-ink-300/60">
+                          ex-support
+                        </span>
+                      {%- endif -%}
+                    {%- endif -%}
+                  </div>
+                </td>
+                <td class="px-4 py-2 text-right font-mono font-semibold">${{ "%.2f"|format(lv.price) }}</td>
+                <td class="px-4 py-2 text-right font-mono {% if lv.distance_pct < 0 %}text-bad-600{% else %}text-ok-600{% endif %}">
+                  {{ "%+.2f%%"|format(lv.distance_pct) }}
+                </td>
+                <td class="px-4 py-2 text-right">
+                  <div class="inline-flex items-center gap-2 justify-end">
+                    <div class="w-16 h-1.5 rounded bg-ink-100 overflow-hidden">
+                      <div class="h-full bg-ink-500" style="width: {{ (lv.strength * 100) | round(0, 'floor') | int }}%"></div>
+                    </div>
+                    <span class="font-mono text-xs">{{ "%.2f"|format(lv.strength) }}</span>
+                  </div>
+                </td>
+                <td class="px-4 py-2 text-right">{{ lv.touches }}</td>
+                <td class="px-4 py-2 text-right text-xs text-ink-500">{{ lv.last_touch_days_ago }}d ago</td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    {% endcall %}
+  {% endif %}
+
+  <!-- Options context -->
+  {% if o.available %}
+    {% call card(title="Options context", subtitle="Trade-flavored framing for short-term option strategies") %}
+      <div class="grid grid-cols-1 sm:grid-cols-2 gap-4 mb-3">
+        {% if o.days_to_earnings is not none %}
+          <div>
+            <div class="text-xs uppercase tracking-wide text-ink-500">Earnings</div>
+            <div class="font-semibold">
+              {%- if o.earnings_warning -%}<span class="text-bad-600">{% endif -%}
+              {{ o.days_to_earnings }} day{{ "s" if o.days_to_earnings != 1 else "" }}
+              {%- if o.earnings_date %} ({{ o.earnings_date }}){% endif -%}
+              {%- if o.earnings_warning -%}</span>{%- endif -%}
+            </div>
+          </div>
+        {% endif %}
+        {% if o.nearest_support %}
+          <div>
+            <div class="text-xs uppercase tracking-wide text-ink-500">Nearest support</div>
+            <div class="font-mono font-semibold text-ok-600">${{ "%.2f"|format(o.nearest_support.price) }}</div>
+            <div class="text-xs text-ink-500">
+              {{ "%.2f%%"|format(o.pct_to_support) }} below current
+              {%- if o.nearest_support.is_flipped %} · <span class="text-ink-700 font-medium">ex-resistance</span>{% endif -%}
+            </div>
+          </div>
+        {% endif %}
+        {% if o.nearest_resistance %}
+          <div>
+            <div class="text-xs uppercase tracking-wide text-ink-500">Nearest resistance</div>
+            <div class="font-mono font-semibold text-bad-600">${{ "%.2f"|format(o.nearest_resistance.price) }}</div>
+            <div class="text-xs text-ink-500">
+              {{ "%.2f%%"|format(o.pct_to_resistance) }} above current
+              {%- if o.nearest_resistance.is_flipped %} · <span class="text-ink-700 font-medium">ex-support</span>{% endif -%}
+            </div>
+          </div>
+        {% endif %}
+      </div>
+
+      {% if o.observations %}
+        <div class="text-xs uppercase tracking-wide text-ink-500 mb-2">Observations</div>
+        <ul class="space-y-2 text-sm text-ink-700 leading-snug">
+          {% for obs in o.observations %}
+            <li class="flex gap-2">
+              <span class="text-ink-400 mt-0.5">▸</span>
+              <span>{{ obs }}</span>
+            </li>
+          {% endfor %}
+        </ul>
+      {% endif %}
+
+      <p class="text-xs text-ink-500 italic mt-4 border-t border-ink-300/40 pt-2">
+        Note: expected ranges are computed from realized historical
+        volatility, not from option chain implied volatility (we don't
+        have option data wired up yet). Treat as estimates of typical
+        moves rather than the options market's pricing.
+      </p>
+    {% endcall %}
+  {% endif %}
+
+  <!-- Diagnostic footer if any sub-modules failed -->
+  {% if a.failures %}
+    <div class="text-xs text-ink-400 italic">
+      Sub-modules with errors: {{ a.failures | join(', ') }}
+    </div>
+  {% endif %}
+
+  <!-- Footer actions -->
+  <div class="flex flex-wrap gap-3 pt-2">
+    <a href="/analysis" class="inline-flex items-center px-4 py-2 rounded border border-ink-300 text-sm">
+      ← All analyses
+    </a>
+    <a href="/watchlist" class="inline-flex items-center px-4 py-2 rounded border border-ink-300 text-sm">
+      📌 Watchlist
+    </a>
+  </div>
+</div>
+{% endif %}
+{% endblock %}

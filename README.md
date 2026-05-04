@@ -168,12 +168,38 @@ Run **weekly** — the index turns over slowly. Required before any `refresh bar
 
 ### `stockscan refresh bars`
 
-Backfills daily OHLCV bars for symbols. Defaults:
+Backfills daily OHLCV bars from the provider into the local store. Two modes:
+
+**Per-symbol** — pass one or more tickers when you want bars for a single
+name (e.g. a stock you're adding to the watchlist for technical analysis,
+or a cash index like VIX) without touching the rest of the universe:
+
+```bash
+stockscan refresh bars AAPL                 # one ticker, default 2007→today
+stockscan refresh bars AAPL MSFT NVDA       # several at once
+stockscan refresh bars AAPL --start 2015-01-01
+stockscan refresh bars VIX --exchange INDX  # cash index
+```
+
+No strategy runs, no signals are generated — this command only writes
+OHLCV rows to the `bars` table. The watchlist UI, the per-symbol
+technical analysis (`/analysis`), and any `backtest run` invocation that
+references the symbol all read straight from this table.
+
+**Universe-wide** — omit positional args to backfill every symbol ever in
+the S&P 500 (current + historical members). Restoring delisted members
+eliminates survivorship bias on backtests.
+
+Defaults:
 
 - **Symbols:** all symbols ever in the S&P 500 (current + historical, ~1,200–1,500 names). Use `--current-only` to fetch just the current ~500.
-- **Start date:** 2010-01-01 (override with `--start YYYY-MM-DD`)
+- **Start date:** 2007-01-01 (override with `--start YYYY-MM-DD`)
 - **End date:** today (override with `--end YYYY-MM-DD`)
 - **Interval:** daily
+
+All invocations are **incremental** on re-run: per symbol, only the
+window from `last_cached_date - 5 days` to `end` is re-fetched, so a
+daily refresh after the initial backfill takes seconds.
 
 Hits EODHD's `/eod/{TICKER}.US` once per symbol. Initial backfill numbers:
 
@@ -218,10 +244,11 @@ make db-reset                                    # DROP + recreate (DANGEROUS)
 
 # Data refresh
 uv run stockscan refresh universe                # ~1500 historical S&P 500 members
-uv run stockscan refresh bars                    # ~6M bars (all members, 2010+)
-uv run stockscan refresh bars --current-only     # ~2M bars (current 500 only)
-uv run stockscan refresh bars AAPL MSFT          # specific symbols
+uv run stockscan refresh bars AAPL               # one symbol (for watchlist / analysis)
+uv run stockscan refresh bars AAPL MSFT NVDA     # several symbols at once
 uv run stockscan refresh bars VIX --exchange INDX  # cash indices
+uv run stockscan refresh bars                    # full universe (~6M bars, 2007+)
+uv run stockscan refresh bars --current-only     # current 500 only (~2M bars)
 uv run stockscan refresh daily --days 5          # bulk-refresh recent N days
 uv run stockscan refresh fundamentals --current-only  # ~500 EODHD fundamentals calls
 uv run stockscan refresh macro                   # FRED HY OAS (default series for regime composite)

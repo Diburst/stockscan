@@ -26,6 +26,16 @@
     </div>
   {% endif %}
 
+  <!-- Quick actions strip -->
+  <div class="flex justify-end">
+    <a href="/analysis"
+       class="inline-flex items-center gap-1.5 text-sm px-3 py-2 rounded
+              bg-ink-900 text-white hover:bg-ink-800 transition-colors min-h-[40px]"
+       title="Generate per-symbol technical analysis with charts for every watched name">
+      📊 Analyze all watched
+    </a>
+  </div>
+
   <!-- Add a symbol -->
   {% call card(title="Add a symbol", subtitle="Type a ticker, optionally set a price target") %}
     <form action="/watchlist/add" method="post"
