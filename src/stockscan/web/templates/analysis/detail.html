@@ -1,14 +1,12 @@
 {% extends "base.html" %}
-{% from "_macros.html" import card, badge, empty %}
+{% from "_macros.html" import card, badge, empty, back_link, tooltip %}
 
 {% block title %}{{ analysis.symbol if analysis else "?" }} · Analysis{% endblock %}
 
 {% block content %}
 {% if not analysis or not analysis.available %}
   {{ empty("Analysis unavailable for this symbol.", "📊") }}
-  <div class="mt-3">
-    <a href="/analysis" class="inline-flex items-center px-4 py-2 rounded border border-ink-300 text-sm">← Back to analysis</a>
-  </div>
+  <div class="mt-4">{{ back_link("/analysis", "Back to analysis") }}</div>
 {% else %}
 {%- set a = analysis -%}
 {%- set t = a.trend -%}
@@ -18,15 +16,19 @@
 <div class="space-y-4">
 
   <!-- Header -->
-  <div class="flex items-baseline justify-between flex-wrap gap-2">
-    <h1 class="text-2xl font-semibold">
-      <span class="font-mono">{{ a.symbol }}</span>
-      <span class="text-base text-ink-500">· technical analysis as of {{ a.as_of }}</span>
-    </h1>
-    <div class="flex items-baseline gap-3">
-      {% if a.last_close %}
-        <span class="font-mono text-2xl">${{ "%.2f"|format(a.last_close) }}</span>
-      {% endif %}
+  <div>
+    {{ back_link("/analysis", "Back to analysis") }}
+    <div class="flex items-baseline justify-between flex-wrap gap-2 mt-1">
+      <h1 class="text-2xl font-semibold">
+        <span class="font-mono">{{ a.symbol }}</span>
+        <span class="text-base text-ink-500">· technical analysis as of {{ a.as_of }}</span>
+      </h1>
+      <div class="flex items-baseline gap-3">
+        {% if a.last_close %}
+          <span class="font-mono text-2xl"
+                title="Most recent end-of-day close">${{ "%.2f"|format(a.last_close) }}</span>
+        {% endif %}
+      </div>
     </div>
   </div>
 
@@ -57,13 +59,13 @@
           <dd class="font-mono">{{ "%+.2f%%"|format(t.return_21d) }}</dd>{% endif %}
           {% if t.return_63d is not none %}<dt class="text-ink-500">63-day return</dt>
           <dd class="font-mono">{{ "%+.2f%%"|format(t.return_63d) }}</dd>{% endif %}
-          {% if t.adx_14 is not none %}<dt class="text-ink-500">ADX(14)</dt>
+          {% if t.adx_14 is not none %}<dt class="text-ink-500">{{ tooltip("ADX(14)", "adx" | explain_text) }}</dt>
           <dd class="font-mono">{{ "%.1f"|format(t.adx_14) }}</dd>{% endif %}
-          {% if t.pct_above_sma20 is not none %}<dt class="text-ink-500">vs SMA(20)</dt>
+          {% if t.pct_above_sma20 is not none %}<dt class="text-ink-500">{{ tooltip("vs SMA(20)", "Today's close as a percent above/below the 20-day simple moving average. Positive = price above the short-term trend.") }}</dt>
           <dd class="font-mono">{{ "%+.2f%%"|format(t.pct_above_sma20) }}</dd>{% endif %}
-          {% if t.pct_above_sma50 is not none %}<dt class="text-ink-500">vs SMA(50)</dt>
+          {% if t.pct_above_sma50 is not none %}<dt class="text-ink-500">{{ tooltip("vs SMA(50)", "Today's close as a percent above/below the 50-day simple moving average. Positive = price above the medium-term trend.") }}</dt>
           <dd class="font-mono">{{ "%+.2f%%"|format(t.pct_above_sma50) }}</dd>{% endif %}
-          {% if t.pct_above_sma200 is not none %}<dt class="text-ink-500">vs SMA(200)</dt>
+          {% if t.pct_above_sma200 is not none %}<dt class="text-ink-500">{{ tooltip("vs SMA(200)", "sma200" | explain_text) }}</dt>
           <dd class="font-mono">{{ "%+.2f%%"|format(t.pct_above_sma200) }}</dd>{% endif %}
         </dl>
         <p class="text-xs text-ink-700 mt-3 leading-snug">{{ t.explanation }}</p>
@@ -82,15 +84,15 @@
       </div>
       {% if v.available %}
         <dl class="text-xs grid grid-cols-2 gap-x-3 gap-y-1 mt-2">
-          {% if v.realized_vol_21d_pct is not none %}<dt class="text-ink-500">HV (21d ann.)</dt>
+          {% if v.realized_vol_21d_pct is not none %}<dt class="text-ink-500">{{ tooltip("HV (21d ann.)", "Historical / realised volatility over the last 21 trading days, annualised (×√252). The actual price movement, not implied vol.") }}</dt>
           <dd class="font-mono">{{ "%.1f%%"|format(v.realized_vol_21d_pct) }}</dd>{% endif %}
-          {% if v.realized_vol_63d_pct is not none %}<dt class="text-ink-500">HV (63d ann.)</dt>
+          {% if v.realized_vol_63d_pct is not none %}<dt class="text-ink-500">{{ tooltip("HV (63d ann.)", "Historical / realised volatility over the last 63 trading days (~3 months), annualised.") }}</dt>
           <dd class="font-mono">{{ "%.1f%%"|format(v.realized_vol_63d_pct) }}</dd>{% endif %}
-          {% if v.hv_percentile is not none %}<dt class="text-ink-500">HV percentile</dt>
+          {% if v.hv_percentile is not none %}<dt class="text-ink-500">{{ tooltip("HV percentile", "Where today's 21-day HV ranks against the symbol's own HV history (252-day window). 50% = typical for this name; 90%+ = unusually volatile right now.") }}</dt>
           <dd class="font-mono">{{ "%.0f%%"|format(v.hv_percentile) }}</dd>{% endif %}
-          {% if v.atr_14 is not none %}<dt class="text-ink-500">ATR(14)</dt>
+          {% if v.atr_14 is not none %}<dt class="text-ink-500">{{ tooltip("ATR(14)", "atr" | explain_text) }}</dt>
           <dd class="font-mono">${{ "%.2f"|format(v.atr_14) }} ({{ "%.1f%%"|format(v.atr_pct_of_price) }})</dd>{% endif %}
-          {% if v.bb_width_pct is not none %}<dt class="text-ink-500">BB width</dt>
+          {% if v.bb_width_pct is not none %}<dt class="text-ink-500">{{ tooltip("BB width", "Bollinger Band width as a percent of the middle band. Compresses during low-volatility regimes, expands during breakouts.") }}</dt>
           <dd class="font-mono">{{ "%.1f%%"|format(v.bb_width_pct) }}</dd>{% endif %}
         </dl>
         {% if v.expected_7d %}
@@ -124,15 +126,15 @@
       </div>
       {% if m.available %}
         <dl class="text-xs grid grid-cols-2 gap-x-3 gap-y-1 mt-2">
-          {% if m.rsi_14 is not none %}<dt class="text-ink-500">RSI(14)</dt>
+          {% if m.rsi_14 is not none %}<dt class="text-ink-500">{{ tooltip("RSI(14)", "rsi" | explain_text) }}</dt>
           <dd class="font-mono">{{ "%.1f"|format(m.rsi_14) }}</dd>{% endif %}
-          {% if m.macd_line is not none %}<dt class="text-ink-500">MACD line</dt>
+          {% if m.macd_line is not none %}<dt class="text-ink-500">{{ tooltip("MACD line", "Difference between the 12-day and 26-day exponential moving averages. >0 = short-term momentum above long-term.") }}</dt>
           <dd class="font-mono">{{ "%+.3f"|format(m.macd_line) }}</dd>{% endif %}
-          {% if m.macd_signal is not none %}<dt class="text-ink-500">MACD signal</dt>
+          {% if m.macd_signal is not none %}<dt class="text-ink-500">{{ tooltip("MACD signal", "9-day EMA of the MACD line. The MACD line crossing above this line is the classic buy signal.") }}</dt>
           <dd class="font-mono">{{ "%+.3f"|format(m.macd_signal) }}</dd>{% endif %}
-          {% if m.macd_histogram is not none %}<dt class="text-ink-500">Histogram</dt>
+          {% if m.macd_histogram is not none %}<dt class="text-ink-500">{{ tooltip("Histogram", "MACD line minus signal line. Positive and rising = bullish momentum strengthening; negative and falling = bearish.") }}</dt>
           <dd class="font-mono">{{ "%+.3f"|format(m.macd_histogram) }}</dd>{% endif %}
-          {% if m.macd_state %}<dt class="text-ink-500">MACD state</dt>
+          {% if m.macd_state %}<dt class="text-ink-500">{{ tooltip("MACD state", "Current relationship between MACD line and signal line, plus zero-line position.") }}</dt>
           <dd>{{ m.macd_label }}</dd>{% endif %}
         </dl>
         <p class="text-xs text-ink-700 mt-3 leading-snug">{{ m.explanation }}</p>

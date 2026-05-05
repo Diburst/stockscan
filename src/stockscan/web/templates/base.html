@@ -41,6 +41,13 @@
   {% block head_extra %}{% endblock %}
 </head>
 <body class="bg-ink-100 text-ink-900 font-sans antialiased min-h-screen">
+  {# Toast region — top-right floating notification stack. Populated by:
+       1. Server-side flash cookie (POST → 303 redirect → render),
+       2. HX-Trigger 'toast' event from HTMX responses.
+     Both are picked up by the small JS handler at the bottom of <body>. #}
+  {% from "_macros.html" import toast_region %}
+  {{ toast_region(initial_toast=initial_toast) }}
+
   <header class="bg-ink-900 text-white sticky top-0 z-30 shadow">
     <div class="max-w-6xl mx-auto px-4 py-3 flex items-center justify-between">
       <a href="/" class="font-semibold text-lg flex items-center gap-2">
@@ -102,6 +109,137 @@
       <span>{{ request.url.path }}</span>
     </div>
   </footer>
+
+  {# ====================================================================
+     Shared client behaviour:
+       - Toast lifecycle (auto-dismiss after 4s, fade out, htmx:trigger
+         hook for backend-pushed toasts).
+       - ssConfirmSubmit: two-step confirm pattern used by
+         confirm_button() macro for destructive actions.
+     Both are tiny vanilla JS — no framework dependency.
+     ==================================================================== #}
+  <script>
+    (function () {
+      var TOAST_VISIBLE_MS = 4000;
+      var TOAST_FADE_MS = 300;
+
+      function dismissToast(el) {
+        if (!el || el._dismissed) return;
+        el._dismissed = true;
+        el.style.transition = 'opacity ' + TOAST_FADE_MS + 'ms ease';
+        el.style.opacity = '0';
+        setTimeout(function () { el.remove(); }, TOAST_FADE_MS);
+      }
+
+      function armToast(el) {
+        if (!el || el._armed) return;
+        el._armed = true;
+        setTimeout(function () { dismissToast(el); }, TOAST_VISIBLE_MS);
+      }
+
+      function armAllToasts() {
+        document.querySelectorAll('.ss-toast').forEach(armToast);
+      }
+
+      // Server-rendered toasts (initial flash) — arm them on first paint.
+      if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', armAllToasts);
+      } else {
+        armAllToasts();
+      }
+
+      // Build a toast DOM element from a {kind, message} payload. Kept in
+      // sync with the toast() Jinja macro so server- and client-rendered
+      // toasts look identical.
+      var KIND_CLASSES = {
+        success: 'bg-ok-100 text-ok-600 border-ok-600/30',
+        error:   'bg-bad-100 text-bad-600 border-bad-600/30',
+        warn:    'bg-warn-100 text-warn-600 border-warn-600/30',
+        info:    'bg-ink-100 text-ink-700 border-ink-300/60'
+      };
+      var KIND_ICONS = { success: '✓', error: '⚠', warn: '⚠', info: 'ⓘ' };
+
+      function buildToast(kind, message) {
+        var cls = KIND_CLASSES[kind] || KIND_CLASSES.info;
+        var icon = KIND_ICONS[kind] || KIND_ICONS.info;
+        var wrap = document.createElement('div');
+        wrap.className = 'ss-toast pointer-events-auto px-3 py-2 rounded border ' +
+                         'text-xs shadow-md flex items-start gap-2 ' + cls;
+        wrap.setAttribute('role', 'status');
+
+        var iconEl = document.createElement('span');
+        iconEl.className = 'font-semibold leading-tight';
+        iconEl.textContent = icon;
+
+        var msgEl = document.createElement('span');
+        msgEl.className = 'flex-1 leading-snug';
+        msgEl.textContent = message;
+
+        var closeBtn = document.createElement('button');
+        closeBtn.type = 'button';
+        closeBtn.setAttribute('aria-label', 'Dismiss');
+        closeBtn.className = 'opacity-60 hover:opacity-100 leading-none -mt-0.5';
+        closeBtn.textContent = '×';
+        closeBtn.addEventListener('click', function () { dismissToast(wrap); });
+
+        wrap.appendChild(iconEl);
+        wrap.appendChild(msgEl);
+        wrap.appendChild(closeBtn);
+        return wrap;
+      }
+
+      function pushToast(kind, message) {
+        var region = document.getElementById('toast-region');
+        if (!region || !message) return;
+        var t = buildToast(kind || 'info', message);
+        region.appendChild(t);
+        armToast(t);
+      }
+
+      // HX-Trigger: {"toast": {"kind": "success", "message": "..."}} on the
+      // body element fires a 'toast' event with detail = {kind, message}.
+      document.body.addEventListener('toast', function (evt) {
+        var d = evt.detail || {};
+        pushToast(d.kind, d.message);
+      });
+
+      // Expose a global so route-level scripts can also push toasts.
+      window.ssToast = pushToast;
+
+      // ----------------------------------------------------------------
+      // Two-step confirm — used by the confirm_button() macro. First
+      // submit attempt morphs the button label into the confirm text and
+      // arms a 3-second window. Second submit within the window goes
+      // through. If the user does nothing the button reverts.
+      // ----------------------------------------------------------------
+      window.ssConfirmSubmit = function (event, form) {
+        if (form.dataset.confirming === 'true') {
+          // Second click — let the form submit normally.
+          delete form.dataset.confirming;
+          return true;
+        }
+        event.preventDefault();
+        var btn = form.querySelector('button[type="submit"], button:not([type])');
+        if (!btn) { form.submit(); return false; }
+        if (!btn.dataset.originalLabel) {
+          btn.dataset.originalLabel = btn.innerHTML;
+          btn.dataset.originalClass = btn.className;
+        }
+        btn.innerHTML = form.dataset.confirmLabel || 'Click again to confirm';
+        btn.classList.add('bg-bad-100', 'text-bad-600', 'border', 'border-bad-600/30',
+                          'px-2', 'py-0.5', 'rounded');
+        form.dataset.confirming = 'true';
+        setTimeout(function () {
+          if (form.dataset.confirming === 'true') {
+            delete form.dataset.confirming;
+            btn.innerHTML = btn.dataset.originalLabel;
+            btn.className = btn.dataset.originalClass;
+          }
+        }, 3000);
+        return false;
+      };
+    })();
+  </script>
 
   {% block scripts %}{% endblock %}
 </body>

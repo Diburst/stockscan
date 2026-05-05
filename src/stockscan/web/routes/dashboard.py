@@ -13,7 +13,7 @@ from stockscan.db import healthcheck
 from stockscan.news import last_fetched_at as news_last_fetched_at
 from stockscan.news import recent_general as recent_news
 from stockscan.positions import list_open_trades
-from stockscan.regime import latest_regime
+from stockscan.regime import build_strategy_factors, latest_regime
 from stockscan.strategies import (
     STRATEGY_REGISTRY,
     current_version_filter,
@@ -67,42 +67,15 @@ async def dashboard(request: Request, s: Session = Depends(get_session)):
     all_strategies = STRATEGY_REGISTRY.all()
 
     # ---- v2 soft sizing: per-strategy multiplier breakdown for the banner.
-    # Each entry has: cls, affinity, composite_mult, stress_mult, effective.
-    # active/inactive are kept (computed from the effective multiplier) for
-    # back-compat with anything still keying off those names.
-    strategy_factors: list[dict[str, object]] = []
+    # Helper lives in stockscan.regime so the regime-refresh route can
+    # rebuild this same shape after a forced recompute.
+    strategy_factors = build_strategy_factors(regime, all_strategies)
     if regime is not None:
-        composite_dec = regime.composite_score
-        composite = float(composite_dec) if composite_dec is not None else None
-        composite_mult = 0.5 + 0.5 * composite if composite is not None else 1.0
-        stress_mult = 0.5 if regime.credit_stress_flag else 1.0
-        for cls in all_strategies:
-            affinity = cls.affinity_for(regime.regime)
-            effective = affinity * composite_mult * stress_mult
-            strategy_factors.append(
-                {
-                    "cls": cls,
-                    "affinity": affinity,
-                    "composite_mult": composite_mult,
-                    "stress_mult": stress_mult,
-                    "effective": effective,
-                }
-            )
         active_strategies = [sf["cls"] for sf in strategy_factors if (sf["effective"] or 0.0) > 0]
         inactive_strategies = [
             sf["cls"] for sf in strategy_factors if (sf["effective"] or 0.0) == 0
         ]
     else:
-        for cls in all_strategies:
-            strategy_factors.append(
-                {
-                    "cls": cls,
-                    "affinity": cls.default_affinity,
-                    "composite_mult": 1.0,
-                    "stress_mult": 1.0,
-                    "effective": 1.0,
-                }
-            )
         active_strategies = all_strategies
         inactive_strategies = []
 

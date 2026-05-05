@@ -1,6 +1,54 @@
-"""Donchian Channel Breakout (Turtle-style) — v1.1.
+"""Donchian Channel Breakout (Turtle-style) — v1.2.
 
-v1.0 was a faithful Turtle System 1 implementation. v1.1 layers on five
+v1.2 ("base breakout") narrows the strategy from "any breakout in a
+trending market" to specifically the **base-breakout setup**: a stock
+that has been quiet (tight range, contracted volatility, not extended
+off its 50-day) and just broke out on volume. This rules out three
+classes of false-positive that v1.1 still let through:
+
+  * **Stocks already mid-trend** — running up for weeks, RSI elevated
+    going into the breakout. These look like breakouts on the chart but
+    are actually mean-reversion candidates.
+  * **Rapidly fluctuating stocks** — high recent ATR, wide swings, the
+    breakout bar is just one of many wide bars. No edge here.
+  * **Overextended stocks** — far above the 50-day MA. Even valid
+    breakouts here have very poor risk:reward because the reversal-
+    to-the-mean can take out the stop in a single bad day.
+
+Four new filters address those (each with its own toggle):
+
+  6. **Base consolidation width.** The 20-bar pre-breakout range,
+     measured as (max high - min low) / midpoint, must be ≤ 15%. Wide
+     bases that resolve upward weren't really consolidations.
+
+  7. **Volatility contraction.** ATR(20) excluding today divided by
+     ATR(63) must be ≤ 0.92. Recent vol must have compressed relative
+     to the longer-term baseline (Bollinger Squeeze framing).
+
+  8. **Max distance above SMA(50).** Today's close <= 1.15x SMA(50)
+     by default. Skip stocks that have already soared off their
+     50-day reference.
+
+  9. **Max RSI pre-breakout.** RSI(14) on yesterday's close ≤ 65.
+     The breakout bar itself naturally pops RSI; this filter targets
+     stocks that were ALREADY overbought going into the move.
+
+Lit reference for these filters:
+  - Minervini, M. (2013). *Trade Like a Stock Market Wizard*. The VCP
+    (Volatility Contraction Pattern) framework.
+  - O'Neil, W. (1988). *How to Make Money in Stocks*. Cup-and-handle base.
+  - Weinstein, S. (1988). *Secrets for Profiting in Bull and Bear Markets*.
+    Stage-2 base breakout.
+  - Bollinger, J. (2001). *Bollinger on Bollinger Bands*. The Squeeze.
+
+The original v1.1 framework (multi-window, volume confirm, vol
+expansion, Turtle 1L, relative strength) is unchanged. The new filters
+sit on top of those; ALL filters apply to BOTH the 20-day and 55-day
+windows (unlike the 1L filter, which is System 1 only).
+
+----------------------------------------------------------------------
+
+v1.0 was a faithful Turtle System 1 implementation. v1.1 layered on five
 empirically-supported improvements drawn from the original Turtle leaked
 rules + modern equity-trend literature:
 
@@ -41,11 +89,31 @@ rules + modern equity-trend literature:
      return of the candidate against the same window for the configured
      benchmark (default SPY); skip if the stock has lagged.
 
-ALL improvements default ON in the v1.1 params, but each one has its
-own boolean toggle so backtests can A/B the contributions independently.
-The original v1.0 behavior is recoverable by setting:
+ALL v1.1 improvements default ON, and the v1.2 filters default ON as
+well. Each filter has its own toggle so backtests can A/B contributions
+independently.
+
+Recover **v1.1 behavior** by disabling the v1.2 filters:
 
     DonchianParams(
+        require_base_consolidation=False,
+        require_vol_contraction=False,
+        max_pct_above_sma50=0.0,       # 0 disables
+        max_rsi_pre_breakout=100.0,    # 100 disables
+        adx_min=18.0,                  # was tightened from 18 → 20
+        volume_mult=1.5,               # was tightened from 1.5 → 1.75
+    )
+
+Recover the original **v1.0 behavior** by additionally disabling all
+v1.1 filters:
+
+    DonchianParams(
+        # v1.2 disabled (as above)
+        require_base_consolidation=False,
+        require_vol_contraction=False,
+        max_pct_above_sma50=0.0,
+        max_rsi_pre_breakout=100.0,
+        # v1.1 disabled
         entry_periods=[20],
         volume_mult=1.0,            # disable volume filter
         require_vol_expansion=False,
@@ -72,7 +140,7 @@ from typing import TYPE_CHECKING, ClassVar
 import pandas as pd
 from pydantic import Field
 
-from stockscan.indicators import adx, atr
+from stockscan.indicators import adx, atr, rsi, sma
 from stockscan.strategies import (
     ExitDecision,
     PositionSnapshot,
@@ -104,7 +172,15 @@ class DonchianParams(StrategyParams):
     chandelier_period: int = Field(22, ge=10, le=40, description="Trailing-stop high window")
     chandelier_atr_mult: float = Field(3.0, ge=1.0, le=5.0)
     adx_period: int = Field(14, ge=5, le=30)
-    adx_min: float = Field(18.0, ge=0.0, le=50.0, description="Skip if ADX below this")
+    adx_min: float = Field(
+        20.0,
+        ge=0.0,
+        le=50.0,
+        description=(
+            "Skip if ADX below this. v1.2 default raised from 18 → 20 to "
+            "tighten the trend-strength gate."
+        ),
+    )
 
     # ---- v1.1: Multi-window ensemble ----
     entry_periods: list[int] = Field(
@@ -117,15 +193,16 @@ class DonchianParams(StrategyParams):
         ),
     )
 
-    # ---- v1.1: Volume confirmation ----
+    # ---- v1.1: Volume confirmation (tightened in v1.2) ----
     volume_mult: float = Field(
-        1.5,
+        1.75,
         ge=0.0,
         le=5.0,
         description=(
             "Min ratio of today's volume to the trailing-N average to "
             "confirm institutional participation. Set to 0 or 1.0 to "
-            "disable the volume gate."
+            "disable the volume gate. v1.2 default raised from 1.5 → 1.75 "
+            "to demand stronger institutional confirmation."
         ),
     )
     volume_window: int = Field(
@@ -166,17 +243,103 @@ class DonchianParams(StrategyParams):
         "SPY", description="Symbol to compare against for relative strength."
     )
 
+    # ---- v1.2: Base-consolidation filter ----
+    require_base_consolidation: bool = Field(
+        True,
+        description=(
+            "Require the pre-breakout window to be a tight base. The "
+            "(max high - min low) over the last `base_lookback_bars` "
+            "(excluding today's bar) measured as % of the base's "
+            "midpoint must be <= `base_max_range_pct`. Filters out "
+            "stocks that were already moving wide before the breakout."
+        ),
+    )
+    base_lookback_bars: int = Field(
+        20,
+        ge=5,
+        le=100,
+        description="Bars before today to evaluate as the consolidation base.",
+    )
+    base_max_range_pct: float = Field(
+        15.0,
+        ge=1.0,
+        le=50.0,
+        description=(
+            "Max width of the consolidation base, as a percent of its "
+            "midpoint. 15% = a clean tight base in equity TA literature "
+            "(Minervini's pivot-point base, O'Neil cup-and-handle). "
+            "v1.2.0 launched at 12.0 but produced too few signals in "
+            "combination with the contraction filter; raised in v1.2.1. "
+            "Lower is stricter. Set to 50.0 to effectively disable."
+        ),
+    )
+
+    # ---- v1.2: Volatility-contraction filter ----
+    require_vol_contraction: bool = Field(
+        True,
+        description=(
+            "Require recent volatility to be compressed relative to the "
+            "longer-term baseline. ATR(20) excluding today / ATR(63) "
+            "must be <= `vol_contraction_ratio`. Captures the Bollinger "
+            "Squeeze pattern: vol contracts before genuine breakouts."
+        ),
+    )
+    vol_contraction_ratio: float = Field(
+        0.92,
+        ge=0.30,
+        le=1.50,
+        description=(
+            "Max allowed ratio of recent ATR(short) to longer-term "
+            "ATR(long). 0.92 = recent vol must be at least 8% lower "
+            "than longer-term vol to qualify as a contraction. v1.2.0 "
+            "launched at 0.85 but produced too few signals in "
+            "combination with the base-width filter (real tight bases "
+            "frequently land in the 0.85-0.92 range); raised in v1.2.1. "
+            "Lower is stricter."
+        ),
+    )
+
+    # ---- v1.2: Already-soared filter (distance from SMA50) ----
+    max_pct_above_sma50: float = Field(
+        15.0,
+        ge=0.0,
+        le=100.0,
+        description=(
+            "Skip if today's close is more than this percent above "
+            "SMA(50). Filters stocks that have already soared off "
+            "their long-term reference and are extended. 15% = "
+            "Minervini's 'climax-run' threshold. Set to 0.0 to disable "
+            "(0 means 'no cap')."
+        ),
+    )
+
+    # ---- v1.2: Pre-breakout RSI cap ----
+    max_rsi_pre_breakout: float = Field(
+        65.0,
+        ge=0.0,
+        le=100.0,
+        description=(
+            "Skip if RSI(14) on YESTERDAY's close was at or above this "
+            "level. Today's breakout bar naturally pops RSI; this filter "
+            "checks whether the stock was already overbought going into "
+            "the move. Set to 100.0 to disable."
+        ),
+    )
+
 
 class DonchianBreakout(Strategy):
     name = "donchian_trend"
-    version = "1.1.0"
+    version = "1.2.1"
     display_name = "Donchian Channel Breakout"
     description = (
-        "Multi-window Turtle-style trend-following. Buys 20-day or 55-day "
-        "high breakouts in actually-trending markets, filtered by volume "
-        "expansion, true-range expansion, the Turtle 1L skip-after-winner "
-        "rule, and relative strength versus SPY. Holds via Chandelier "
-        "trailing stop."
+        "Multi-window Turtle-style breakout, narrowed in v1.2 to the "
+        "base-breakout setup. Buys 20-day or 55-day high breakouts that "
+        "emerge from a tight pre-breakout base (≤12% range) with "
+        "compressed volatility (ATR contraction) — and that are NOT "
+        "already extended (close ≤ 15% above SMA50, RSI < 65 going in). "
+        "Volume expansion, true-range expansion, Turtle 1L, and "
+        "relative-strength filters from v1.1 still apply. Holds via "
+        "Chandelier trailing stop."
     )
     tags = ("trend_following", "breakout", "long_only", "swing")
     params_model = DonchianParams
@@ -206,15 +369,40 @@ The trade-off: we will be wrong most of the time. Most "breakouts" turn out
 to be false starts that immediately reverse. The math still works because
 when we ARE right, the winning trades are much larger than the losers.
 
+## What's new in v1.2 — the "base breakout" framing
+
+v1.1 caught real breakouts in trending markets but still produced too
+many signals on stocks that had already soared, were in choppy
+fluctuation, or were extended off their 50-day MA. v1.2 narrows the
+funnel to the specific setup where breakouts have the best historical
+edge: a stock that has been QUIET (tight range, contracted vol, near
+its 50-day MA, RSI not elevated) and just broke out on volume.
+
+Four new filters, each with its own toggle:
+
+  - **Base consolidation width.** The 20 bars BEFORE the breakout, as a
+    range, must be at most 15% of midpoint. Wide "bases" weren't really
+    consolidations.
+  - **Volatility contraction.** ATR(20) excluding today / ATR(63) must
+    be ≤ 0.92. Vol must have compressed before the move (Bollinger
+    Squeeze).
+  - **Already-soared cap.** Today's close must be ≤ 15% above SMA(50).
+    Stocks already extended off their long-term MA make poor entries.
+  - **Pre-breakout RSI cap.** Yesterday's RSI(14) must be < 65. Filters
+    stocks that were ALREADY overbought going into the move.
+
+Plus tightened defaults on existing filters: `adx_min` 18 → 20,
+`volume_mult` 1.5 → 1.75.
+
 ## What's new in v1.1
 
-The v1.1 release layers on five filters drawn from the original Turtle
+The v1.1 release layered on five filters drawn from the original Turtle
 leaked rules and modern equity-trend literature:
 
   - **20 + 55 day ensemble.** Both Turtle "System 1" (20-day, sensitive)
     and "System 2" (55-day, more confirmed) windows fire in parallel.
   - **Volume confirmation.** Breakout volume must be at least 1.5x its
-    20-day average.
+    20-day average. (v1.2 raised to 1.75x.)
   - **Volatility expansion.** Today's true range must be at least equal
     to its 14-day average. Filters out wick-touch breakouts.
   - **Turtle 1L filter.** Skip 20-day breakouts when the PREVIOUS 20-day
@@ -283,6 +471,46 @@ substantially worse than absolute breakouts in stocks beating it. We
 require the candidate's 60-day return to exceed SPY's 60-day return.
 Roughly halves the trade count; the surviving trades are higher quality.
 
+### Base consolidation width (v1.2)
+
+The 20 bars before today's breakout bar must form a tight range —
+(highest high - lowest low) of those 20 bars, divided by their
+midpoint, must be ≤ 15%. In Mark Minervini's *Trade Like a Stock
+Market Wizard*, the highest-quality VCP setups always emerge from a
+"pivot point" base of roughly 5-15% width. Bases wider than that are
+just chop in disguise. This filter is the single biggest reason v1.2
+generates fewer signals than v1.1.
+
+### Volatility contraction (v1.2)
+
+ATR over the trailing 20 bars (excluding today) divided by ATR over
+the trailing 63 bars must be ≤ 0.92. In plain English: recent vol
+must be at least 8% lower than the longer-term baseline. This is
+the math behind the "Bollinger Squeeze" — bands narrow as volatility
+contracts, and the subsequent breakout has a better historical hit
+rate than breakouts from already-volatile names. v1.2.0 launched
+this at 0.85 (≥15% contraction) but produced too few signals in
+practice, since real tight bases frequently land in the 0.85-0.92
+range; v1.2.1 raised the cap to 0.92.
+
+### Already-soared cap (v1.2)
+
+Today's close must be no more than 15% above the 50-day SMA. A stock
+already 25% above its 50-day MA is in a climax run; even a "valid"
+breakout there has poor risk:reward because the typical stop (2x ATR
+from entry) is dwarfed by the size of the typical mean-reversion to
+the 50-day. Minervini calls this stage "extended"; O'Neil's rule of
+thumb is similar at ~10% above the breakout pivot.
+
+### Pre-breakout RSI cap (v1.2)
+
+RSI(14) on YESTERDAY's close — i.e., the bar BEFORE the breakout —
+must be below 65. This filters stocks that were already overbought
+going into the move. Today's breakout bar will naturally pop RSI to
+70+ on a clean break (that's expected and not what we filter on);
+the question is whether the stock was already in overbought territory
+before the breakout, which signals it was already mid-move.
+
 ### ATR - Average True Range
 
 A volatility measurement (J. Welles Wilder, 1978). It tells you the
@@ -291,11 +519,34 @@ typical daily price range of a stock over a lookback window.
 We use ATR for both our initial stop-loss and our trailing stop, scaled
 by multipliers (2x and 3x respectively).
 
-### ADX - Average Directional Index
+### ADX - Average Directional Index (v1.1 fallback)
 
 Also Wilder (1978). 0-100 scale measuring trend strength (not direction).
-We require ADX(14) >= 18 to take a breakout - real trends have ADX above
+v1.1 required ADX(14) >= 18 (raised to >= 20 in v1.2 default) to take
+a breakout. v1.2's default base-consolidation mode REPLACES this gate
+with a Stage-2 uptrend filter (see below) because ADX is structurally
+incompatible with a tight base — a clean consolidation has ADX in
+single digits, so an ADX gate would reject exactly the setups we want.
+ADX is still used as the trend-strength gate when base consolidation
+is disabled (v1.1-equivalent mode). Real trends have ADX above
 ~20 historically; chop / range-bound markets sit below ~18.
+
+### Stage-2 uptrend filter (v1.2 base mode)
+
+Stan Weinstein (*Secrets for Profiting in Bull and Bear Markets*, 1988)
+classifies stocks into four "stages" of a market cycle:
+
+  - Stage 1: bottom basing (sideways after a downtrend)
+  - **Stage 2: uptrend** (advancing, the only stage you should buy in)
+  - Stage 3: top distribution (sideways after an uptrend)
+  - Stage 4: downtrend
+
+The simplest mathematical test for "this is a Stage 2 uptrend":
+**close > SMA(200) AND SMA(50) > SMA(200)**. Both conditions ensure
+we're not buying in Stages 3 or 4 (which fail close > SMA(200)) or
+in early Stage 2 before momentum has confirmed (which would fail
+SMA(50) > SMA(200)). v1.2 uses this in place of ADX during base mode
+because it doesn't get blocked by tight consolidations.
 
 ### Chandelier Exit
 
@@ -309,12 +560,23 @@ normal pullbacks.
 ## The rules in plain English
 
 **Setup filters** (all must pass):
-  - ADX(14) >= 18 - the market is actually trending.
+  - **Trend-strength gate** — one of:
+    * (default, base mode ON) Stan-Weinstein Stage 2 uptrend:
+      close > SMA(200) AND SMA(50) > SMA(200). Captures
+      "long-term uptrend" without measuring the recent consolidation
+      itself (ADX naturally compresses inside a tight base, so the
+      ADX(14) gate would block exactly the setups we want).
+    * (base mode OFF, v1.1 fallback) ADX(14) >= 20.
   - Today's close exceeds the prior N-day max close (N is the longest
     qualifying window from `entry_periods`).
-  - Today's volume >= 1.5x its 20-day average.
+  - Today's volume >= 1.75x its 20-day average. (v1.2: raised from 1.5x.)
   - Today's true range >= ATR(14).
   - Stock 60d return > SPY 60d return.
+  - **(v1.2) Base width ≤ 15%** — the 20-bar pre-breakout range must
+    fit within 12% of midpoint.
+  - **(v1.2) Vol contraction** — pre-breakout ATR(20) <= 0.92x ATR(63).
+  - **(v1.2) Not extended** — today's close <= 1.15x SMA(50).
+  - **(v1.2) Pre-breakout RSI** — yesterday's RSI(14) < 65.
   - The stock isn't reporting earnings within 5 trading days (portfolio
     filter).
 
@@ -341,18 +603,22 @@ normal pullbacks.
 
 ## What to expect when running this
 
-  - **Far fewer trades than v1.0.** The volume + RS + 1L filters together
-    cut signal frequency by ~50-70%. Each surviving trade has a
-    measurably higher win rate.
+  - **Far fewer trades than v1.1**, which itself was tighter than v1.0.
+    The base + contraction filters together typically cut v1.1's signal
+    count by another 60-80%. On a typical day in a healthy market you
+    might see 0-3 candidates; in choppy markets, 0.
   - **Long holding periods** when the trend is real (weeks to months).
-  - **Win rate ~45-55%** historically (up from ~35-45% in v1.0).
+  - **Higher quality per trade.** The surviving signals are explicit
+    base-breakouts, which have stronger historical edge in the equity
+    trend-following literature than "any breakout in any uptrend."
   - **Big asymmetry** between wins and losses still required. Trend
     strategies depend on winners running 3-5x the size of losers.
 
 ## Where this strategy struggles
 
   - **Choppy / range-bound markets** still cause whipsaws on the bars
-    that did pass all filters. ADX + 1L help but aren't perfect.
+    that did pass all filters. The base-width and contraction filters
+    plus 1L help but aren't perfect.
   - **Mean-reversion regimes** - the strategy spends long periods in
     cash waiting for trends to develop.
   - **Late entries.** By definition, we enter AFTER a breakout - some
@@ -377,7 +643,8 @@ sustained run of either market type doesn't kill total P&L.
     # ------------------------------------------------------------------
     def required_history(self) -> int:
         # Longest entry window + slack for prior-signal walkback (1L)
-        # plus the longer of (RS window, chandelier, ADX warmup).
+        # plus the longer of (RS window, chandelier, ADX warmup, the v1.2
+        # 50-day MA, and the long ATR(63) for vol contraction).
         max_entry = max(self.params.entry_periods or [self.params.entry_period])
         return (
             max(
@@ -387,6 +654,9 @@ sustained run of either market type doesn't kill total P&L.
                 self.params.chandelier_period,
                 self.params.atr_period_stop,
                 self.params.adx_period * 2,
+                self.params.base_lookback_bars + 5,    # v1.2 base window
+                63 + 5,                                # v1.2 long ATR for contraction
+                50 + 5,                                # v1.2 SMA(50)
             )
             + 10
         )
@@ -421,11 +691,38 @@ sustained run of either market type doesn't kill total P&L.
         if qualifying_window is None or prior_max_close is None:
             return []
 
-        # ---- 2. ADX trend-strength filter (existing v1.0). ----
-        adx_v = adx(high, low, close, self.params.adx_period).iloc[-1]
-        if pd.isna(adx_v) or float(adx_v) < self.params.adx_min:
-            return []
-        adx_f = float(adx_v)
+        # ---- 2. Trend-strength gate. ----
+        # Two flavors, mutually exclusive:
+        #
+        #  (a) When base consolidation is REQUIRED: ADX(14) is the wrong
+        #      tool — by design a tight base has ADX in single digits, so
+        #      a >=20 ADX gate would block exactly the setups we want.
+        #      Replace it with a Stan-Weinstein "Stage 2 uptrend" check:
+        #      close > SMA(200) AND SMA(50) > SMA(200). That captures
+        #      "stock is in a long-term uptrend" without measuring the
+        #      consolidation phase itself.
+        #
+        #  (b) When base consolidation is OFF (back-compat with v1.1):
+        #      use the original ADX(14) >= adx_min gate.
+        adx_f: float | None = None
+        if self.params.require_base_consolidation:
+            sma200_series = sma(close, 200)
+            sma50_series = sma(close, 50)
+            if len(sma200_series) < 1 or len(sma50_series) < 1:
+                return []
+            sma200_v = sma200_series.iloc[-1]
+            sma50_v = sma50_series.iloc[-1]
+            if pd.isna(sma200_v) or pd.isna(sma50_v):
+                return []
+            if last_close <= float(sma200_v):
+                return []
+            if float(sma50_v) <= float(sma200_v):
+                return []
+        else:
+            adx_v = adx(high, low, close, self.params.adx_period).iloc[-1]
+            if pd.isna(adx_v) or float(adx_v) < self.params.adx_min:
+                return []
+            adx_f = float(adx_v)
 
         # ---- 3. Volume confirmation. ----
         volume_ratio: float | None = None
@@ -463,6 +760,83 @@ sustained run of either market type doesn't kill total P&L.
             return []
         vol_expansion_ratio = today_tr / atr14_f if atr14_f > 0 else None
 
+        # ---- 4b. v1.2: Base-consolidation width filter. ----
+        # Look at the K bars BEFORE today's bar (the breakout). Compute
+        # the high-low range as a percent of the midpoint. A clean base
+        # is tight; a "base" wider than ~12% of price is really just
+        # ongoing chop, not a consolidation we want to fade buying into.
+        base_range_pct: float | None = None
+        if self.params.require_base_consolidation:
+            k = self.params.base_lookback_bars
+            if len(view) <= k:
+                return []
+            base_window = view.iloc[-(k + 1) : -1]  # exclude today
+            base_high = float(base_window["high"].max())
+            base_low = float(base_window["low"].min())
+            base_mid = (base_high + base_low) / 2
+            if base_mid <= 0:
+                return []
+            base_range_pct = (base_high - base_low) / base_mid * 100
+            if base_range_pct > self.params.base_max_range_pct:
+                return []
+
+        # ---- 4c. v1.2: Volatility-contraction filter. ----
+        # Recent ATR(20) excluding today / longer-term ATR(63) must be
+        # below the threshold. Captures the Bollinger Squeeze: real
+        # base breakouts are preceded by contraction, not expansion.
+        contraction_ratio: float | None = None
+        if self.params.require_vol_contraction:
+            short_atr_series = atr(high, low, close, 20)
+            long_atr_series = atr(high, low, close, 63)
+            # Exclude today's bar (the breakout) so the ratio reflects
+            # the PRE-breakout regime, not the breakout itself.
+            if len(short_atr_series) < 2 or len(long_atr_series) < 2:
+                return []
+            short_atr = short_atr_series.iloc[-2]
+            long_atr = long_atr_series.iloc[-2]
+            if pd.isna(short_atr) or pd.isna(long_atr) or float(long_atr) <= 0:
+                return []
+            contraction_ratio = float(short_atr) / float(long_atr)
+            if contraction_ratio > self.params.vol_contraction_ratio:
+                return []
+
+        # ---- 4d. v1.2: Already-soared filter (distance from SMA50). ----
+        # Stocks already 15%+ above their 50-day MA are extended; even
+        # valid breakouts here have poor risk:reward. 0 disables the cap.
+        pct_above_sma50: float | None = None
+        if self.params.max_pct_above_sma50 > 0:
+            sma50_series = sma(close, 50)
+            if len(sma50_series) < 1:
+                return []
+            sma50_v = sma50_series.iloc[-1]
+            if pd.isna(sma50_v) or float(sma50_v) <= 0:
+                return []
+            pct_above_sma50 = (last_close - float(sma50_v)) / float(sma50_v) * 100
+            if pct_above_sma50 > self.params.max_pct_above_sma50:
+                return []
+
+        # ---- 4e. v1.2: Pre-breakout RSI cap. ----
+        # Yesterday's RSI(14) — the breakout bar itself naturally pops
+        # RSI, so checking today's would defeat the filter. We want to
+        # reject stocks that were already in overbought territory before
+        # the breakout (i.e., already in a sustained run-up).
+        rsi_pre: float | None = None
+        if self.params.max_rsi_pre_breakout < 100.0:
+            if len(close) < 2:
+                return []
+            rsi_series = rsi(close.iloc[:-1], 14)
+            if len(rsi_series) < 1:
+                return []
+            rsi_v = rsi_series.iloc[-1]
+            if pd.isna(rsi_v):
+                # No RSI yet (insufficient history) — be conservative
+                # and skip, matching how other warmup-required filters
+                # behave above.
+                return []
+            rsi_pre = float(rsi_v)
+            if rsi_pre >= self.params.max_rsi_pre_breakout:
+                return []
+
         # ---- 5. Relative-strength filter. ----
         rs_diff: float | None = None
         if self.params.enable_relative_strength:
@@ -490,15 +864,27 @@ sustained run of either market type doesn't kill total P&L.
             "breakout_window": qualifying_window,
             "prior_max_close": round(prior_max_close, 4),
             "atr": round(atr20_f, 4),
-            "adx": round(adx_f, 4),
             "vol_expansion_ratio": round(vol_expansion_ratio, 4)
             if vol_expansion_ratio is not None
             else None,
         }
+        if adx_f is not None:
+            metadata["adx"] = round(adx_f, 4)
         if volume_ratio is not None:
             metadata["volume_mult_actual"] = round(volume_ratio, 4)
         if rs_diff is not None:
             metadata["rs_60d_diff"] = round(rs_diff, 4)
+        # v1.2 base-breakout diagnostics. Only stash when the filter
+        # actually computed a value (so the signal-detail page can
+        # tell "filter disabled" from "filter passed cleanly").
+        if base_range_pct is not None:
+            metadata["base_range_pct"] = round(base_range_pct, 4)
+        if contraction_ratio is not None:
+            metadata["vol_contraction_ratio_actual"] = round(contraction_ratio, 4)
+        if pct_above_sma50 is not None:
+            metadata["pct_above_sma50"] = round(pct_above_sma50, 4)
+        if rsi_pre is not None:
+            metadata["rsi_pre_breakout"] = round(rsi_pre, 4)
 
         # ---- 7. Turtle 1L filter (System 1 only). ----
         # Walks back to the most recent prior 20-day breakout for this

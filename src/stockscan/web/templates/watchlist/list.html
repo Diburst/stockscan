@@ -1,24 +1,14 @@
 {% extends "base.html" %}
-{% from "_macros.html" import card, badge, empty %}
+{% from "_macros.html" import card, badge, empty, tech_score, confirm_button,
+     table_open, table_close, mobile_list_open, mobile_list_close,
+     field_label, page_header %}
 
 {% block title %}Watchlist{% endblock %}
 
-{% macro tech_score_badge(score) %}
-  {% if score is none %}
-    <span class="text-xs text-ink-500">—</span>
-  {% else %}
-    {% set s = score|float %}
-    {% set color = 'ok-600' if s > 0.05 else ('bad-600' if s < -0.05 else 'ink-500') %}
-    {% set bg = 'ok-100' if s > 0.05 else ('bad-100' if s < -0.05 else 'ink-100') %}
-    <span class="inline-flex items-center text-xs font-mono px-2 py-0.5 rounded
-                 bg-{{ bg }} text-{{ color }} border border-{{ color }}/30">
-      {{ "%+.2f"|format(s) }}
-    </span>
-  {% endif %}
-{% endmacro %}
-
 {% block content %}
 <div class="space-y-6">
+
+  {{ page_header("Watchlist", subtitle="Symbols you're tracking, with live quotes and price-target alerts") }}
 
   {% if err %}
     <div class="bg-bad-100 border border-bad-600/30 text-bad-600 px-4 py-3 rounded text-sm">
@@ -31,8 +21,8 @@
     <a href="/analysis"
        class="inline-flex items-center gap-1.5 text-sm px-3 py-2 rounded
               bg-ink-900 text-white hover:bg-ink-800 transition-colors min-h-[40px]"
-       title="Generate per-symbol technical analysis with charts for every watched name">
-      📊 Analyze all watched
+       title="Run a fresh per-symbol technical analysis (with charts) for every watched name">
+      📊 Analyse all watched
     </a>
   </div>
 
@@ -41,22 +31,25 @@
     <form action="/watchlist/add" method="post"
           class="flex flex-col sm:flex-row sm:items-end gap-2">
       <div class="flex-1">
-        <label class="block text-xs text-ink-500 mb-1">Symbol</label>
-        <input name="symbol" required maxlength="10"
+        {{ field_label("symbol", "Symbol", required=True,
+                       help="Stock ticker, e.g., AAPL. Auto-uppercased on submit.") }}
+        <input id="symbol" name="symbol" required maxlength="10"
                placeholder="AAPL"
                class="w-full px-3 py-2 rounded border border-ink-300 text-sm font-mono uppercase"
                style="text-transform: uppercase;">
       </div>
       <div class="flex-1 grid grid-cols-2 gap-2">
         <div>
-          <label class="block text-xs text-ink-500 mb-1">Target price (optional)</label>
-          <input name="target_price" type="number" step="0.01" min="0"
+          {{ field_label("target_price", "Target price",
+                         help="Optional. When the symbol crosses this price (in the configured direction) and alerts are enabled, you'll be notified.") }}
+          <input id="target_price" name="target_price" type="number" step="0.01" min="0"
                  inputmode="decimal" placeholder="—"
                  class="w-full px-3 py-2 rounded border border-ink-300 text-sm">
         </div>
         <div>
-          <label class="block text-xs text-ink-500 mb-1">Direction</label>
-          <select name="target_direction"
+          {{ field_label("target_direction", "Direction",
+                         help="'above' triggers when price rises through the target; 'below' triggers when price falls through.") }}
+          <select id="target_direction" name="target_direction"
                   class="w-full px-3 py-2 rounded border border-ink-300 text-sm">
             <option value="">—</option>
             <option value="above">above</option>
@@ -64,7 +57,8 @@
           </select>
         </div>
       </div>
-      <button class="px-4 py-2 rounded bg-ink-900 text-white text-sm h-fit">
+      <button class="px-4 py-2 rounded bg-ink-900 text-white text-sm h-fit"
+              title="Add this symbol to the watchlist">
         Add
       </button>
     </form>
@@ -74,21 +68,17 @@
     {{ empty("Your watchlist is empty.", "👀") }}
   {% else %}
     <!-- Desktop table -->
-    <div class="hidden sm:block bg-white rounded-xl shadow-sm border border-ink-300/40 overflow-x-auto">
-      <table class="w-full text-sm">
-        <thead class="text-xs uppercase text-ink-500 bg-ink-100 border-b border-ink-300/40">
-          <tr>
-            <th class="text-left px-4 py-2">Symbol</th>
-            <th class="text-right px-4 py-2">Last close</th>
-            <th class="text-right px-4 py-2">Δ</th>
-            <th class="text-right px-4 py-2">Volume</th>
-            <th class="text-center px-4 py-2" title="Direction-agnostic technical bias from RSI(14) + MACD. Positive = bullish recent action; negative = bearish.">Tech</th>
-            <th class="text-left px-4 py-2">Target</th>
-            <th class="text-left px-4 py-2">Alert</th>
-            <th class="px-4 py-2"></th>
-          </tr>
-        </thead>
-        <tbody class="divide-y divide-ink-300/40">
+    <div class="hidden sm:block bg-white rounded-xl shadow-sm border border-ink-300/40 overflow-hidden">
+      {{ table_open([
+          {"label": "Symbol", "align": "left"},
+          {"label": "Last close", "align": "right", "help": "Most recent end-of-day close"},
+          {"label": "Δ", "align": "right", "help": "Today's percentage change vs. prior close"},
+          {"label": "Volume", "align": "right", "help": "Today's traded share volume"},
+          {"label": "Tech", "align": "center", "help": "Direction-agnostic technical bias from RSI(14) + MACD. Positive = bullish recent action; negative = bearish."},
+          {"label": "Target", "align": "left", "help": "Optional price target — triggers an alert when crossed"},
+          {"label": "Alert", "align": "center", "help": "Whether the price-target alert is currently armed"},
+          {"label": "", "align": "right"},
+      ]) }}
           {% for w in items %}
             <tr class="{% if w.target_satisfied %}bg-ok-100/40{% endif %}">
               <td class="px-4 py-2 font-mono font-semibold align-middle whitespace-nowrap">
@@ -108,14 +98,15 @@
                 {% if w.last_volume %}{{ "{:,}".format(w.last_volume) }}{% else %}—{% endif %}
               </td>
               <td class="px-4 py-2 text-center align-middle">
-                {{ tech_score_badge(tech_scores.get(w.symbol)) }}
+                {{ tech_score(tech_scores.get(w.symbol)) }}
               </td>
               <!-- Target editor -->
               <td class="px-4 py-2 align-middle">
                 <form action="/watchlist/{{ w.watchlist_id }}/target" method="post"
                       class="flex items-center gap-1">
                   <select name="target_direction"
-                          class="px-2 py-1 rounded border border-ink-300 text-xs">
+                          class="px-2 py-1 rounded border border-ink-300 text-xs"
+                          title="Trigger when price crosses the target in this direction">
                     <option value="">—</option>
                     <option value="above" {% if w.target_direction == 'above' %}selected{% endif %}>above</option>
                     <option value="below" {% if w.target_direction == 'below' %}selected{% endif %}>below</option>
@@ -124,14 +115,17 @@
                          inputmode="decimal"
                          value="{{ '%.2f'|format(w.target_price|float) if w.target_price is not none else '' }}"
                          placeholder="—"
-                         class="w-24 px-2 py-1 rounded border border-ink-300 text-xs font-mono">
-                  <button class="text-xs underline">save</button>
+                         class="w-24 px-2 py-1 rounded border border-ink-300 text-xs font-mono"
+                         title="Target price; leave blank to clear">
+                  <button class="text-xs underline"
+                          title="Save target price + direction">Save</button>
                 </form>
               </td>
               <!-- Alert toggle (no label text — checkbox alone) -->
               <td class="px-4 py-2 align-middle text-center">
                 {% if w.target_price is not none %}
-                  <form action="/watchlist/{{ w.watchlist_id }}/toggle-alert" method="post">
+                  <form action="/watchlist/{{ w.watchlist_id }}/toggle-alert" method="post"
+                        title="Toggle whether this target fires alerts">
                     <input type="checkbox" name="enabled" value="on"
                            {% if w.alert_enabled %}checked{% endif %}
                            onchange="this.form.submit()"
@@ -139,19 +133,22 @@
                            aria-label="alert enabled">
                   </form>
                 {% else %}
-                  <span class="text-xs text-ink-500">—</span>
+                  <span class="text-xs text-ink-500" title="No target set">—</span>
                 {% endif %}
               </td>
-              <!-- Remove (no confirm popup) -->
+              <!-- Remove (two-step inline confirm) -->
               <td class="px-4 py-2 text-right align-middle">
-                <form action="/watchlist/{{ w.watchlist_id }}/delete" method="post">
-                  <button class="text-ink-500 hover:text-bad-600 text-lg" aria-label="remove">×</button>
-                </form>
+                {{ confirm_button(
+                    "/watchlist/" ~ w.watchlist_id ~ "/delete",
+                    label="×",
+                    confirm_label="Confirm",
+                    classes="text-ink-500 hover:text-bad-600 text-lg leading-none px-1",
+                    aria_label="Remove " ~ w.symbol ~ " from watchlist",
+                ) }}
               </td>
             </tr>
           {% endfor %}
-        </tbody>
-      </table>
+      {{ table_close() }}
     </div>
 
     <!-- Mobile cards -->
@@ -163,9 +160,13 @@
               <span class="font-mono font-semibold text-base">{{ w.symbol }}</span>
               {% if w.target_satisfied and w.alert_enabled %}{{ badge("hit", "ok") }}{% endif %}
             </div>
-            <form action="/watchlist/{{ w.watchlist_id }}/delete" method="post">
-              <button class="text-ink-500 hover:text-bad-600 text-xl" aria-label="remove">×</button>
-            </form>
+            {{ confirm_button(
+                "/watchlist/" ~ w.watchlist_id ~ "/delete",
+                label="×",
+                confirm_label="Confirm",
+                classes="text-ink-500 hover:text-bad-600 text-xl leading-none px-1",
+                aria_label="Remove " ~ w.symbol ~ " from watchlist",
+            ) }}
           </div>
           <div class="font-mono text-sm">
             {% if w.last_close is not none %}${{ "%.2f"|format(w.last_close|float) }}{% else %}—{% endif %}
@@ -178,7 +179,7 @@
           {% endif %}
           <div class="mt-1 text-xs flex items-center gap-2">
             <span class="text-ink-500">tech</span>
-            {{ tech_score_badge(tech_scores.get(w.symbol)) }}
+            {{ tech_score(tech_scores.get(w.symbol)) }}
           </div>
 
           <form action="/watchlist/{{ w.watchlist_id }}/target" method="post"
@@ -194,7 +195,8 @@
                    value="{{ '%.2f'|format(w.target_price|float) if w.target_price is not none else '' }}"
                    placeholder="target"
                    class="flex-1 px-2 py-1.5 rounded border border-ink-300 text-xs font-mono">
-            <button class="px-3 py-1.5 rounded bg-ink-900 text-white text-xs">save</button>
+            <button class="px-3 py-1.5 rounded bg-ink-900 text-white text-xs"
+                    title="Save target price + direction">Save</button>
           </form>
 
           {% if w.target_price is not none %}

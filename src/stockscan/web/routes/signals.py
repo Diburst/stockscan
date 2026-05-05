@@ -29,7 +29,13 @@ from stockscan.strategies import (
     current_version_filter,
     discover_strategies,
 )
-from stockscan.web.deps import get_session, render
+from stockscan.web.deps import (
+    attach_hx_toast,
+    get_session,
+    rate_limit_check,
+    render,
+    safe,
+)
 
 router = APIRouter(prefix="/signals")
 log = logging.getLogger(__name__)
@@ -138,6 +144,26 @@ async def refresh_endpoint(
     Filters (``strategy``, ``days``, ``show_rejected``) are forwarded
     so the post-refresh view matches whatever the user was looking at.
     """
+    # Signals refresh is the most expensive endpoint in the app — bars
+    # backfill + every strategy re-runs. Debounce harder than news.
+    cooldown_remaining = rate_limit_check("signals.refresh", cooldown_seconds=20)
+    if cooldown_remaining is not None:
+        ctx = _query_signals_view(
+            s, strategy=strategy, days=days, show_rejected=show_rejected
+        )
+        response = render(
+            request,
+            "signals/_signals_content.html",
+            signals_refresh_error=None,
+            signals_refresh_summary=None,
+            **ctx,
+        )
+        return attach_hx_toast(
+            response,
+            "warn",
+            f"Just refreshed — try again in {int(cooldown_remaining) + 1}s",
+        )
+
     error: str | None = None
     refresh_summary: dict[str, object] | None = None
 
@@ -170,13 +196,23 @@ async def refresh_endpoint(
     ctx = _query_signals_view(
         s, strategy=strategy, days=days, show_rejected=show_rejected
     )
-    return render(
+    response = render(
         request,
         "signals/_signals_content.html",
         signals_refresh_error=error,
         signals_refresh_summary=refresh_summary,
         **ctx,
     )
+    if error:
+        return attach_hx_toast(response, "error", "Signal refresh failed")
+    if refresh_summary:
+        n_new = refresh_summary.get("signals_emitted", 0)
+        return attach_hx_toast(
+            response,
+            "success",
+            f"Signals refreshed — {n_new} new signal{'s' if n_new != 1 else ''}",
+        )
+    return response
 
 
 @router.get("/{signal_id}")
@@ -228,12 +264,10 @@ async def signal_detail(
         )
 
     # ---- 2. Regime context at the signal's as_of_date.
-    regime: MarketRegime | None
-    try:
-        regime = get_regime(signal.as_of_date, session=s)
-    except Exception as exc:
-        log.warning("signal_detail %s: regime lookup failed: %s", signal_id, exc)
-        regime = None
+    regime: MarketRegime | None = safe(
+        lambda: get_regime(signal.as_of_date, session=s),
+        label=f"signal_detail[{signal_id}].get_regime",
+    )
 
     # ---- 3. Technical-confirmation score for (symbol, as_of, strategy).
     tech_sql = text(
@@ -243,14 +277,13 @@ async def signal_detail(
         WHERE symbol = :sym AND as_of_date = :d AND strategy_name = :n
         """
     )
-    try:
-        tech_score = s.execute(
+    tech_score = safe(
+        lambda: s.execute(
             tech_sql,
             {"sym": signal.symbol, "d": signal.as_of_date, "n": signal.strategy_name},
-        ).first()
-    except Exception as exc:
-        log.warning("signal_detail %s: tech_score lookup failed: %s", signal_id, exc)
-        tech_score = None
+        ).first(),
+        label=f"signal_detail[{signal_id}].tech_score",
+    )
 
     # ---- 4. The strategy class — used for affinity lookups, the
     #         description-and-manual block, and parameter-schema.

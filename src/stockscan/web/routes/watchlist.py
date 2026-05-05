@@ -20,7 +20,13 @@ from stockscan.watchlist.store import (
     set_target,
     toggle_alert,
 )
-from stockscan.web.deps import get_session, render
+from stockscan.web.deps import (
+    flash_redirect,
+    get_session,
+    hx_toast_response,
+    render,
+    safe,
+)
 
 router = APIRouter(prefix="/watchlist")
 
@@ -36,17 +42,20 @@ async def watchlist_list(
     # watchlist is small (~20-50 names), and bars are already in the local DB,
     # so this is fast — sub-100ms typical. No caching layer needed at this scale.
     today = _date.today()
+    one_year_ago = today.replace(year=today.year - 1)
     tech_scores: dict[str, float | None] = {}
     for item in items:
-        try:
-            bars = get_bars(item.symbol, today.replace(year=today.year - 1), today, session=s)
-        except Exception:
+        bars = safe(
+            lambda sym=item.symbol: get_bars(sym, one_year_ago, today, session=s),
+            label=f"watchlist.get_bars[{item.symbol}]",
+        )
+        if bars is None or getattr(bars, "empty", True):
             tech_scores[item.symbol] = None
             continue
-        if bars is None or bars.empty:
-            tech_scores[item.symbol] = None
-            continue
-        result = compute_technical_score(None, bars, today)
+        result = safe(
+            lambda b=bars: compute_technical_score(None, b, today),
+            label=f"watchlist.compute_technical_score[{item.symbol}]",
+        )
         tech_scores[item.symbol] = result.score if result is not None else None
     return render(
         request,
@@ -101,15 +110,27 @@ async def watchlist_add(
         )
     except (ValueError, InvalidOperation) as exc:
         if _is_htmx(request):
-            return HTMLResponse(_WATCH_ERROR_SNIPPET, status_code=400)
-        return RedirectResponse(
-            url=f"/watchlist?err={str(exc).replace(' ', '+')}", status_code=303
+            # The HX-Trigger toast appears immediately without a page reload.
+            return hx_toast_response(
+                _WATCH_ERROR_SNIPPET,
+                "error",
+                f"Couldn't add {symbol.upper()}: {exc}",
+                status_code=400,
+            )
+        return flash_redirect(
+            f"/watchlist?err={str(exc).replace(' ', '+')}",
+            "error",
+            f"Couldn't add {symbol.upper()}: {exc}",
         )
 
     if _is_htmx(request):
         # Replace the form in-place; no page reload, no scroll jump.
-        return HTMLResponse(_WATCHING_SNIPPET)
-    return RedirectResponse(url=redirect_to, status_code=303)
+        return hx_toast_response(
+            _WATCHING_SNIPPET, "success", f"Added {symbol.upper()} to watchlist"
+        )
+    return flash_redirect(
+        redirect_to, "success", f"Added {symbol.upper()} to watchlist"
+    )
 
 
 @router.post("/{watchlist_id}/delete")
@@ -118,8 +139,19 @@ async def watchlist_delete(
     request: Request,
     s: Session = Depends(get_session),
 ):
+    # Capture the symbol before deletion so the toast can be specific.
+    symbol = None
+    try:
+        items = list_watchlist(session=s)
+        for item in items:
+            if item.watchlist_id == watchlist_id:
+                symbol = item.symbol
+                break
+    except Exception:  # noqa: BLE001 - lookup is best-effort for the toast
+        pass
     remove_from_watchlist(watchlist_id, session=s)
-    return RedirectResponse(url="/watchlist", status_code=303)
+    msg = f"Removed {symbol} from watchlist" if symbol else "Removed from watchlist"
+    return flash_redirect("/watchlist", "success", msg)
 
 
 @router.post("/{watchlist_id}/target")
@@ -133,16 +165,18 @@ async def watchlist_set_target(
     try:
         if not target_price.strip():
             set_target(watchlist_id, None, None, session=s)
-        else:
-            tp = Decimal(target_price.strip())
-            if target_direction not in {"above", "below"}:
-                raise ValueError("target_direction must be 'above' or 'below'")
-            set_target(watchlist_id, tp, target_direction, session=s)  # type: ignore[arg-type]
+            return flash_redirect("/watchlist", "success", "Target cleared")
+        tp = Decimal(target_price.strip())
+        if target_direction not in {"above", "below"}:
+            raise ValueError("target_direction must be 'above' or 'below'")
+        set_target(watchlist_id, tp, target_direction, session=s)  # type: ignore[arg-type]
     except (ValueError, InvalidOperation) as exc:
-        return RedirectResponse(
-            url=f"/watchlist?err={str(exc).replace(' ', '+')}", status_code=303
+        return flash_redirect(
+            f"/watchlist?err={str(exc).replace(' ', '+')}",
+            "error",
+            f"Couldn't save target: {exc}",
         )
-    return RedirectResponse(url="/watchlist", status_code=303)
+    return flash_redirect("/watchlist", "success", "Target saved")
 
 
 @router.post("/{watchlist_id}/toggle-alert")
@@ -152,5 +186,8 @@ async def watchlist_toggle_alert(
     enabled: str = Form("off"),
     s: Session = Depends(get_session),
 ):
-    toggle_alert(watchlist_id, enabled.lower() in {"on", "true", "1"}, session=s)
-    return RedirectResponse(url="/watchlist", status_code=303)
+    is_on = enabled.lower() in {"on", "true", "1"}
+    toggle_alert(watchlist_id, is_on, session=s)
+    return flash_redirect(
+        "/watchlist", "info", "Alert " + ("armed" if is_on else "disarmed")
+    )

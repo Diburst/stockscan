@@ -1,21 +1,25 @@
 {% extends "base.html" %}
-{% from "_macros.html" import card, badge, empty %}
+{% from "_macros.html" import card, badge, empty, page_header, back_link, tooltip %}
 
 {% block title %}Trade {{ trade.symbol if trade else "?" }}{% endblock %}
 
 {% block content %}
 {% if not trade %}
   {{ empty("Trade not found.", "❓") }}
+  <div class="mt-4">{{ back_link("/trades", "Back to trades") }}</div>
 {% else %}
 <div class="space-y-6">
 
   <!-- Header -->
-  <div class="flex items-baseline justify-between flex-wrap gap-2">
-    <h1 class="text-2xl font-semibold">
-      <span class="font-mono">{{ trade.symbol }}</span>
-      <span class="text-base text-ink-500">· {{ trade.strategy }}</span>
-    </h1>
-    {% if trade.status == 'open' %}{{ badge("open", "ok") }}{% else %}{{ badge("closed") }}{% endif %}
+  <div>
+    {{ back_link("/trades", "Back to trades") }}
+    <div class="flex items-baseline justify-between flex-wrap gap-2 mt-1">
+      <h1 class="text-2xl font-semibold">
+        <span class="font-mono">{{ trade.symbol }}</span>
+        <span class="text-base text-ink-500">· {{ trade.strategy }}</span>
+      </h1>
+      {% if trade.status == 'open' %}{{ badge("open", "ok") }}{% else %}{{ badge("closed") }}{% endif %}
+    </div>
   </div>
 
   {% call card(title="Trade summary") %}
@@ -23,12 +27,15 @@
       <div><dt class="text-ink-500">Opened</dt><dd>{{ trade.opened_at.date() }}</dd></div>
       <div><dt class="text-ink-500">Closed</dt><dd>{{ trade.closed_at.date() if trade.closed_at else "—" }}</dd></div>
       <div><dt class="text-ink-500">Hold (days)</dt><dd>{{ trade.holding_days or "—" }}</dd></div>
-      <div><dt class="text-ink-500">Realized P&amp;L</dt>
-        <dd class="font-mono {% if trade.realized_pnl and trade.realized_pnl > 0 %}text-ok-600{% elif trade.realized_pnl and trade.realized_pnl < 0 %}text-bad-600{% endif %}">
+      <div><dt class="text-ink-500">Realised P&amp;L</dt>
+        <dd class="font-mono {% if trade.realized_pnl and trade.realized_pnl > 0 %}text-ok-600{% elif trade.realized_pnl and trade.realized_pnl < 0 %}text-bad-600{% endif %}"
+            title="Profit & loss after slippage and fees, in dollars">
           {% if trade.realized_pnl is not none %}${{ "%.2f"|format(trade.realized_pnl|float) }}{% else %}—{% endif %}
         </dd></div>
-      <div><dt class="text-ink-500">MFE</dt><dd>{{ "%.2f%%"|format(trade.mfe|float * 100) if trade.mfe else "—" }}</dd></div>
-      <div><dt class="text-ink-500">MAE</dt><dd>{{ "%.2f%%"|format(trade.mae|float * 100) if trade.mae else "—" }}</dd></div>
+      <div><dt class="text-ink-500">{{ tooltip("MFE", "mfe" | explain_text) }}</dt>
+        <dd title="Best unrealised P&L during the trade, as a percent of entry price">{{ "%.2f%%"|format(trade.mfe|float * 100) if trade.mfe else "—" }}</dd></div>
+      <div><dt class="text-ink-500">{{ tooltip("MAE", "mae" | explain_text) }}</dt>
+        <dd title="Worst unrealised drawdown during the trade, as a percent of entry price">{{ "%.2f%%"|format(trade.mae|float * 100) if trade.mae else "—" }}</dd></div>
     </dl>
   {% endcall %}
 
@@ -80,13 +87,11 @@
       <textarea name="body" rows="4" required minlength="1"
                 placeholder="Capture rationale, context, or lessons. Markdown supported."
                 class="block w-full px-3 py-2 rounded border border-ink-300 text-sm font-mono"></textarea>
-      <button class="px-4 py-2 rounded bg-ink-900 text-white text-sm">Add note</button>
+      <button class="px-4 py-2 rounded bg-ink-900 text-white text-sm"
+              title="Save the note to this trade's record">Save note</button>
     </form>
   {% endcall %}
 
-  <a href="/trades" class="inline-flex items-center px-4 py-2 rounded border border-ink-300 text-sm">
-    ← Back to trades
-  </a>
 </div>
 {% endif %}
 {% endblock %}

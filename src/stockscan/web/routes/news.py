@@ -29,7 +29,12 @@ from stockscan.news import (
     refresh_news,
 )
 from stockscan.watchlist import watchlist_symbols
-from stockscan.web.deps import get_session, render
+from stockscan.web.deps import (
+    attach_hx_toast,
+    get_session,
+    rate_limit_check,
+    render,
+)
 
 router = APIRouter(prefix="/news")
 log = logging.getLogger(__name__)
@@ -46,6 +51,24 @@ async def refresh_endpoint(
     updates in place — no page reload. The partial is the same one the
     dashboard renders on initial load, so the surface stays consistent.
     """
+    # Debounce — refusing to hit the upstream if the user just refreshed.
+    # Renders the current card unchanged and pops a "wait" toast.
+    cooldown_remaining = rate_limit_check("news.refresh", cooldown_seconds=10)
+    if cooldown_remaining is not None:
+        response = render(
+            request,
+            "_news_card.html",
+            news_articles=recent_general(limit=10, session=s),
+            news_last_fetched=last_fetched_at(session=s),
+            news_refresh_error=None,
+            news_refresh_summary=None,
+        )
+        return attach_hx_toast(
+            response,
+            "warn",
+            f"Just refreshed — try again in {int(cooldown_remaining) + 1}s",
+        )
+
     error: str | None = None
     refresh_summary: dict[str, object] | None = None
 
@@ -72,7 +95,7 @@ async def refresh_endpoint(
             log.exception("news refresh: unexpected error")
             error = f"Refresh failed: {exc}"
 
-    return render(
+    response = render(
         request,
         "_news_card.html",
         news_articles=recent_general(limit=10, session=s),
@@ -80,6 +103,16 @@ async def refresh_endpoint(
         news_refresh_error=error,
         news_refresh_summary=refresh_summary,
     )
+    if error:
+        return attach_hx_toast(response, "error", "News refresh failed")
+    if refresh_summary:
+        n_new = refresh_summary.get("articles_upserted", 0)
+        return attach_hx_toast(
+            response,
+            "success",
+            f"News refreshed — {n_new} new article{'s' if n_new != 1 else ''}",
+        )
+    return response
 
 
 @router.get("/{article_id}/content")

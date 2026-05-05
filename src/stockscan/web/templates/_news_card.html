@@ -9,7 +9,7 @@
      news_refresh_summary — dict | None, "{articles_upserted, api_calls, failures}"
                             from a successful refresh (shown briefly as feedback)
 #}
-{% from "_macros.html" import card, badge, empty %}
+{% from "_macros.html" import card, badge, empty, time_ago, loading_spinner %}
 
 {% macro _sentiment_dot(polarity) %}
   {%- if polarity is none -%}
@@ -30,28 +30,6 @@
   {%- endif -%}
 {% endmacro %}
 
-{# Format the last-fetched timestamp as a relative ago string + absolute
-   tooltip. Pure Jinja so it doesn't depend on JS. #}
-{% macro _time_ago(dt) %}
-  {%- if dt is none -%}
-    <span class="text-ink-400">never</span>
-  {%- else -%}
-    {%- set delta = (now_utc() - dt).total_seconds() | int -%}
-    {%- if delta < 60 -%}
-      {%- set ago = "just now" -%}
-    {%- elif delta < 3600 -%}
-      {%- set ago = (delta // 60) ~ "m ago" -%}
-    {%- elif delta < 86400 -%}
-      {%- set ago = (delta // 3600) ~ "h ago" -%}
-    {%- elif delta < 604800 -%}
-      {%- set ago = (delta // 86400) ~ "d ago" -%}
-    {%- else -%}
-      {%- set ago = (delta // 604800) ~ "w ago" -%}
-    {%- endif -%}
-    <span title="{{ dt.strftime('%Y-%m-%d %H:%M UTC') }}">{{ ago }}</span>
-  {%- endif -%}
-{% endmacro %}
-
 <div id="news-card">
   {% call card(
        title="Market News",
@@ -60,7 +38,7 @@
     <!-- Header strip: last-fetched + refresh button -->
     <div class="flex items-center justify-between gap-3 flex-wrap mb-3 -mt-1">
       <div class="text-xs text-ink-500">
-        Last fetch: {{ _time_ago(news_last_fetched) }}
+        Last fetch: {{ time_ago(news_last_fetched) }}
         {% if news_refresh_summary %}
           <span class="ml-2 text-ok-600">
             ✓ +{{ news_refresh_summary.articles_upserted }} articles
@@ -79,7 +57,7 @@
           class="inline-flex items-center gap-1.5 text-xs px-3 py-1.5 rounded border border-ink-300 hover:bg-ink-100 transition-colors min-h-[36px] disabled:opacity-50 disabled:cursor-wait"
           title="Pull the latest news from EODHD"
         >
-          ⟳ Fetch latest
+          ⟳ Refresh
         </button>
       </form>
     </div>
@@ -92,7 +70,7 @@
 
     {% if not news_articles %}
       {{ empty(
-            "No news yet — click 'Fetch latest' to populate from EODHD." if news_last_fetched is none
+            "No news yet — click 'Refresh' to populate from EODHD." if news_last_fetched is none
             else "No articles match the configured general-market feed yet.",
             "📰",
       ) }}
@@ -124,7 +102,7 @@
                   <div class="text-sm text-ink-900 leading-snug">{{ art.title }}</div>
                   <div class="text-xs text-ink-500 mt-0.5 truncate">
                     {% if art.source %}{{ art.source }}{% else %}EODHD{% endif %}
-                    · {{ _time_ago(art.published_at) }}
+                    · {{ time_ago(art.published_at) }}
                     {% if art.symbols %}
                       ·
                       {% for s in art.symbols[:4] %}

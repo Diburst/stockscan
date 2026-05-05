@@ -1,31 +1,30 @@
 {% extends "base.html" %}
-{% from "_macros.html" import card, badge, empty %}
+{% from "_macros.html" import card, badge, empty,
+     table_open, table_close, mobile_list_open, mobile_list_close,
+     page_header %}
 
 {% block title %}Backtests{% endblock %}
 
 {% block content %}
 <div class="space-y-4">
-  <h1 class="text-2xl font-semibold">Backtests</h1>
+
+  {{ page_header("Backtests", subtitle="Historical strategy runs and equity curves") }}
 
   {% if runs %}
     <div class="bg-white rounded-xl border border-ink-300/40 overflow-hidden">
-      {# Desktop table #}
-      <div class="hidden sm:block overflow-x-auto">
-        <table class="w-full text-sm">
-          <thead class="text-xs uppercase text-ink-500 bg-ink-100">
-            <tr>
-              <th class="text-left px-4 py-2">#</th>
-              <th class="text-left px-4 py-2">Strategy</th>
-              <th class="text-left px-4 py-2">Window</th>
-              <th class="text-right px-4 py-2">Trades</th>
-              <th class="text-right px-4 py-2">Ending equity</th>
-              <th class="text-left px-4 py-2">When</th>
-            </tr>
-          </thead>
-          <tbody class="divide-y divide-ink-300/40">
+      {{ table_open([
+          {"label": "#", "align": "left"},
+          {"label": "Strategy", "align": "left"},
+          {"label": "Window", "align": "left", "help": "Backtest start and end dates"},
+          {"label": "Trades", "align": "right", "help": "Total number of round-trip trades in the run"},
+          {"label": "Ending equity", "align": "right", "help": "Account value at the end of the run"},
+          {"label": "When", "align": "left", "help": "When this run was executed"},
+      ]) }}
             {% for r in runs %}
               <tr>
-                <td class="px-4 py-2"><a href="/backtests/{{ r.run_id }}" class="font-mono underline">#{{ r.run_id }}</a></td>
+                <td class="px-4 py-2"><a href="/backtests/{{ r.run_id }}"
+                                         class="font-mono underline"
+                                         title="Open backtest report">#{{ r.run_id }}</a></td>
                 <td class="px-4 py-2">{{ r.strategy_name }} <span class="text-ink-500">v{{ r.strategy_version }}</span></td>
                 <td class="px-4 py-2 text-xs text-ink-500">{{ r.start_date }} → {{ r.end_date }}</td>
                 <td class="px-4 py-2 text-right">{{ r.num_trades or 0 }}</td>
@@ -33,21 +32,20 @@
                 <td class="px-4 py-2 text-xs text-ink-500">{{ r.created_at.strftime("%Y-%m-%d %H:%M") }}</td>
               </tr>
             {% endfor %}
-          </tbody>
-        </table>
-      </div>
+      {{ table_close() }}
 
-      {# Mobile cards #}
-      <ul class="sm:hidden divide-y divide-ink-300/40">
+      {{ mobile_list_open() }}
         {% for r in runs %}
           <li class="px-4 py-3">
-            <a href="/backtests/{{ r.run_id }}" class="font-mono font-semibold underline">#{{ r.run_id }}</a>
+            <a href="/backtests/{{ r.run_id }}"
+               class="font-mono font-semibold underline"
+               title="Open backtest report">#{{ r.run_id }}</a>
             <span class="text-sm">· {{ r.strategy_name }}</span>
             <div class="text-xs text-ink-500">{{ r.start_date }} → {{ r.end_date }} · {{ r.num_trades or 0 }} trades</div>
             <div class="text-xs font-mono mt-0.5">end ${{ "{:,.0f}".format(r.ending_equity|float) if r.ending_equity else "—" }}</div>
           </li>
         {% endfor %}
-      </ul>
+      {{ mobile_list_close() }}
     </div>
   {% else %}
     {{ empty("No backtest runs yet — `stockscan backtest run rsi2_meanrev`.", "🧪") }}

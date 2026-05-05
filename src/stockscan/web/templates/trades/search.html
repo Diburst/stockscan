@@ -1,18 +1,21 @@
 {% extends "base.html" %}
-{% from "_macros.html" import card, empty %}
+{% from "_macros.html" import card, empty, back_link %}
 
 {% block title %}Notes search{% endblock %}
 
 {% block content %}
 <div class="space-y-4">
-  <h1 class="text-2xl font-semibold">Notes search · "{{ query }}"</h1>
+  <div>
+    {{ back_link("/trades", "Back to trades") }}
+    <h1 class="text-2xl font-semibold mt-1">Notes search · "{{ query }}"</h1>
+  </div>
 
   {% if results %}
     <ul class="space-y-3">
       {% for note, snippet in results %}
         <li class="bg-white border border-ink-300/40 rounded p-4">
           <div class="text-xs text-ink-500 mb-1">
-            <a href="/trades/{{ note.trade_id }}" class="underline">trade #{{ note.trade_id }}</a>
+            <a href="/trades/{{ note.trade_id }}" class="underline" title="Open trade">trade #{{ note.trade_id }}</a>
             · {{ note.created_at.strftime("%Y-%m-%d") }} · {{ note.note_type }}
           </div>
           <div class="text-sm">{{ snippet|safe }}</div>
@@ -22,7 +25,5 @@
   {% else %}
     {{ empty("No matching notes.", "🔍") }}
   {% endif %}
-
-  <a href="/trades" class="inline-block text-xs underline">← Back to trades</a>
 </div>
 {% endblock %}

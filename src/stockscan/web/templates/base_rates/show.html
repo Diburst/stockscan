@@ -1,15 +1,17 @@
 {% extends "base.html" %}
-{% from "_macros.html" import card, badge, empty, stat %}
+{% from "_macros.html" import card, badge, empty, stat, back_link %}
 
 {% block title %}Base rates{% endblock %}
 
 {% block content %}
 {% if not signal %}
   {{ empty("Signal not found.", "❓") }}
+  <div class="mt-4">{{ back_link("/signals", "Back to signals") }}</div>
 {% else %}
 <div class="space-y-6">
   <div>
-    <h1 class="text-2xl font-semibold">
+    {{ back_link("/signals/" ~ signal.signal_id, "Back to signal " ~ signal.symbol) }}
+    <h1 class="text-2xl font-semibold mt-1">
       Base rates · <span class="font-mono">{{ signal.symbol }}</span>
     </h1>
     <p class="text-sm text-ink-500">

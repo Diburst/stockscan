@@ -1,5 +1,5 @@
 {% extends "base.html" %}
-{% from "_macros.html" import card, badge, empty, stat %}
+{% from "_macros.html" import card, badge, empty, stat, back_link, tooltip %}
 
 {% block title %}Backtest #{{ run.run_id if run else "?" }}{% endblock %}
 
@@ -10,10 +10,12 @@
 {% block content %}
 {% if not run %}
   {{ empty("Backtest not found.", "❓") }}
+  <div class="mt-4">{{ back_link("/backtests", "Back to backtests") }}</div>
 {% else %}
 <div class="space-y-6">
   <div>
-    <h1 class="text-2xl font-semibold">
+    {{ back_link("/backtests", "Back to backtests") }}
+    <h1 class="text-2xl font-semibold mt-1">
       Backtest <span class="font-mono">#{{ run.run_id }}</span>
     </h1>
     <p class="text-sm text-ink-500">{{ run.strategy_name }} v{{ run.strategy_version }} · {{ run.start_date }} → {{ run.end_date }}</p>
@@ -22,35 +24,44 @@
   <!-- Headline metrics -->
   {% set m = run.metrics_json or {} %}
   <div class="grid grid-cols-2 sm:grid-cols-4 gap-4">
-    <div class="bg-white rounded-xl shadow-sm border border-ink-300/40 p-4">
+    <div class="bg-white rounded-xl shadow-sm border border-ink-300/40 p-4"
+         title="Total return over the entire backtest window, before fees">
       {{ stat("Total return", "{:.1%}".format(m.get('total_return_pct', 0)),
               kind=("ok" if m.get('total_return_pct', 0) > 0 else "bad")) }}
     </div>
-    <div class="bg-white rounded-xl shadow-sm border border-ink-300/40 p-4">
+    <div class="bg-white rounded-xl shadow-sm border border-ink-300/40 p-4"
+         title="{{ 'cagr' | explain_text }}">
       {{ stat("CAGR", "{:.2%}".format(m.get('cagr', 0))) }}
     </div>
-    <div class="bg-white rounded-xl shadow-sm border border-ink-300/40 p-4">
+    <div class="bg-white rounded-xl shadow-sm border border-ink-300/40 p-4"
+         title="{{ 'sharpe' | explain_text }}">
       {{ stat("Sharpe", "{:.2f}".format(m.get('sharpe', 0))) }}
     </div>
-    <div class="bg-white rounded-xl shadow-sm border border-ink-300/40 p-4">
+    <div class="bg-white rounded-xl shadow-sm border border-ink-300/40 p-4"
+         title="{{ 'max_dd' | explain_text }}">
       {{ stat("Max drawdown",
               "{:.2%}".format(m.get('max_drawdown_pct', 0)),
               sub="{} days".format(m.get('max_drawdown_days', 0)),
               kind="bad") }}
     </div>
-    <div class="bg-white rounded-xl shadow-sm border border-ink-300/40 p-4">
+    <div class="bg-white rounded-xl shadow-sm border border-ink-300/40 p-4"
+         title="Total number of round-trip trades in the run">
       {{ stat("Trades", run.num_trades or 0) }}
     </div>
-    <div class="bg-white rounded-xl shadow-sm border border-ink-300/40 p-4">
+    <div class="bg-white rounded-xl shadow-sm border border-ink-300/40 p-4"
+         title="{{ 'win_rate' | explain_text }}">
       {{ stat("Win rate", "{:.1%}".format(m.get('win_rate', 0))) }}
     </div>
-    <div class="bg-white rounded-xl shadow-sm border border-ink-300/40 p-4">
+    <div class="bg-white rounded-xl shadow-sm border border-ink-300/40 p-4"
+         title="{{ 'profit_factor' | explain_text }}">
       {{ stat("Profit factor", "{:.2f}".format(m.get('profit_factor', 0))) }}
     </div>
-    <div class="bg-white rounded-xl shadow-sm border border-ink-300/40 p-4">
+    <div class="bg-white rounded-xl shadow-sm border border-ink-300/40 p-4"
+         title="{{ 'expectancy' | explain_text }}">
       {{ stat("Expectancy", "{:.2%}".format(m.get('expectancy_pct', 0))) }}
     </div>
-    <div class="bg-white rounded-xl shadow-sm border border-ink-300/40 p-4">
+    <div class="bg-white rounded-xl shadow-sm border border-ink-300/40 p-4"
+         title="{{ 'r_multiple' | explain_text }}">
       {{ stat("Avg R",
               "{:+.2f}R".format(avg_r) if avg_r is not none else "—",
               sub=("best {:+.2f}R · worst {:+.2f}R".format(best_r, worst_r)
@@ -235,9 +246,6 @@
     {% endif %}
   {% endcall %}
 
-  <a href="/backtests" class="inline-flex items-center px-4 py-2 rounded border border-ink-300 text-sm">
-    ← Back to backtests
-  </a>
 </div>
 {% endif %}
 {% endblock %}

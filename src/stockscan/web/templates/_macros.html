@@ -50,3 +50,265 @@
     {{ label }}
   </a>
 {% endmacro %}
+
+
+{# ====================================================================
+   Pass 1 additions — shared UI primitives. Import them per-template:
+     {% from "_macros.html" import tooltip, time_ago, tech_score,
+        confirm_button, table_header, mobile_list_open, mobile_list_close,
+        loading_spinner, back_link, page_header, toast_region, toast,
+        field_label, field_error, sort_header %}
+   ==================================================================== #}
+
+{# ----- tooltip ---------------------------------------------------------
+   Wrap a label with native browser tooltip + dotted underline so it's
+   discoverable. If `text` is empty, just renders the bare label.
+#}
+{% macro tooltip(label, text="") %}
+  {%- if text -%}
+    <span title="{{ text }}" class="border-b border-dotted border-ink-300 cursor-help">{{ label }}</span>
+  {%- else -%}
+    {{ label }}
+  {%- endif -%}
+{% endmacro %}
+
+
+{# ----- time_ago -------------------------------------------------------
+   Relative timestamp ("3m ago") with the absolute UTC time as the hover
+   tooltip. Consolidates the duplicated _time_ago in _news_card.html and
+   signals/_signals_content.html.
+#}
+{% macro time_ago(dt, never_label="never") %}
+  {%- if dt is none -%}
+    <span class="text-ink-400">{{ never_label }}</span>
+  {%- else -%}
+    {%- set delta = (now_utc() - dt).total_seconds() | int -%}
+    {%- if delta < 60 -%}
+      {%- set ago = "just now" -%}
+    {%- elif delta < 3600 -%}
+      {%- set ago = (delta // 60) ~ "m ago" -%}
+    {%- elif delta < 86400 -%}
+      {%- set ago = (delta // 3600) ~ "h ago" -%}
+    {%- elif delta < 604800 -%}
+      {%- set ago = (delta // 86400) ~ "d ago" -%}
+    {%- else -%}
+      {%- set ago = (delta // 604800) ~ "w ago" -%}
+    {%- endif -%}
+    <span title="{{ dt.strftime('%Y-%m-%d %H:%M UTC') }}">{{ ago }}</span>
+  {%- endif -%}
+{% endmacro %}
+
+
+{# ----- tech_score -----------------------------------------------------
+   Signed [-1, +1] technical confirmation score rendered as a small
+   coloured chip. Consolidates _tech_score_badge (signals) and
+   tech_score_badge (watchlist).
+#}
+{% macro tech_score(score) %}
+  {%- if score is none -%}
+    <span class="text-xs text-ink-500">—</span>
+  {%- else -%}
+    {%- set s = score|float -%}
+    {%- if s > 0.05 -%}
+      <span class="inline-flex items-center text-xs font-mono px-2 py-0.5 rounded
+                   bg-ok-100 text-ok-600 border border-ok-600/30"
+            title="Technical bias: bullish ({{ '%+.2f'|format(s) }})">
+        {{ "%+.2f"|format(s) }}
+      </span>
+    {%- elif s < -0.05 -%}
+      <span class="inline-flex items-center text-xs font-mono px-2 py-0.5 rounded
+                   bg-bad-100 text-bad-600 border border-bad-600/30"
+            title="Technical bias: bearish ({{ '%+.2f'|format(s) }})">
+        {{ "%+.2f"|format(s) }}
+      </span>
+    {%- else -%}
+      <span class="inline-flex items-center text-xs font-mono px-2 py-0.5 rounded
+                   bg-ink-100 text-ink-500 border border-ink-300/60"
+            title="Technical bias: neutral ({{ '%+.2f'|format(s) }})">
+        {{ "%+.2f"|format(s) }}
+      </span>
+    {%- endif -%}
+  {%- endif -%}
+{% endmacro %}
+
+
+{# ----- back_link / page_header --------------------------------------
+   Consistent back-arrow link + page header for detail pages.
+#}
+{% macro back_link(href, label="Back") %}
+  <a href="{{ href }}"
+     class="inline-flex items-center gap-1 text-xs text-ink-500 hover:text-ink-900 transition-colors">
+    <span aria-hidden="true">←</span> {{ label }}
+  </a>
+{% endmacro %}
+
+{% macro page_header(title, subtitle="", back_href="", back_label="Back") %}
+  <div class="mb-4">
+    {% if back_href %}{{ back_link(back_href, back_label) }}{% endif %}
+    <h1 class="text-2xl font-semibold text-ink-900 {% if back_href %}mt-1{% endif %}">{{ title }}</h1>
+    {% if subtitle %}<p class="text-sm text-ink-500 mt-1">{{ subtitle }}</p>{% endif %}
+  </div>
+{% endmacro %}
+
+
+{# ----- loading_spinner ----------------------------------------------
+   A 12px CSS spinner + optional label. For HTMX, wrap with the
+   `htmx-indicator` class on the parent so it auto-shows during requests.
+#}
+{% macro loading_spinner(label="") %}
+  <span class="inline-flex items-center gap-1.5 text-xs text-ink-500">
+    <span class="inline-block w-3 h-3 border-2 border-ink-300 border-t-ink-700 rounded-full animate-spin"
+          aria-hidden="true"></span>
+    {%- if label %} {{ label }}{% endif %}
+  </span>
+{% endmacro %}
+
+
+{# ----- table_header / mobile_list_open / mobile_list_close ----------
+   Standard wrappers for the "desktop table + mobile cards" pattern
+   used by trades/list, backtests/list, watchlist/list. Templates still
+   render their own row markup (cell shapes vary too much to abstract);
+   these handle the wrapper styling, header alignment, and tooltip
+   support so the surface stays consistent.
+
+   Headers is a list of dicts:
+     {label: "Symbol", align: "left"|"right"|"center", help: "tooltip text"}
+   `align` defaults to "left", `help` is optional.
+#}
+{% macro table_open(headers, classes="") %}
+  <div class="hidden sm:block overflow-x-auto -mx-4 {{ classes }}">
+    <table class="w-full text-sm">
+      <thead class="text-xs uppercase text-ink-500 border-b border-ink-300/40">
+        <tr>
+          {% for h in headers %}
+            <th class="px-4 py-2 text-{{ h.align|default('left') }}"
+                {% if h.help %}title="{{ h.help }}"{% endif %}>
+              {{ h.label }}
+            </th>
+          {% endfor %}
+        </tr>
+      </thead>
+      <tbody class="divide-y divide-ink-300/40">
+{% endmacro %}
+
+{% macro table_close() %}
+      </tbody>
+    </table>
+  </div>
+{% endmacro %}
+
+{% macro mobile_list_open(classes="") %}
+  <ul class="sm:hidden divide-y divide-ink-300/40 -mx-4 {{ classes }}">
+{% endmacro %}
+
+{% macro mobile_list_close() %}
+  </ul>
+{% endmacro %}
+
+
+{# ----- sort_header ---------------------------------------------------
+   Renders a sortable column header. Toggles direction when the active
+   column is re-clicked.
+
+   Args:
+     label       — visible column label
+     key         — sort key passed via ?sort=
+     base_url    — base URL with trailing "?" or "&" (other params preserved)
+     current_key — currently active sort key (None if no sort)
+     current_dir — currently active sort direction ("asc" or "desc")
+#}
+{% macro sort_header(label, key, base_url, current_key=None, current_dir="desc") %}
+  {%- set is_active = (key == current_key) -%}
+  {%- set next_dir = "asc" if (is_active and current_dir == "desc") else "desc" -%}
+  {%- set arrow = "↓" if (is_active and current_dir == "desc") else ("↑" if is_active else "") -%}
+  <a href="{{ base_url }}sort={{ key }}&dir={{ next_dir }}"
+     class="inline-flex items-center gap-0.5 hover:text-ink-900 {% if is_active %}text-ink-900 font-semibold{% endif %}"
+     title="Sort by {{ label }}{% if is_active %} ({{ next_dir }}ending){% endif %}">
+    {{ label }}
+    {%- if arrow %} <span class="text-ink-500">{{ arrow }}</span>{% endif %}
+  </a>
+{% endmacro %}
+
+
+{# ----- form helpers --------------------------------------------------
+   Pair of macros for consistent form labels and inline error messages.
+   Inputs themselves stay in the template (too many shapes — text, select,
+   number, checkbox — to abstract well).
+#}
+{% macro field_label(name, label, required=False, help="") %}
+  <label for="{{ name }}" class="block text-xs text-ink-500 mb-1">
+    {{ label }}
+    {%- if required %} <span class="text-bad-600" title="required">*</span>{% endif %}
+    {%- if help %} <span class="text-ink-400 cursor-help" title="{{ help }}">ⓘ</span>{% endif %}
+  </label>
+{% endmacro %}
+
+{% macro field_error(message) %}
+  {% if message %}<p class="text-xs text-bad-600 mt-1">⚠ {{ message }}</p>{% endif %}
+{% endmacro %}
+
+
+{# ----- confirm_button ----------------------------------------------
+   Two-step inline confirm for destructive actions. First click morphs
+   the button label into "Click again to confirm" for ~3s; second click
+   submits. Falls back to immediate submit if JS is disabled (so the
+   form is still functional, just without the safety step).
+
+   Args:
+     action       — form action URL
+     label        — initial button text ("Remove", "Delete", etc.)
+     confirm_label — text shown on first click (default "Click again to confirm")
+     classes      — Tailwind classes for the <button>
+     aria_label   — accessibility label (when icon-only)
+     hx_attrs     — extra HTMX attributes for the form (e.g.,
+                    {"hx-post": "...", "hx-target": "..."})
+#}
+{% macro confirm_button(action, label="Remove", confirm_label="Click again to confirm",
+                        classes="", aria_label="", hx_attrs={}, form_classes="inline") %}
+  <form action="{{ action }}" method="post" class="{{ form_classes }}"
+        data-confirm-label="{{ confirm_label }}"
+        onsubmit="return ssConfirmSubmit(event, this);"
+        {% for k, v in hx_attrs.items() %}{{ k }}="{{ v }}" {% endfor %}>
+    <button type="submit"
+            class="{{ classes or 'text-ink-500 hover:text-bad-600 text-sm transition-colors' }}"
+            {% if aria_label %}aria-label="{{ aria_label }}"{% endif %}>
+      {{ label }}
+    </button>
+  </form>
+{% endmacro %}
+
+
+{# ----- toast region + toast ----------------------------------------
+   Floating top-right notification stack. `toast_region` is rendered
+   once in base.html; `toast` is the single-toast partial used both for
+   server-side initial render and as the JS template (inline copy below).
+   Auto-dismiss + htmx:trigger handling lives in base.html scripts.
+#}
+{% macro toast(kind, message) %}
+  {%- set kind_class = {
+    'success': 'bg-ok-100 text-ok-600 border-ok-600/30',
+    'error':   'bg-bad-100 text-bad-600 border-bad-600/30',
+    'warn':    'bg-warn-100 text-warn-600 border-warn-600/30',
+    'info':    'bg-ink-100 text-ink-700 border-ink-300/60',
+  }.get(kind, 'bg-ink-100 text-ink-700 border-ink-300/60') -%}
+  {%- set icon = {'success':'✓','error':'⚠','warn':'⚠','info':'ⓘ'}.get(kind, 'ⓘ') -%}
+  <div class="ss-toast pointer-events-auto px-3 py-2 rounded border text-xs shadow-md
+              flex items-start gap-2 {{ kind_class }}"
+       role="status">
+    <span class="font-semibold leading-tight">{{ icon }}</span>
+    <span class="flex-1 leading-snug">{{ message }}</span>
+    <button type="button" aria-label="Dismiss"
+            class="opacity-60 hover:opacity-100 leading-none -mt-0.5"
+            onclick="this.closest('.ss-toast').remove()">×</button>
+  </div>
+{% endmacro %}
+
+{% macro toast_region(initial_toast=None) %}
+  <div id="toast-region"
+       class="fixed top-4 right-4 z-50 space-y-2 max-w-sm pointer-events-none"
+       aria-live="polite" aria-atomic="false">
+    {% if initial_toast and initial_toast.message %}
+      {{ toast(initial_toast.kind or 'info', initial_toast.message) }}
+    {% endif %}
+  </div>
+{% endmacro %}

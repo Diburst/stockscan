@@ -1,16 +1,21 @@
 {% extends "base.html" %}
-{% from "_macros.html" import card, badge, empty %}
+{% from "_macros.html" import card, badge, empty,
+     table_open, table_close, mobile_list_open, mobile_list_close,
+     page_header %}
 
 {% block title %}Trades{% endblock %}
 
 {% block content %}
 <div class="space-y-6">
 
+  {{ page_header("Trades", subtitle="Open positions and closed trade history") }}
+
   <form action="/trades/search" method="get"
         class="flex gap-2 items-center">
     <input type="search" name="q" placeholder="Search notes (Postgres FTS)…"
            class="flex-1 px-4 py-2 rounded border border-ink-300 text-sm" minlength="2">
-    <button class="px-4 py-2 rounded bg-ink-900 text-white text-sm">Search</button>
+    <button class="px-4 py-2 rounded bg-ink-900 text-white text-sm"
+            title="Search across all trade notes">Search</button>
   </form>
 
   {% call card(title="Open positions (" ~ open_trades|length ~ ")") %}
@@ -22,7 +27,9 @@
               <div class="font-mono font-semibold">{{ t.symbol }}</div>
               <div class="text-xs text-ink-500">{{ t.strategy }} · opened {{ t.opened_at.date() }}</div>
             </div>
-            <a href="/trades/{{ t.trade_id }}" class="text-xs underline">detail</a>
+            <a href="/trades/{{ t.trade_id }}"
+               class="text-xs underline"
+               title="Open trade detail page">Open</a>
           </li>
         {% endfor %}
       </ul>
@@ -33,20 +40,14 @@
 
   {% call card(title="Closed trades (" ~ closed_trades|length ~ ")") %}
     {% if closed_trades %}
-      {# Desktop table #}
-      <div class="hidden sm:block overflow-x-auto -mx-4">
-        <table class="w-full text-sm">
-          <thead class="text-xs uppercase text-ink-500 border-b border-ink-300/40">
-            <tr>
-              <th class="text-left px-4 py-2">Symbol</th>
-              <th class="text-left px-4 py-2">Strategy</th>
-              <th class="text-left px-4 py-2">Closed</th>
-              <th class="text-right px-4 py-2">Days</th>
-              <th class="text-right px-4 py-2">P&amp;L</th>
-              <th class="text-right px-4 py-2"></th>
-            </tr>
-          </thead>
-          <tbody class="divide-y divide-ink-300/40">
+      {{ table_open([
+          {"label": "Symbol", "align": "left"},
+          {"label": "Strategy", "align": "left"},
+          {"label": "Closed", "align": "left"},
+          {"label": "Days", "align": "right", "help": "Holding period in trading days"},
+          {"label": "P&L", "align": "right", "help": "Realised profit & loss in dollars (after slippage + fees)"},
+          {"label": "", "align": "right"},
+      ]) }}
             {% for t in closed_trades %}
               <tr>
                 <td class="px-4 py-2 font-mono font-semibold">{{ t.symbol }}</td>
@@ -58,16 +59,15 @@
                   {% if t.realized_pnl is not none %}${{ "%.2f"|format(t.realized_pnl|float) }}{% else %}—{% endif %}
                 </td>
                 <td class="px-4 py-2 text-right">
-                  <a href="/trades/{{ t.trade_id }}" class="text-xs underline">detail</a>
+                  <a href="/trades/{{ t.trade_id }}"
+                     class="text-xs underline"
+                     title="Open trade detail page">Open</a>
                 </td>
               </tr>
             {% endfor %}
-          </tbody>
-        </table>
-      </div>
+      {{ table_close() }}
 
-      {# Mobile cards #}
-      <ul class="sm:hidden divide-y divide-ink-300/40 -mx-4">
+      {{ mobile_list_open() }}
         {% for t in closed_trades %}
           <li class="px-4 py-3">
             <div class="flex items-baseline justify-between">
@@ -80,10 +80,12 @@
             <div class="text-xs text-ink-500 mt-0.5">
               {{ t.strategy }} · {{ t.holding_days or "?" }}d · closed {{ t.closed_at.date() if t.closed_at else "—" }}
             </div>
-            <a href="/trades/{{ t.trade_id }}" class="inline-block mt-2 text-xs underline">detail</a>
+            <a href="/trades/{{ t.trade_id }}"
+               class="inline-block mt-2 text-xs underline"
+               title="Open trade detail page">Open</a>
           </li>
         {% endfor %}
-      </ul>
+      {{ mobile_list_close() }}
     {% else %}
       {{ empty("No closed trades yet.", "📭") }}
     {% endif %}

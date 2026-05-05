@@ -1,0 +1,54 @@
+{% extends "base.html" %}
+{% from "_macros.html" import card, empty, back_link %}
+
+{% block title %}{{ status_code }} {{ status_label }}{% endblock %}
+
+{% block content %}
+<div class="space-y-6 max-w-2xl mx-auto">
+
+  <div class="text-center py-8">
+    <div class="text-7xl mb-3">
+      {%- if status_code == 404 -%}🧭
+      {%- elif status_code == 403 -%}🔒
+      {%- elif status_code == 400 -%}🤔
+      {%- elif status_code >= 500 -%}💥
+      {%- else -%}⚠️
+      {%- endif -%}
+    </div>
+    <h1 class="text-3xl font-semibold text-ink-900">
+      {{ status_code }} · {{ status_label }}
+    </h1>
+    <p class="text-sm text-ink-500 mt-2">{{ message }}</p>
+  </div>
+
+  {% if path %}
+    {% call card(title="Request") %}
+      <dl class="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1 text-sm">
+        <dt class="text-ink-500">Path</dt>
+        <dd class="font-mono break-all">{{ path }}</dd>
+        {% if method %}
+          <dt class="text-ink-500">Method</dt>
+          <dd class="font-mono">{{ method }}</dd>
+        {% endif %}
+      </dl>
+    {% endcall %}
+  {% endif %}
+
+  {% if detail %}
+    {% call card(title="Detail") %}
+      <pre class="text-xs text-ink-700 whitespace-pre-wrap font-mono">{{ detail }}</pre>
+    {% endcall %}
+  {% endif %}
+
+  <div class="flex justify-center gap-3 pt-2">
+    {{ back_link("/", "Back to dashboard") }}
+    <button type="button"
+            onclick="history.length > 1 ? history.back() : (location.href = '/')"
+            class="text-xs text-ink-500 hover:text-ink-900 transition-colors"
+            title="Go back to the previous page">
+      ← Previous page
+    </button>
+  </div>
+
+</div>
+{% endblock %}

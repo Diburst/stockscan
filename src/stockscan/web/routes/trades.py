@@ -18,7 +18,7 @@ from stockscan.positions import (
     list_closed_trades,
     list_open_trades,
 )
-from stockscan.web.deps import get_session, render
+from stockscan.web.deps import flash_redirect, get_session, render
 
 router = APIRouter(prefix="/trades")
 
@@ -93,8 +93,13 @@ async def trade_add_note(
     note_type: str = Form("free"),
     s: Session = Depends(get_session),
 ):
-    create_note(trade_id, body=body, note_type=note_type, session=s)  # type: ignore[arg-type]
-    return RedirectResponse(url=f"/trades/{trade_id}", status_code=303)
+    try:
+        create_note(trade_id, body=body, note_type=note_type, session=s)  # type: ignore[arg-type]
+    except Exception as exc:  # noqa: BLE001 - surface DB / validation errors as a toast
+        return flash_redirect(
+            f"/trades/{trade_id}", "error", f"Couldn't save note: {exc}"
+        )
+    return flash_redirect(f"/trades/{trade_id}", "success", "Note saved")
 
 
 @router.post("/{trade_id}/notes/{note_id}/edit")
@@ -105,5 +110,10 @@ async def trade_edit_note(
     body: str = Form(..., min_length=1),
     s: Session = Depends(get_session),
 ):
-    update_note(note_id, body=body, session=s)
-    return RedirectResponse(url=f"/trades/{trade_id}", status_code=303)
+    try:
+        update_note(note_id, body=body, session=s)
+    except Exception as exc:  # noqa: BLE001 - surface as a toast
+        return flash_redirect(
+            f"/trades/{trade_id}", "error", f"Couldn't update note: {exc}"
+        )
+    return flash_redirect(f"/trades/{trade_id}", "success", "Note updated")

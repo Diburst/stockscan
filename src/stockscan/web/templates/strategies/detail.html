@@ -1,15 +1,17 @@
 {% extends "base.html" %}
-{% from "_macros.html" import card, badge, empty %}
+{% from "_macros.html" import card, badge, empty, back_link %}
 
 {% block title %}{{ strategy.display_name if strategy else "Strategy" }}{% endblock %}
 
 {% block content %}
 {% if not strategy %}
   {{ empty("Strategy not found.", "❓") }}
+  <div class="mt-4">{{ back_link("/strategies", "Back to strategies") }}</div>
 {% else %}
 <div class="space-y-4">
   <div>
-    <h1 class="text-2xl font-semibold">{{ strategy.display_name }}</h1>
+    {{ back_link("/strategies", "Back to strategies") }}
+    <h1 class="text-2xl font-semibold mt-1">{{ strategy.display_name }}</h1>
     <p class="text-sm text-ink-500">{{ strategy.name }} v{{ strategy.version }}</p>
   </div>
 

@@ -1,5 +1,5 @@
 {% extends "base.html" %}
-{% from "_macros.html" import card, badge, empty %}
+{% from "_macros.html" import card, badge, empty, back_link %}
 
 {% block title %}Signal {{ signal.symbol if signal else "?" }}{% endblock %}
 
@@ -73,19 +73,24 @@
 <div class="space-y-4">
 
   {# ---- Header ---- #}
-  <div class="flex items-baseline justify-between flex-wrap gap-2">
-    <h1 class="text-2xl font-semibold">
-      <span class="font-mono">{{ signal.symbol }}</span>
-      <span class="text-base text-ink-500">·
-        {% if strategy_cls %}{{ strategy_cls.display_name }}{% else %}{{ signal.strategy_name }}{% endif %}
-        v{{ signal.strategy_version }}
-      </span>
-    </h1>
-    <div class="flex items-center gap-2">
-      {% if signal.status == 'new' %}{{ badge("passing", "ok") }}
-      {% elif signal.status == 'rejected' %}{{ badge("rejected", "warn") }}
-      {% else %}{{ badge(signal.status) }}{% endif %}
-      <span class="text-xs text-ink-500">signal #{{ signal.signal_id }}</span>
+  <div>
+    {{ back_link("/signals", "Back to signals") }}
+    <div class="flex items-baseline justify-between flex-wrap gap-2 mt-1">
+      <h1 class="text-2xl font-semibold">
+        <span class="font-mono">{{ signal.symbol }}</span>
+        <span class="text-base text-ink-500">·
+          {% if strategy_cls %}{{ strategy_cls.display_name }}{% else %}{{ signal.strategy_name }}{% endif %}
+          v{{ signal.strategy_version }}
+        </span>
+      </h1>
+      <div class="flex items-center gap-2">
+        {% if signal.status == 'new' %}
+          <span title="The strategy fired and the signal passed every portfolio filter">{{ badge("passing", "ok") }}</span>
+        {% elif signal.status == 'rejected' %}
+          <span title="The strategy fired but a portfolio filter blocked the trade — see Outcome for the reason">{{ badge("rejected", "warn") }}</span>
+        {% else %}{{ badge(signal.status) }}{% endif %}
+        <span class="text-xs text-ink-500">signal #{{ signal.signal_id }}</span>
+      </div>
     </div>
   </div>
 
