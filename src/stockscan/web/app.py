@@ -24,6 +24,7 @@ from stockscan.web.routes import (
     dashboard,
     manual,
     news,
+    paper_trades,
     regime,
     signals,
     strategies,
@@ -176,6 +177,7 @@ def create_app() -> FastAPI:
     # ------------------------------------------------------------------
     app.include_router(dashboard.router)
     app.include_router(signals.router)
+    app.include_router(paper_trades.router)
     app.include_router(trades.router)
     app.include_router(backtests.router)
     app.include_router(base_rates.router)

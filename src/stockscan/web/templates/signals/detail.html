@@ -483,6 +483,75 @@
     </details>
   {% endif %}
 
+  {# ---- Paper trade form ---- #}
+  {% if signal.status == 'new' %}
+    <div id="paper-trade">
+      {% call card(
+           title="Paper trade",
+           subtitle="Open a simulated position from this signal",
+      ) %}
+        <form action="/signals/{{ signal.signal_id }}/paper-trade" method="post"
+              class="space-y-4">
+          <div class="grid grid-cols-2 sm:grid-cols-4 gap-4">
+            <div>
+              <label for="entry_price" class="block text-xs text-ink-500 mb-1">
+                Entry price <span class="text-bad-600">*</span>
+              </label>
+              <input type="number" step="0.01" name="entry_price" id="entry_price"
+                     value="{{ "%.2f"|format(signal.suggested_entry|float) }}"
+                     required
+                     class="w-full px-3 py-2 rounded border border-ink-300 text-sm font-mono">
+            </div>
+            <div>
+              <label for="stop_price" class="block text-xs text-ink-500 mb-1">
+                Stop price <span class="text-bad-600">*</span>
+              </label>
+              <input type="number" step="0.01" name="stop_price" id="stop_price"
+                     value="{{ "%.2f"|format(signal.suggested_stop|float) }}"
+                     required
+                     class="w-full px-3 py-2 rounded border border-ink-300 text-sm font-mono">
+            </div>
+            <div>
+              <label for="target_price" class="block text-xs text-ink-500 mb-1">
+                Target price
+              </label>
+              <input type="number" step="0.01" name="target_price" id="target_price"
+                     value="{{ "%.2f"|format(signal.suggested_target|float) if signal.suggested_target else '' }}"
+                     class="w-full px-3 py-2 rounded border border-ink-300 text-sm font-mono"
+                     placeholder="Optional">
+            </div>
+            <div>
+              <label for="qty" class="block text-xs text-ink-500 mb-1">
+                Shares <span class="text-bad-600">*</span>
+              </label>
+              <input type="number" step="1" min="1" name="qty" id="qty"
+                     value="{{ signal.suggested_qty or '' }}"
+                     required
+                     class="w-full px-3 py-2 rounded border border-ink-300 text-sm font-mono">
+            </div>
+          </div>
+
+          {# Risk summary #}
+          <div class="text-xs text-ink-500 bg-ink-100 rounded px-3 py-2 font-mono" id="trade-risk-summary">
+            <span id="risk-per-share">—</span> risk/share ·
+            <span id="risk-total">—</span> total risk ·
+            <span id="trade-notional">—</span> notional
+          </div>
+
+          <div class="flex items-center gap-3">
+            <button type="submit"
+                    class="inline-flex items-center gap-1.5 px-4 py-2 rounded bg-ok-600 text-white text-sm font-medium hover:bg-ok-600/90 transition-colors">
+              Paper trade {{ signal.symbol }}
+            </button>
+            <span class="text-xs text-ink-500">
+              {{ signal.side }} · {{ signal.strategy_name }}
+            </span>
+          </div>
+        </form>
+      {% endcall %}
+    </div>
+  {% endif %}
+
   {# ---- Footer actions ---- #}
   <div class="flex flex-wrap gap-3 pt-2">
     <a href="/signals/{{ signal.signal_id }}/base-rates"
@@ -501,4 +570,31 @@
   </div>
 </div>
 {% endif %}
+{% endblock %}
+
+{% block scripts %}
+<script>
+(function () {
+  var form = document.querySelector('#paper-trade form');
+  if (!form) return;
+  var entryEl = form.querySelector('#entry_price');
+  var stopEl  = form.querySelector('#stop_price');
+  var qtyEl   = form.querySelector('#qty');
+
+  function update() {
+    var entry = parseFloat(entryEl.value) || 0;
+    var stop  = parseFloat(stopEl.value) || 0;
+    var qty   = parseInt(qtyEl.value) || 0;
+    var rps   = Math.abs(entry - stop);
+    document.getElementById('risk-per-share').textContent = '$' + rps.toFixed(2);
+    document.getElementById('risk-total').textContent     = '$' + (rps * qty).toFixed(2);
+    document.getElementById('trade-notional').textContent = '$' + (entry * qty).toLocaleString(undefined, {minimumFractionDigits: 0, maximumFractionDigits: 0});
+  }
+
+  entryEl.addEventListener('input', update);
+  stopEl.addEventListener('input', update);
+  qtyEl.addEventListener('input', update);
+  update();
+})();
+</script>
 {% endblock %}

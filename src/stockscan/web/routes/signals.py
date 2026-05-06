@@ -41,12 +41,48 @@ router = APIRouter(prefix="/signals")
 log = logging.getLogger(__name__)
 
 
+# Valid sort columns + their SQL expressions.
+def _to_float(v: str | None) -> float | None:
+    """Parse a query-string value as float, treating '' as None.
+
+    HTML forms send empty number inputs as ``""``, which FastAPI can't
+    coerce to ``float | None`` — it 422s. Accepting ``str | None`` and
+    converting here avoids that.
+    """
+    if v is None or v.strip() == "":
+        return None
+    return float(v)
+
+
+_SORT_COLUMNS: dict[str, str] = {
+    "symbol": "s.symbol",
+    "strategy": "s.strategy_name",
+    "score": "s.score",
+    "tech": "t.score",
+    "entry": "s.suggested_entry",
+    "stop": "s.suggested_stop",
+    "qty": "s.suggested_qty",
+    "date": "s.as_of_date",
+    "side": "s.side",
+}
+
+
 def _query_signals_view(
     s: Session,
     *,
     strategy: str | None,
     days: int,
     show_rejected: bool,
+    # Filtering
+    symbol: str | None = None,
+    side: str | None = None,
+    score_min: float | None = None,
+    score_max: float | None = None,
+    tech_min: float | None = None,
+    tech_max: float | None = None,
+    # Sorting
+    sort: str | None = None,
+    sort_dir: str | None = None,
 ) -> dict[str, Any]:
     """Run the signals SELECT and bundle the template context.
 
@@ -64,14 +100,51 @@ def _query_signals_view(
         params["strat"] = strategy
     if not show_rejected:
         where.append("s.status = 'new'")
+
+    # Symbol search filter
+    if symbol:
+        where.append("UPPER(s.symbol) LIKE UPPER(:sym_filter)")
+        params["sym_filter"] = f"%{symbol}%"
+
+    # Side filter
+    if side and side in ("long", "short"):
+        where.append("s.side = :side_filter")
+        params["side_filter"] = side
+
+    # Score range filters
+    if score_min is not None:
+        where.append("s.score >= :score_min")
+        params["score_min"] = score_min
+    if score_max is not None:
+        where.append("s.score <= :score_max")
+        params["score_max"] = score_max
+
+    # Tech score range filters (applied via HAVING-style post-filter
+    # since tech_score comes from a LEFT JOIN; we use a subquery wrapper
+    # instead to keep it clean with WHERE).
+    tech_filter_clauses: list[str] = []
+    if tech_min is not None:
+        tech_filter_clauses.append("t.score >= :tech_min")
+        params["tech_min"] = tech_min
+    if tech_max is not None:
+        tech_filter_clauses.append("t.score <= :tech_max")
+        params["tech_max"] = tech_max
+    if tech_filter_clauses:
+        # When filtering by tech score, require it exists (not null)
+        where.extend(tech_filter_clauses)
+
     # Restrict to the CURRENT registered version of each strategy.
-    # Older-version signals stay in the DB intentionally (use
-    # ``stockscan signals delete`` to remove) but never appear in the
-    # live signals list. Detail pages remain reachable via direct ID
-    # lookup since /signals/{id} doesn't apply this filter.
     version_clause, version_params = current_version_filter(prefix="s")
     where.append(version_clause)
     params.update(version_params)
+
+    # Sorting
+    sort_key = sort if sort in _SORT_COLUMNS else None
+    direction = "ASC" if sort_dir == "asc" else "DESC"
+    if sort_key:
+        order_by = f"{_SORT_COLUMNS[sort_key]} {direction} NULLS LAST, s.signal_id DESC"
+    else:
+        order_by = "s.as_of_date DESC, s.status ASC, s.score DESC NULLS LAST"
 
     sql = text(
         f"""
@@ -86,7 +159,7 @@ def _query_signals_view(
          AND t.as_of_date = s.as_of_date
          AND t.strategy_name = s.strategy_name
         WHERE {" AND ".join(where)}
-        ORDER BY s.as_of_date DESC, s.status ASC, s.score DESC NULLS LAST
+        ORDER BY {order_by}
         LIMIT 500
         """
     )
@@ -102,6 +175,16 @@ def _query_signals_view(
         "show_rejected": show_rejected,
         "days": days,
         "freshness": signals_freshness(session=s),
+        # Filter state (so the template can preserve values)
+        "filter_symbol": symbol or "",
+        "filter_side": side or "",
+        "filter_score_min": score_min,
+        "filter_score_max": score_max,
+        "filter_tech_min": tech_min,
+        "filter_tech_max": tech_max,
+        # Sort state
+        "sort_key": sort_key or "",
+        "sort_dir": sort_dir or "desc",
     }
 
 
@@ -111,10 +194,31 @@ async def signals_list(
     strategy: str | None = Query(None),
     days: int = Query(7, ge=1, le=90),
     show_rejected: bool = Query(True),
+    # Filters
+    symbol: str | None = Query(None),
+    side: str | None = Query(None),
+    score_min: str | None = Query(None),
+    score_max: str | None = Query(None),
+    tech_min: str | None = Query(None),
+    tech_max: str | None = Query(None),
+    # Sort
+    sort: str | None = Query(None),
+    dir: str | None = Query(None),
     s: Session = Depends(get_session),
 ):
     ctx = _query_signals_view(
-        s, strategy=strategy, days=days, show_rejected=show_rejected
+        s,
+        strategy=strategy,
+        days=days,
+        show_rejected=show_rejected,
+        symbol=symbol,
+        side=side,
+        score_min=_to_float(score_min),
+        score_max=_to_float(score_max),
+        tech_min=_to_float(tech_min),
+        tech_max=_to_float(tech_max),
+        sort=sort,
+        sort_dir=dir,
     )
     return render(
         request,
@@ -131,6 +235,15 @@ async def refresh_endpoint(
     strategy: str | None = Query(None),
     days: int = Query(7, ge=1, le=90),
     show_rejected: bool = Query(True),
+    # Filters — forwarded so the post-refresh view preserves the user's filters
+    symbol: str | None = Query(None),
+    side: str | None = Query(None),
+    score_min: str | None = Query(None),
+    score_max: str | None = Query(None),
+    tech_min: str | None = Query(None),
+    tech_max: str | None = Query(None),
+    sort: str | None = Query(None),
+    dir: str | None = Query(None),
     s: Session = Depends(get_session),
 ):
     """Pull the last 7 days of bars + re-run all strategies, then swap
@@ -141,15 +254,23 @@ async def refresh_endpoint(
     ``#signals-content`` for ``outerHTML`` replacement so the page
     refreshes without a full reload.
 
-    Filters (``strategy``, ``days``, ``show_rejected``) are forwarded
-    so the post-refresh view matches whatever the user was looking at.
+    All filters and sort params are forwarded so the post-refresh view
+    matches whatever the user was looking at.
     """
+    _filter_kwargs = dict(
+        symbol=symbol, side=side,
+        score_min=_to_float(score_min), score_max=_to_float(score_max),
+        tech_min=_to_float(tech_min), tech_max=_to_float(tech_max),
+        sort=sort, sort_dir=dir,
+    )
+
     # Signals refresh is the most expensive endpoint in the app — bars
     # backfill + every strategy re-runs. Debounce harder than news.
     cooldown_remaining = rate_limit_check("signals.refresh", cooldown_seconds=20)
     if cooldown_remaining is not None:
         ctx = _query_signals_view(
-            s, strategy=strategy, days=days, show_rejected=show_rejected
+            s, strategy=strategy, days=days, show_rejected=show_rejected,
+            **_filter_kwargs,
         )
         response = render(
             request,
@@ -189,12 +310,26 @@ async def refresh_endpoint(
         except EODHDError as exc:
             log.warning("signals refresh: provider error: %s", exc)
             error = f"Provider error: {exc}"
+            # Defensive rollback: even though EODHD errors are from the
+            # provider (no DB I/O), refresh_signals may have done partial
+            # writes through `s` before the provider call failed. Rolling
+            # back ensures the post-refresh SELECT below runs cleanly
+            # rather than tripping InFailedSqlTransaction.
+            _safe_rollback(s)
         except Exception as exc:
             log.exception("signals refresh: unexpected error")
             error = f"Refresh failed: {exc}"
+            # Critical: an SQL error inside refresh_signals will have
+            # marked the transaction as aborted. Postgres refuses every
+            # subsequent statement on this connection until ROLLBACK,
+            # so without this the partial-render SELECT below 500s with
+            # InFailedSqlTransaction and the user never sees the real
+            # error message we just captured into `error`.
+            _safe_rollback(s)
 
     ctx = _query_signals_view(
-        s, strategy=strategy, days=days, show_rejected=show_rejected
+        s, strategy=strategy, days=days, show_rejected=show_rejected,
+        **_filter_kwargs,
     )
     response = render(
         request,
@@ -309,6 +444,21 @@ async def signal_detail(
         tech_score=tech_score,
         sizing_breakdown=sizing_breakdown,
     )
+
+
+def _safe_rollback(session: Session) -> None:
+    """Roll back ``session`` and swallow any rollback-of-rollback error.
+
+    Used in the refresh endpoint's except handlers to clear an aborted
+    transaction state before issuing the partial-render SELECT. We
+    deliberately swallow secondary errors here — if rollback itself
+    fails, the underlying connection is unusable and the partial
+    render will surface a fresh error in the response banner anyway.
+    """
+    try:
+        session.rollback()
+    except Exception as exc:
+        log.warning("rollback failed during error recovery: %s", exc)
 
 
 def _sizing_breakdown(

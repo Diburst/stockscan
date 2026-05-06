@@ -678,6 +678,11 @@ class ScanRunner:
         status: str,
         rejected_reason: str | None,
     ) -> None:
+        # ON CONFLICT on the natural key (symbol, strategy_name,
+        # strategy_version, as_of_date) so re-running the same
+        # strategy for the same date updates the existing row
+        # rather than creating a duplicate. The latest run always
+        # wins — score, sizing, metadata, and status are refreshed.
         s.execute(
             text(
                 """
@@ -689,7 +694,20 @@ class ScanRunner:
                 VALUES (:run_id, :n, :v, :c,
                         :symbol, :side, :score, :as_of,
                         :entry, :stop, :target, :qty,
-                        :reason, CAST(:meta AS JSONB), :status);
+                        :reason, CAST(:meta AS JSONB), :status)
+                ON CONFLICT (symbol, strategy_name, strategy_version, as_of_date)
+                DO UPDATE SET
+                    run_id          = EXCLUDED.run_id,
+                    config_id       = EXCLUDED.config_id,
+                    side            = EXCLUDED.side,
+                    score           = EXCLUDED.score,
+                    suggested_entry = EXCLUDED.suggested_entry,
+                    suggested_stop  = EXCLUDED.suggested_stop,
+                    suggested_target = EXCLUDED.suggested_target,
+                    suggested_qty   = EXCLUDED.suggested_qty,
+                    rejected_reason = EXCLUDED.rejected_reason,
+                    metadata        = EXCLUDED.metadata,
+                    status          = EXCLUDED.status;
                 """
             ),
             {

@@ -2,13 +2,19 @@
 
 Loop structure (one trading day at a time):
 
-  1. For each open position, run strategy.exit_rules() with bars[≤today].
-     If exit triggered → enqueue MARKET_ON_OPEN sell for tomorrow.
-  2. Run strategy.signals() over the day's universe.
-     Apply the filter chain (risk module). Size each passing signal.
+  1. For each open position, check the engine-level stop-loss. If the
+     day's low breaches ``entry_stop``, enqueue a sell immediately
+     (before the strategy's own exit_rules run).
+  2. For each remaining open position, run strategy.exit_rules() with
+     bars[≤today]. If exit triggered → enqueue MARKET_ON_OPEN sell
+     for tomorrow.
+  3. Run strategy.signals() over the day's universe.
+     Apply the filter chain (risk module). Size each passing signal,
+     scaled by the regime-affinity multiplier (matching the live
+     scanner's soft-sizing logic).
      For passing+sized signals → enqueue MARKET_ON_OPEN buy for tomorrow.
-  3. Mark-to-market end-of-day equity using today's close.
-  4. Advance to tomorrow → fill enqueued orders at tomorrow's open with
+  4. Mark-to-market end-of-day equity using today's close.
+  5. Advance to tomorrow → fill enqueued orders at tomorrow's open with
      slippage. Reject buys that violate cash availability.
 
 The engine never reads from `bars` past `as_of` — strategies and risk
@@ -28,11 +34,13 @@ import pandas as pd
 
 from stockscan.backtest.slippage import FixedBpsSlippage, SlippageModel
 from stockscan.data.store import get_bars
+from stockscan.indicators import adx as compute_adx, sma
 from stockscan.metrics import (
     PerformanceReport,
     TradeResult,
     performance_report,
 )
+from stockscan.regime.detect import classify_regime
 from stockscan.risk.filters import FilterChain, PortfolioContext
 from stockscan.risk.sizer import position_size
 from stockscan.strategies import (
@@ -42,6 +50,12 @@ from stockscan.strategies import (
     StrategyParams,
 )
 from stockscan.universe import members_as_of
+
+# Minimum SPY bars to classify the legacy regime label. SMA(200) is the
+# longest indicator; add 30 for Wilder ADX warmup + buffer.
+_MIN_REGIME_BARS = 230
+# SPY is the benchmark for regime classification.
+_REGIME_BENCHMARK = "SPY"
 
 log = logging.getLogger(__name__)
 
@@ -82,6 +96,9 @@ class _Position:
     # Strategy's suggested stop at entry — preserved through the trade so we
     # can compute R-multiple at close. None for trades opened without one.
     entry_stop: Decimal | None = None
+    # The live stop level, updated by the strategy's ratchet_stop() method.
+    # Initialised from entry_stop; can only move UP over the position's life.
+    current_stop: Decimal | None = None
     # Snapshot of the originating signal's metadata — RSI/MACD/SMA values
     # that fired the entry. Used by the UI's trade log + chart hovers.
     entry_metadata: dict | None = None
@@ -128,6 +145,9 @@ class BacktestEngine:
         # bars_loader signature: (symbol, start, end) -> DataFrame indexed by ts (UTC)
         self._bars_loader = bars_loader or get_bars
         self._bars_cache: dict[str, pd.DataFrame] = {}
+        # Regime label cache: date -> RegimeLabel | None. Computed once per
+        # trading day from SPY bars. None means SPY data was insufficient.
+        self._regime_cache: dict[date, str | None] = {}
 
         self.filter_chain = FilterChain.default(
             max_positions=config.max_positions,
@@ -187,13 +207,55 @@ class BacktestEngine:
             bars = self._bars(symbol, today)
             if bars.empty:
                 continue
+
             snapshot = PositionSnapshot(
                 symbol=symbol,
                 qty=pos.qty,
                 avg_cost=pos.avg_cost,
                 opened_at=pos.opened_at,
                 strategy=self.strategy.name,
+                current_stop=pos.current_stop,
             )
+
+            # ----- Ratchet the stop (only upward) -----
+            # Ask the strategy for an updated stop level. The engine
+            # enforces the "only ratchet up" invariant: the new level is
+            # accepted only if it's higher than the current one. This
+            # gradually reduces risk-capital as the trade moves in our
+            # favour without needlessly exiting winners.
+            new_stop = self.strategy.ratchet_stop(snapshot, bars, today)
+            if new_stop is not None and pos.current_stop is not None:
+                if new_stop > pos.current_stop:
+                    pos.current_stop = new_stop
+            elif new_stop is not None and pos.current_stop is None:
+                pos.current_stop = new_stop
+
+            # ----- Engine-level stop-loss check -----
+            # Uses the (potentially just-ratcheted) current_stop. If
+            # today's low breaches it, queue a sell immediately — before
+            # the strategy's own exit_rules. Without this, the position
+            # sizer assumes risk is capped by the stop distance but the
+            # stop is never actually enforced.
+            #
+            # Fill happens at next-day open (like all exits). In a real
+            # stop-loss order the fill would be at the stop price or
+            # worse intraday — so next-day open is a slightly
+            # conservative approximation, consistent with the engine's
+            # architecture.
+            if pos.current_stop is not None:
+                today_low = Decimal(str(float(bars.iloc[-1]["low"])))
+                if today_low <= pos.current_stop:
+                    self.pending_orders.append(
+                        _PendingOrder(
+                            symbol=symbol,
+                            side="sell",
+                            qty=pos.qty,
+                            reason="stop_hit",
+                        )
+                    )
+                    continue  # stop takes priority over strategy exit_rules
+
+            # ----- Strategy-level exit rules -----
             decision = self.strategy.exit_rules(snapshot, bars, today)
             if decision is not None:
                 self.pending_orders.append(
@@ -210,6 +272,10 @@ class BacktestEngine:
         if not universe:
             return
 
+        # Regime-aware soft sizing (matches live scanner logic):
+        # scale base qty by the strategy's affinity for today's regime.
+        regime_mult = self._regime_multiplier(today)
+
         signals: list[tuple[RawSignal, int]] = []
         for symbol in universe:
             if symbol in self.positions:
@@ -219,7 +285,8 @@ class BacktestEngine:
                 continue
             raw = self.strategy.signals(bars, today)
             for sig in raw:
-                qty = self._size(sig)
+                base_qty = self._size(sig)
+                qty = max(0, round(base_qty * regime_mult))
                 if qty > 0:
                     signals.append((sig, qty))
 
@@ -295,6 +362,7 @@ class BacktestEngine:
                     low_water_close=fill,
                     entry_index=0,
                     entry_stop=order.suggested_stop,
+                    current_stop=order.suggested_stop,
                     entry_metadata=order.entry_metadata,
                 )
             else:  # sell
@@ -444,6 +512,63 @@ class BacktestEngine:
         if cached.empty:
             return cached
         return cached[cached.index.date <= as_of]
+
+    # ---------------------------------------------------------------------
+    # Regime
+    # ---------------------------------------------------------------------
+    def _regime_label(self, today: date) -> str | None:
+        """Classify the market regime from SPY bars. Cached per date.
+
+        Computes the legacy ADX(14) + SMA(200) label used by the live
+        scanner's ``classify_regime()``. Only needs SPY bars already in
+        the database — no VIX, RSP, or FRED data required.
+
+        Returns ``None`` when SPY bars are missing or insufficient,
+        which tells ``_regime_multiplier`` to fall back to a neutral 1.0
+        so a missing benchmark never blocks the strategy entirely.
+        """
+        if today in self._regime_cache:
+            return self._regime_cache[today]
+
+        spy_bars = self._bars(_REGIME_BENCHMARK, today)
+        if spy_bars.empty or len(spy_bars) < _MIN_REGIME_BARS:
+            self._regime_cache[today] = None
+            return None
+
+        spy_close = spy_bars["close"].astype(float)
+        spy_high = spy_bars["high"].astype(float)
+        spy_low = spy_bars["low"].astype(float)
+
+        adx_series = compute_adx(spy_high, spy_low, spy_close, period=14)
+        sma200 = sma(spy_close, 200)
+
+        adx_val = float(adx_series.iloc[-1]) if not pd.isna(adx_series.iloc[-1]) else None
+        sma200_val = float(sma200.iloc[-1]) if not pd.isna(sma200.iloc[-1]) else None
+        close_val = float(spy_close.iloc[-1])
+
+        if adx_val is None or sma200_val is None:
+            self._regime_cache[today] = None
+            return None
+
+        label = classify_regime(adx_val, close_val, sma200_val)
+        self._regime_cache[today] = label
+        return label
+
+    def _regime_multiplier(self, today: date) -> float:
+        """Return the regime-based sizing multiplier for today.
+
+        Matches the live scanner's soft-sizing logic: looks up the
+        strategy's affinity for the current regime label and returns it
+        as the multiplier. An affinity of 0.0 means "do not trade in
+        this regime" (e.g. momentum_52w_high in trending_down).
+
+        Soft-fails to 1.0 when regime data is unavailable so a missing
+        SPY data feed never silently blocks the strategy.
+        """
+        label = self._regime_label(today)
+        if label is None:
+            return 1.0
+        return float(self.strategy.affinity_for(label))
 
     def _equity_series(self) -> pd.Series:
         if not self.equity_history:

@@ -1,0 +1,289 @@
+{% extends "base.html" %}
+{% from "_macros.html" import card, badge, empty, back_link, tooltip %}
+
+{% block title %}Paper Trade {{ pt.symbol if pt else "?" }}{% endblock %}
+
+{# Format a metadata value sensibly. #}
+{% macro _fmt(key, value) -%}
+  {%- if value is none -%}<span class="text-ink-400">—</span>
+  {%- elif value is mapping or value is sequence and value is not string -%}
+    <code class="text-xs bg-ink-100 px-1 rounded">{{ value|tojson }}</code>
+  {%- elif value is number -%}
+    <span class="font-mono">{{ "%.4f"|format(value|float) }}</span>
+  {%- else -%}<span>{{ value }}</span>
+  {%- endif -%}
+{%- endmacro %}
+
+{% block content %}
+{% if not pt %}
+  {{ empty("Paper trade not found.", "❓") }}
+  <div class="mt-4">{{ back_link("/trades", "Back to trades") }}</div>
+{% else %}
+<div class="space-y-6">
+
+  <!-- Header -->
+  <div>
+    {{ back_link("/trades", "Back to trades") }}
+    <div class="flex items-baseline justify-between flex-wrap gap-2 mt-1">
+      <h1 class="text-2xl font-semibold">
+        <span class="font-mono">{{ pt.symbol }}</span>
+        <span class="text-base text-ink-500">· {{ pt.strategy_name }} · paper</span>
+      </h1>
+      <div class="flex items-center gap-2">
+        {{ badge("paper", "warn") }}
+        {% if pt.status == 'open' %}{{ badge("open", "ok") }}{% else %}{{ badge("closed") }}{% endif %}
+      </div>
+    </div>
+  </div>
+
+  <!-- Trade summary -->
+  {% call card(title="Trade summary") %}
+    <dl class="grid grid-cols-2 sm:grid-cols-4 gap-x-6 gap-y-3 text-sm">
+      <div>
+        <dt class="text-xs text-ink-500 uppercase tracking-wide">Side</dt>
+        <dd class="font-semibold">{{ pt.side }}</dd>
+      </div>
+      <div>
+        <dt class="text-xs text-ink-500 uppercase tracking-wide">Entry</dt>
+        <dd class="font-mono">${{ "%.2f"|format(pt.entry_price|float) }}</dd>
+      </div>
+      <div>
+        <dt class="text-xs text-ink-500 uppercase tracking-wide">Stop</dt>
+        <dd class="font-mono text-bad-600">${{ "%.2f"|format(pt.stop_price|float) }}</dd>
+      </div>
+      <div>
+        <dt class="text-xs text-ink-500 uppercase tracking-wide">Target</dt>
+        <dd class="font-mono">{% if pt.target_price %} ${{ "%.2f"|format(pt.target_price|float) }}{% else %}—{% endif %}</dd>
+      </div>
+      <div>
+        <dt class="text-xs text-ink-500 uppercase tracking-wide">Qty</dt>
+        <dd class="font-semibold">{{ pt.qty }} shares</dd>
+      </div>
+      <div>
+        <dt class="text-xs text-ink-500 uppercase tracking-wide">Opened</dt>
+        <dd>{{ pt.opened_at.strftime('%Y-%m-%d %H:%M') }}</dd>
+      </div>
+      {% if pt.status == 'open' and pt.current_price %}
+        <div>
+          <dt class="text-xs text-ink-500 uppercase tracking-wide">Current price</dt>
+          <dd class="font-mono">${{ "%.2f"|format(pt.current_price|float) }}</dd>
+        </div>
+      {% endif %}
+      {% if pt.status == 'closed' %}
+        <div>
+          <dt class="text-xs text-ink-500 uppercase tracking-wide">Closed</dt>
+          <dd>{{ pt.closed_at.strftime('%Y-%m-%d %H:%M') if pt.closed_at else "—" }}</dd>
+        </div>
+      {% endif %}
+    </dl>
+  {% endcall %}
+
+  <!-- P/L -->
+  {% call card(title="P/L") %}
+    <dl class="grid grid-cols-2 sm:grid-cols-4 gap-x-6 gap-y-3 text-sm">
+      {% if pt.status == 'open' %}
+        <div>
+          <dt class="text-xs text-ink-500 uppercase tracking-wide">Unrealised P&amp;L</dt>
+          <dd class="font-mono text-lg
+                     {% if pt.unrealised_pnl and pt.unrealised_pnl > 0 %}text-ok-600{% elif pt.unrealised_pnl and pt.unrealised_pnl < 0 %}text-bad-600{% endif %}">
+            {% if pt.unrealised_pnl is not none %}${{ "%.2f"|format(pt.unrealised_pnl|float) }}{% else %}—{% endif %}
+          </dd>
+        </div>
+        <div>
+          <dt class="text-xs text-ink-500 uppercase tracking-wide">Unrealised %</dt>
+          <dd class="font-mono
+                     {% if pt.unrealised_pnl_pct and pt.unrealised_pnl_pct > 0 %}text-ok-600{% elif pt.unrealised_pnl_pct and pt.unrealised_pnl_pct < 0 %}text-bad-600{% endif %}">
+            {% if pt.unrealised_pnl_pct is not none %}{{ "%.2f%%"|format(pt.unrealised_pnl_pct|float * 100) }}{% else %}—{% endif %}
+          </dd>
+        </div>
+      {% else %}
+        <div>
+          <dt class="text-xs text-ink-500 uppercase tracking-wide">Realised P&amp;L</dt>
+          <dd class="font-mono text-lg
+                     {% if pt.realized_pnl and pt.realized_pnl > 0 %}text-ok-600{% elif pt.realized_pnl and pt.realized_pnl < 0 %}text-bad-600{% endif %}">
+            {% if pt.realized_pnl is not none %}${{ "%.2f"|format(pt.realized_pnl|float) }}{% else %}—{% endif %}
+          </dd>
+        </div>
+        <div>
+          <dt class="text-xs text-ink-500 uppercase tracking-wide">Realised %</dt>
+          <dd class="font-mono
+                     {% if pt.realized_pnl_pct and pt.realized_pnl_pct > 0 %}text-ok-600{% elif pt.realized_pnl_pct and pt.realized_pnl_pct < 0 %}text-bad-600{% endif %}">
+            {% if pt.realized_pnl_pct is not none %}{{ "%.2f%%"|format(pt.realized_pnl_pct|float * 100) }}{% else %}—{% endif %}
+          </dd>
+        </div>
+        <div>
+          <dt class="text-xs text-ink-500 uppercase tracking-wide">Exit price</dt>
+          <dd class="font-mono">${{ "%.2f"|format(pt.exit_price|float) if pt.exit_price else "—" }}</dd>
+        </div>
+        <div>
+          <dt class="text-xs text-ink-500 uppercase tracking-wide">Exit reason</dt>
+          <dd>{{ pt.exit_reason or "—" }}</dd>
+        </div>
+      {% endif %}
+      <div>
+        <dt class="text-xs text-ink-500 uppercase tracking-wide">{{ tooltip("MFE", "mfe" | explain_text) }}</dt>
+        <dd>{{ "%.2f%%"|format(pt.mfe|float * 100) if pt.mfe else "—" }}</dd>
+      </div>
+      <div>
+        <dt class="text-xs text-ink-500 uppercase tracking-wide">{{ tooltip("MAE", "mae" | explain_text) }}</dt>
+        <dd>{{ "%.2f%%"|format(pt.mae|float * 100) if pt.mae else "—" }}</dd>
+      </div>
+      {% if pt.holding_days is not none %}
+        <div>
+          <dt class="text-xs text-ink-500 uppercase tracking-wide">Hold (days)</dt>
+          <dd>{{ pt.holding_days }}</dd>
+        </div>
+      {% endif %}
+      {% if pt.last_mark_at %}
+        <div>
+          <dt class="text-xs text-ink-500 uppercase tracking-wide">Last mark</dt>
+          <dd class="text-xs">{{ pt.last_mark_at.strftime('%Y-%m-%d %H:%M') }}</dd>
+        </div>
+      {% endif %}
+    </dl>
+  {% endcall %}
+
+  <!-- Entry snapshot -->
+  {% if pt.entry_signal_metadata %}
+    {% call card(title="Entry snapshot", subtitle="Signal metadata at open time") %}
+      <div class="grid grid-cols-2 sm:grid-cols-3 gap-x-6 gap-y-2 text-sm">
+        {% for key, value in pt.entry_signal_metadata.items() %}
+          <div>
+            <dt class="text-xs text-ink-500">{{ key.replace('_', ' ').title() }}</dt>
+            <dd>{{ _fmt(key, value) }}</dd>
+          </div>
+        {% endfor %}
+      </div>
+    {% endcall %}
+  {% endif %}
+
+  {% if pt.entry_regime %}
+    {% call card(title="Entry regime context", subtitle="Market state when trade was opened") %}
+      <div class="grid grid-cols-2 sm:grid-cols-3 gap-x-6 gap-y-2 text-sm">
+        {% for key, value in pt.entry_regime.items() %}
+          <div>
+            <dt class="text-xs text-ink-500">{{ key.replace('_', ' ').title() }}</dt>
+            <dd>{{ _fmt(key, value) }}</dd>
+          </div>
+        {% endfor %}
+      </div>
+    {% endcall %}
+  {% endif %}
+
+  {% if pt.entry_tech_score %}
+    {% call card(title="Entry technical score") %}
+      <div class="text-sm">
+        {% if pt.entry_tech_score.score is not none %}
+          {%- set s = pt.entry_tech_score.score|float -%}
+          <span class="font-mono font-semibold text-lg
+                       {% if s > 0.05 %}text-ok-600{% elif s < -0.05 %}text-bad-600{% else %}text-ink-500{% endif %}">
+            {{ "%+.3f"|format(s) }}
+          </span>
+        {% endif %}
+        {% if pt.entry_tech_score.breakdown %}
+          <details class="mt-2 text-xs">
+            <summary class="text-ink-500 cursor-pointer">Breakdown</summary>
+            <pre class="mt-1 bg-ink-100 p-2 rounded overflow-auto">{{ pt.entry_tech_score.breakdown|tojson(indent=2) }}</pre>
+          </details>
+        {% endif %}
+      </div>
+    {% endcall %}
+  {% endif %}
+
+  {% if pt.entry_strategy_params %}
+    {% call card(title="Strategy parameters at entry") %}
+      <pre class="text-xs bg-ink-100 p-3 rounded overflow-auto">{{ pt.entry_strategy_params|tojson(indent=2) }}</pre>
+    {% endcall %}
+  {% endif %}
+
+  <!-- Exit snapshot (closed trades only) -->
+  {% if pt.status == 'closed' %}
+    {% if pt.exit_regime %}
+      {% call card(title="Exit regime context", subtitle="Market state when trade was closed") %}
+        <div class="grid grid-cols-2 sm:grid-cols-3 gap-x-6 gap-y-2 text-sm">
+          {% for key, value in pt.exit_regime.items() %}
+            <div>
+              <dt class="text-xs text-ink-500">{{ key.replace('_', ' ').title() }}</dt>
+              <dd>{{ _fmt(key, value) }}</dd>
+            </div>
+          {% endfor %}
+        </div>
+      {% endcall %}
+    {% endif %}
+
+    {% if pt.exit_signal_metadata %}
+      {% call card(title="Exit snapshot", subtitle="Re-computed indicators at close time") %}
+        <div class="grid grid-cols-2 sm:grid-cols-3 gap-x-6 gap-y-2 text-sm">
+          {% for key, value in pt.exit_signal_metadata.items() %}
+            <div>
+              <dt class="text-xs text-ink-500">{{ key.replace('_', ' ').title() }}</dt>
+              <dd>{{ _fmt(key, value) }}</dd>
+            </div>
+          {% endfor %}
+        </div>
+      {% endcall %}
+    {% endif %}
+  {% endif %}
+
+  <!-- Auto-close rules -->
+  {% if pt.auto_close_rules %}
+    {% call card(title="Auto-close rules", subtitle="Strategy exit rules applied to this trade") %}
+      <div class="grid grid-cols-2 sm:grid-cols-3 gap-x-6 gap-y-2 text-sm">
+        {% for key, value in pt.auto_close_rules.items() %}
+          <div>
+            <dt class="text-xs text-ink-500">{{ key.replace('_', ' ').title() }}</dt>
+            <dd class="font-mono">
+              {% if value is number %}{{ "%.2f"|format(value|float) }}{% else %}{{ value }}{% endif %}
+            </dd>
+          </div>
+        {% endfor %}
+      </div>
+    {% endcall %}
+  {% endif %}
+
+  <!-- Manual close form (open trades only) -->
+  {% if pt.status == 'open' %}
+    {% call card(title="Close trade", subtitle="Manually close this paper trade") %}
+      <form action="/paper-trades/{{ pt.paper_trade_id }}/close" method="post"
+            class="flex flex-wrap items-end gap-4">
+        <div>
+          <label for="exit_price" class="block text-xs text-ink-500 mb-1">
+            Exit price <span class="text-bad-600">*</span>
+          </label>
+          <input type="number" step="0.01" name="exit_price" id="exit_price"
+                 value="{{ "%.2f"|format(pt.current_price|float) if pt.current_price else '' }}"
+                 required
+                 class="px-3 py-2 rounded border border-ink-300 text-sm font-mono w-36">
+        </div>
+        <div>
+          <label for="exit_reason" class="block text-xs text-ink-500 mb-1">Reason</label>
+          <select name="exit_reason" id="exit_reason"
+                  class="px-3 py-2 rounded border border-ink-300 text-sm">
+            <option value="manual" selected>Manual close</option>
+            <option value="stop_hit">Stop hit</option>
+            <option value="target_hit">Target hit</option>
+            <option value="time_stop">Time stop</option>
+            <option value="thesis_invalidated">Thesis invalidated</option>
+          </select>
+        </div>
+        <button type="submit"
+                class="px-4 py-2 rounded bg-bad-600 text-white text-sm font-medium hover:bg-bad-600/90 transition-colors">
+          Close trade
+        </button>
+      </form>
+    {% endcall %}
+  {% endif %}
+
+  <!-- Footer -->
+  <div class="flex flex-wrap gap-3 pt-2">
+    <a href="/signals/{{ pt.signal_id }}"
+       class="inline-flex items-center px-4 py-2 rounded border border-ink-300 text-sm">
+      View source signal
+    </a>
+    <a href="/trades" class="inline-flex items-center px-4 py-2 rounded border border-ink-300 text-sm">
+      ← Back to trades
+    </a>
+  </div>
+</div>
+{% endif %}
+{% endblock %}

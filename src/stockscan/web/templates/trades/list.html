@@ -8,7 +8,7 @@
 {% block content %}
 <div class="space-y-6">
 
-  {{ page_header("Trades", subtitle="Open positions and closed trade history") }}
+  {{ page_header("Trades", subtitle="Open positions, paper trades, and closed trade history") }}
 
   <form action="/trades/search" method="get"
         class="flex gap-2 items-center">
@@ -18,6 +18,74 @@
             title="Search across all trade notes">Search</button>
   </form>
 
+  {# ---- Open paper trades ---- #}
+  {% call card(title="Open paper trades (" ~ open_paper_trades|length ~ ")", subtitle="Simulated positions with live P/L tracking") %}
+    {% if open_paper_trades %}
+      {{ table_open([
+          {"label": "Symbol", "align": "left"},
+          {"label": "Strategy", "align": "left"},
+          {"label": "Entry", "align": "right"},
+          {"label": "Current", "align": "right"},
+          {"label": "Qty", "align": "right"},
+          {"label": "P&L", "align": "right", "help": "Unrealised profit & loss"},
+          {"label": "P&L %", "align": "right"},
+          {"label": "Opened", "align": "left"},
+          {"label": "", "align": "right"},
+      ]) }}
+            {% for pt in open_paper_trades %}
+              <tr>
+                <td class="px-4 py-2 font-mono font-semibold">
+                  {{ pt.symbol }}
+                  <span class="ml-1">{{ badge(pt.side, "ok" if pt.side == "long" else "bad") }}</span>
+                </td>
+                <td class="px-4 py-2 text-ink-700 text-xs">{{ pt.strategy_name }}</td>
+                <td class="px-4 py-2 text-right font-mono">${{ "%.2f"|format(pt.entry_price|float) }}</td>
+                <td class="px-4 py-2 text-right font-mono">
+                  {% if pt.current_price %} ${{ "%.2f"|format(pt.current_price|float) }}{% else %}—{% endif %}
+                </td>
+                <td class="px-4 py-2 text-right">{{ pt.qty }}</td>
+                <td class="px-4 py-2 text-right font-mono
+                           {% if pt.unrealised_pnl and pt.unrealised_pnl > 0 %}text-ok-600{% elif pt.unrealised_pnl and pt.unrealised_pnl < 0 %}text-bad-600{% endif %}">
+                  {% if pt.unrealised_pnl is not none %}${{ "%.2f"|format(pt.unrealised_pnl|float) }}{% else %}—{% endif %}
+                </td>
+                <td class="px-4 py-2 text-right font-mono text-xs
+                           {% if pt.unrealised_pnl_pct and pt.unrealised_pnl_pct > 0 %}text-ok-600{% elif pt.unrealised_pnl_pct and pt.unrealised_pnl_pct < 0 %}text-bad-600{% endif %}">
+                  {% if pt.unrealised_pnl_pct is not none %}{{ "%.2f%%"|format(pt.unrealised_pnl_pct|float * 100) }}{% else %}—{% endif %}
+                </td>
+                <td class="px-4 py-2 text-ink-500 text-xs">{{ pt.opened_at.date() }}</td>
+                <td class="px-4 py-2 text-right">
+                  <a href="/paper-trades/{{ pt.paper_trade_id }}"
+                     class="text-xs underline"
+                     title="Open paper trade detail">Open</a>
+                </td>
+              </tr>
+            {% endfor %}
+      {{ table_close() }}
+
+      {{ mobile_list_open() }}
+        {% for pt in open_paper_trades %}
+          <li class="px-4 py-3">
+            <div class="flex items-baseline justify-between">
+              <span class="font-mono font-semibold">{{ pt.symbol }} {{ badge(pt.side, "ok" if pt.side == "long" else "bad") }}</span>
+              <span class="font-mono text-sm
+                           {% if pt.unrealised_pnl and pt.unrealised_pnl > 0 %}text-ok-600{% elif pt.unrealised_pnl and pt.unrealised_pnl < 0 %}text-bad-600{% endif %}">
+                {% if pt.unrealised_pnl is not none %}${{ "%.2f"|format(pt.unrealised_pnl|float) }}{% else %}—{% endif %}
+              </span>
+            </div>
+            <div class="text-xs text-ink-500 mt-0.5">
+              {{ pt.strategy_name }} · {{ pt.qty }} @ ${{ "%.2f"|format(pt.entry_price|float) }} · opened {{ pt.opened_at.date() }}
+            </div>
+            <a href="/paper-trades/{{ pt.paper_trade_id }}"
+               class="inline-block mt-2 text-xs underline">Open</a>
+          </li>
+        {% endfor %}
+      {{ mobile_list_close() }}
+    {% else %}
+      {{ empty("No open paper trades. Open one from the Signals page.", "📝") }}
+    {% endif %}
+  {% endcall %}
+
+  {# ---- Open real positions ---- #}
   {% call card(title="Open positions (" ~ open_trades|length ~ ")") %}
     {% if open_trades %}
       <ul class="divide-y divide-ink-300/40 -mx-4">
@@ -38,6 +106,61 @@
     {% endif %}
   {% endcall %}
 
+  {# ---- Closed paper trades ---- #}
+  {% if closed_paper_trades %}
+    {% call card(title="Closed paper trades (" ~ closed_paper_trades|length ~ ")") %}
+      {{ table_open([
+          {"label": "Symbol", "align": "left"},
+          {"label": "Strategy", "align": "left"},
+          {"label": "Entry", "align": "right"},
+          {"label": "Exit", "align": "right"},
+          {"label": "Days", "align": "right"},
+          {"label": "P&L", "align": "right"},
+          {"label": "Reason", "align": "left"},
+          {"label": "", "align": "right"},
+      ]) }}
+            {% for pt in closed_paper_trades %}
+              <tr>
+                <td class="px-4 py-2 font-mono font-semibold">{{ pt.symbol }}</td>
+                <td class="px-4 py-2 text-ink-700 text-xs">{{ pt.strategy_name }}</td>
+                <td class="px-4 py-2 text-right font-mono">${{ "%.2f"|format(pt.entry_price|float) }}</td>
+                <td class="px-4 py-2 text-right font-mono">${{ "%.2f"|format(pt.exit_price|float) if pt.exit_price else "—" }}</td>
+                <td class="px-4 py-2 text-right">{{ pt.holding_days or "—" }}</td>
+                <td class="px-4 py-2 text-right font-mono
+                           {% if pt.realized_pnl and pt.realized_pnl > 0 %}text-ok-600{% elif pt.realized_pnl and pt.realized_pnl < 0 %}text-bad-600{% endif %}">
+                  {% if pt.realized_pnl is not none %}${{ "%.2f"|format(pt.realized_pnl|float) }}{% else %}—{% endif %}
+                </td>
+                <td class="px-4 py-2 text-xs text-ink-500">{{ pt.exit_reason or "—" }}</td>
+                <td class="px-4 py-2 text-right">
+                  <a href="/paper-trades/{{ pt.paper_trade_id }}"
+                     class="text-xs underline">Open</a>
+                </td>
+              </tr>
+            {% endfor %}
+      {{ table_close() }}
+
+      {{ mobile_list_open() }}
+        {% for pt in closed_paper_trades %}
+          <li class="px-4 py-3">
+            <div class="flex items-baseline justify-between">
+              <span class="font-mono font-semibold">{{ pt.symbol }}</span>
+              <span class="font-mono text-sm
+                           {% if pt.realized_pnl and pt.realized_pnl > 0 %}text-ok-600{% elif pt.realized_pnl and pt.realized_pnl < 0 %}text-bad-600{% endif %}">
+                {% if pt.realized_pnl is not none %}${{ "%.2f"|format(pt.realized_pnl|float) }}{% else %}—{% endif %}
+              </span>
+            </div>
+            <div class="text-xs text-ink-500 mt-0.5">
+              {{ pt.strategy_name }} · {{ pt.holding_days or "?" }}d · {{ pt.exit_reason or "closed" }}
+            </div>
+            <a href="/paper-trades/{{ pt.paper_trade_id }}"
+               class="inline-block mt-2 text-xs underline">Open</a>
+          </li>
+        {% endfor %}
+      {{ mobile_list_close() }}
+    {% endcall %}
+  {% endif %}
+
+  {# ---- Closed real trades ---- #}
   {% call card(title="Closed trades (" ~ closed_trades|length ~ ")") %}
     {% if closed_trades %}
       {{ table_open([

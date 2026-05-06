@@ -57,6 +57,19 @@ _REGIME_INDX_SYMBOLS = {"VIX"}
 _REFRESH_DAYS_BACK = 5
 
 
+def _safe_rollback(session: Session) -> None:
+    """Clear aborted-transaction state on the request session.
+
+    See the matching helper in ``signals.py`` / ``news.py``: this
+    keeps an SQL error inside the refresh body from cascading into
+    InFailedSqlTransaction on the post-refresh SELECT.
+    """
+    try:
+        session.rollback()
+    except Exception as exc:
+        log.warning("rollback failed during error recovery: %s", exc)
+
+
 @router.post("/refresh")
 async def refresh_endpoint(
     request: Request,
@@ -125,9 +138,11 @@ async def refresh_endpoint(
         except EODHDError as exc:
             log.warning("regime refresh: provider error: %s", exc)
             error = f"Provider error: {exc}"
+            _safe_rollback(s)
         except Exception as exc:
             log.exception("regime refresh: bar-refresh failed")
             error = f"Bar refresh failed: {exc}"
+            _safe_rollback(s)
 
     # ---- Phase 2: recompute the regime for today. ----
     # Always attempted — even if the bar refresh failed (e.g., no API
@@ -141,6 +156,10 @@ async def refresh_endpoint(
         except Exception as exc:
             log.exception("regime refresh: detect_regime failed")
             error = f"Recompute failed: {exc}"
+            # Without this, the latest_regime() call inside _render_card
+            # would 500 with InFailedSqlTransaction instead of rendering
+            # the error banner the user can read.
+            _safe_rollback(s)
 
     summary: dict[str, object] | None = None
     if error is None:

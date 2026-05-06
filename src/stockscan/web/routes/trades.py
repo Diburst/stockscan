@@ -15,7 +15,9 @@ from stockscan.notes import (
 )
 from stockscan.positions import (
     get_trade,
+    list_closed_paper_trades,
     list_closed_trades,
+    list_open_paper_trades,
     list_open_trades,
 )
 from stockscan.web.deps import flash_redirect, get_session, render
@@ -31,11 +33,15 @@ async def trades_list(
 ):
     open_trades = list_open_trades(session=s)
     closed_trades = list_closed_trades(strategy=strategy, session=s)
+    open_paper = list_open_paper_trades(session=s)
+    closed_paper = list_closed_paper_trades(strategy=strategy, session=s)
     return render(
         request,
         "trades/list.html",
         open_trades=open_trades,
         closed_trades=closed_trades,
+        open_paper_trades=open_paper,
+        closed_paper_trades=closed_paper,
         active_strategy=strategy,
     )
 

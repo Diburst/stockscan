@@ -171,6 +171,17 @@ class DonchianParams(StrategyParams):
     atr_stop_mult: float = Field(2.0, ge=1.0, le=4.0, description="Initial stop ATR mult")
     chandelier_period: int = Field(22, ge=10, le=40, description="Trailing-stop high window")
     chandelier_atr_mult: float = Field(3.0, ge=1.0, le=5.0)
+    ratchet_interval: int = Field(
+        14,
+        ge=5,
+        le=60,
+        description=(
+            "Every N trading bars, recompute the ATR-based stop from "
+            "the current price. The engine only ratchets UP, so winning "
+            "trades gradually lock in profit. Supplements the existing "
+            "chandelier and N-day-low exits."
+        ),
+    )
     adx_period: int = Field(14, ge=5, le=30)
     adx_min: float = Field(
         20.0,
@@ -946,6 +957,44 @@ sustained run of either market type doesn't kill total P&L.
                 return ExitDecision(reason="chandelier_stop", qty=position.qty)
 
         return None
+
+    # ------------------------------------------------------------------
+    def ratchet_stop(
+        self,
+        position: PositionSnapshot,
+        bars: pd.DataFrame,
+        as_of: date,
+    ) -> Decimal | None:
+        """Every ``ratchet_interval`` bars, recompute the ATR-based stop.
+
+        Supplements the existing chandelier and N-day-low exits. The
+        engine only ratchets the stop UP, so this gradually reduces
+        risk-capital on winning trades without forcing exits.
+        """
+        if position.opened_at is None:
+            return None
+
+        view = self._slice(bars, as_of)
+        if len(view) < self.params.atr_period_stop + 5:
+            return None
+
+        entry_date = position.opened_at.date()
+        bars_since = view[view.index.date > entry_date]
+        n_bars = len(bars_since)
+        if n_bars == 0 or n_bars % self.params.ratchet_interval != 0:
+            return None
+
+        high = view["high"]
+        low = view["low"]
+        close = view["close"]
+        last_close = float(close.iloc[-1])
+
+        atr_v = atr(high, low, close, self.params.atr_period_stop).iloc[-1]
+        if pd.isna(atr_v) or float(atr_v) <= 0:
+            return None
+
+        new_stop = round(last_close - self.params.atr_stop_mult * float(atr_v), 4)
+        return Decimal(str(new_stop))
 
     # ------------------------------------------------------------------
     # Internal helpers — kept private to avoid widening the strategy ABC.

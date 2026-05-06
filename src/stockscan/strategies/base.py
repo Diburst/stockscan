@@ -19,6 +19,7 @@ from pydantic import BaseModel
 if TYPE_CHECKING:
     from collections.abc import Mapping
     from datetime import date
+    from decimal import Decimal
 
     import pandas as pd
 
@@ -151,6 +152,23 @@ class Strategy(ABC):
         as_of: date,
     ) -> ExitDecision | None:
         """Return an exit decision, or None to hold."""
+
+    def ratchet_stop(
+        self,
+        position: PositionSnapshot,
+        bars: pd.DataFrame,
+        as_of: date,
+    ) -> Decimal | None:
+        """Return a new stop level, or None to keep the current one.
+
+        Called by the engine before the stop-loss check on every bar.
+        The engine enforces the "only ratchet up" invariant: if the
+        returned value is lower than the current stop, it's ignored.
+
+        Override in concrete strategies to implement periodic ATR-based
+        stop resets. The default returns None (no ratcheting).
+        """
+        return None
 
     # ----- helpers used by the framework -----
     @classmethod

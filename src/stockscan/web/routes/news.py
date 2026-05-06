@@ -40,6 +40,22 @@ router = APIRouter(prefix="/news")
 log = logging.getLogger(__name__)
 
 
+def _safe_rollback(session: Session) -> None:
+    """Clear aborted-transaction state on the request session.
+
+    Refresh routes catch broad ``Exception`` so they can still render
+    the existing card with the error banner. If the failure was an
+    SQL error, Postgres has the connection in an ABORTED state and
+    refuses every subsequent statement until ROLLBACK — which would
+    cause the post-refresh SELECT to 500 with InFailedSqlTransaction
+    and hide the original error from the user.
+    """
+    try:
+        session.rollback()
+    except Exception as exc:
+        log.warning("rollback failed during error recovery: %s", exc)
+
+
 @router.post("/refresh")
 async def refresh_endpoint(
     request: Request,
@@ -91,9 +107,16 @@ async def refresh_endpoint(
         except EODHDError as exc:
             log.warning("news refresh: provider error: %s", exc)
             error = f"Provider error: {exc}"
+            _safe_rollback(s)
         except Exception as exc:
             log.exception("news refresh: unexpected error")
             error = f"Refresh failed: {exc}"
+            # SQL errors inside refresh_news leave the session in an
+            # aborted-transaction state. Without rollback, the
+            # ``recent_general()`` and ``last_fetched_at()`` calls below
+            # would 500 with InFailedSqlTransaction and the user would
+            # never see the error message we captured.
+            _safe_rollback(s)
 
     response = render(
         request,

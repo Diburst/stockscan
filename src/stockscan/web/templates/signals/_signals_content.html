@@ -4,21 +4,52 @@
    target it for outerHTML replacement.
 
    Inputs:
-     freshness               — SignalsFreshness with latest_signal_date,
-                               latest_run_at, latest_bar_date,
-                               signals_today_count
+     freshness               — SignalsFreshness
      passing                 — list of passing signal rows
      rejected                — list of rejected signal rows
      strategies              — list of registered Strategy classes
      active_strategy         — currently-filtered strategy name | None
      show_rejected           — bool
      days                    — int
-     signals_refresh_error   — str | None: error from a failed refresh
-     signals_refresh_summary — dict | None: counts from a successful one
-                               (bars_upserted, strategies_run, signals_emitted,
-                                rejected_count, duration_seconds, failures)
+     signals_refresh_error   — str | None
+     signals_refresh_summary — dict | None
+     filter_symbol, filter_side, filter_score_min, filter_score_max,
+     filter_tech_min, filter_tech_max — current filter values
+     sort_key, sort_dir       — current sort state
 #}
 {% from "_macros.html" import card, badge, empty, pill_link, time_ago, tech_score, loading_spinner %}
+
+{# ---- Helper: build a URL preserving all current filter/sort/strategy state ---- #}
+{#  Only emit params that carry a value — empty-string floats cause FastAPI
+    422 errors (it can't parse "" as float|None).  #}
+{%- macro _base_params() -%}
+days={{ days }}&show_rejected={{ 'true' if show_rejected else 'false' }}
+{%- if active_strategy %}&strategy={{ active_strategy }}{% endif -%}
+{%- if filter_symbol %}&symbol={{ filter_symbol }}{% endif -%}
+{%- if filter_side %}&side={{ filter_side }}{% endif -%}
+{%- if filter_score_min is not none %}&score_min={{ filter_score_min }}{% endif -%}
+{%- if filter_score_max is not none %}&score_max={{ filter_score_max }}{% endif -%}
+{%- if filter_tech_min is not none %}&tech_min={{ filter_tech_min }}{% endif -%}
+{%- if filter_tech_max is not none %}&tech_max={{ filter_tech_max }}{% endif -%}
+{%- endmacro -%}
+
+{# ---- Helper: sortable column header ---- #}
+{% macro sort_th(label, key, align="left", help="") %}
+  {%- set is_active = (key == sort_key) -%}
+  {%- set next_dir = "asc" if (is_active and sort_dir == "desc") else "desc" -%}
+  {%- set arrow = "" -%}
+  {%- if is_active -%}
+    {%- set arrow = " ↓" if sort_dir == "desc" else " ↑" -%}
+  {%- endif -%}
+  <th class="text-{{ align }} px-4 py-2"
+      {% if help %}title="{{ help }}"{% endif %}>
+    <a href="/signals?{{ _base_params() }}&sort={{ key }}&dir={{ next_dir }}"
+       class="inline-flex items-center gap-0.5 hover:text-ink-900
+              {% if is_active %}text-ink-900 font-semibold{% endif %}">
+      {{ label }}{{ arrow }}
+    </a>
+  </th>
+{% endmacro %}
 
 <div id="signals-content" class="space-y-6">
 
@@ -50,7 +81,7 @@
       </div>
     </div>
     <form
-      hx-post="/signals/refresh?strategy={{ active_strategy or '' }}&days={{ days }}&show_rejected={{ 'true' if show_rejected else 'false' }}"
+      hx-post="/signals/refresh?{{ _base_params() }}&sort={{ sort_key }}&dir={{ sort_dir }}"
       hx-target="#signals-content"
       hx-swap="outerHTML"
       hx-disabled-elt="this"
@@ -110,10 +141,78 @@
     {% endfor %}
   </div>
 
+  <!-- Filter bar -->
+  <form action="/signals" method="get"
+        class="bg-white rounded-xl border border-ink-300/40 px-4 py-3">
+    {# Preserve strategy / days / show_rejected / sort across filter submissions #}
+    {% if active_strategy %}<input type="hidden" name="strategy" value="{{ active_strategy }}">{% endif %}
+    <input type="hidden" name="days" value="{{ days }}">
+    <input type="hidden" name="show_rejected" value="{{ 'true' if show_rejected else 'false' }}">
+    {% if sort_key %}<input type="hidden" name="sort" value="{{ sort_key }}">{% endif %}
+    {% if sort_dir %}<input type="hidden" name="dir" value="{{ sort_dir }}">{% endif %}
+
+    <div class="flex flex-wrap items-end gap-3">
+      <div>
+        <label class="block text-xs text-ink-500 mb-1">Symbol</label>
+        <input type="text" name="symbol" value="{{ filter_symbol }}"
+               placeholder="e.g. AAPL"
+               class="px-2 py-1.5 rounded border border-ink-300 text-sm font-mono w-24">
+      </div>
+      <div>
+        <label class="block text-xs text-ink-500 mb-1">Side</label>
+        <select name="side" class="px-2 py-1.5 rounded border border-ink-300 text-sm w-20">
+          <option value="">All</option>
+          <option value="long" {% if filter_side == 'long' %}selected{% endif %}>Long</option>
+          <option value="short" {% if filter_side == 'short' %}selected{% endif %}>Short</option>
+        </select>
+      </div>
+      <div>
+        <label class="block text-xs text-ink-500 mb-1">Score min</label>
+        <input type="number" step="0.01" name="score_min"
+               value="{{ filter_score_min if filter_score_min is not none else '' }}"
+               placeholder="0.00"
+               class="px-2 py-1.5 rounded border border-ink-300 text-sm font-mono w-20">
+      </div>
+      <div>
+        <label class="block text-xs text-ink-500 mb-1">Score max</label>
+        <input type="number" step="0.01" name="score_max"
+               value="{{ filter_score_max if filter_score_max is not none else '' }}"
+               placeholder="1.00"
+               class="px-2 py-1.5 rounded border border-ink-300 text-sm font-mono w-20">
+      </div>
+      <div>
+        <label class="block text-xs text-ink-500 mb-1">Tech min</label>
+        <input type="number" step="0.01" name="tech_min"
+               value="{{ filter_tech_min if filter_tech_min is not none else '' }}"
+               placeholder="-1.00"
+               class="px-2 py-1.5 rounded border border-ink-300 text-sm font-mono w-20">
+      </div>
+      <div>
+        <label class="block text-xs text-ink-500 mb-1">Tech max</label>
+        <input type="number" step="0.01" name="tech_max"
+               value="{{ filter_tech_max if filter_tech_max is not none else '' }}"
+               placeholder="1.00"
+               class="px-2 py-1.5 rounded border border-ink-300 text-sm font-mono w-20">
+      </div>
+      <div class="flex gap-2">
+        <button type="submit"
+                class="px-3 py-1.5 rounded bg-ink-900 text-white text-xs">
+          Filter
+        </button>
+        {% if filter_symbol or filter_side or filter_score_min is not none or filter_score_max is not none or filter_tech_min is not none or filter_tech_max is not none %}
+          <a href="/signals?{% if active_strategy %}strategy={{ active_strategy }}&{% endif %}days={{ days }}&show_rejected={{ 'true' if show_rejected else 'false' }}{% if sort_key %}&sort={{ sort_key }}&dir={{ sort_dir }}{% endif %}"
+             class="px-3 py-1.5 rounded border border-ink-300 text-xs text-ink-500 hover:bg-ink-100">
+            Clear
+          </a>
+        {% endif %}
+      </div>
+    </div>
+  </form>
+
   <!-- Passing signals -->
   {% call card(
     title="Passing signals (" ~ passing|length ~ ")",
-    subtitle="Last " ~ days ~ " days · ranked by score"
+    subtitle="Last " ~ days ~ " days" ~ (" · filtered" if filter_symbol or filter_side or filter_score_min is not none or filter_score_max is not none or filter_tech_min is not none or filter_tech_max is not none else "")
   ) %}
     {% if passing %}
       {# Desktop table #}
@@ -121,14 +220,16 @@
         <table class="w-full text-sm">
           <thead class="text-xs uppercase text-ink-500 border-b border-ink-300/40">
             <tr>
-              <th class="text-left px-4 py-2">Symbol</th>
-              <th class="text-left px-4 py-2">Strategy</th>
-              <th class="text-right px-4 py-2">Score</th>
-              <th class="text-center px-4 py-2" title="Technical confirmation score: positive = technicals confirm the setup; negative = technicals contradict.">Tech</th>
-              <th class="text-right px-4 py-2">Entry</th>
-              <th class="text-right px-4 py-2">Stop</th>
-              <th class="text-right px-4 py-2">Qty</th>
-              <th class="text-left px-4 py-2">Date</th>
+              {{ sort_th("Symbol", "symbol") }}
+              {{ sort_th("Side", "side") }}
+              {{ sort_th("Strategy", "strategy") }}
+              {{ sort_th("Score", "score", align="right") }}
+              {{ sort_th("Tech", "tech", align="center", help="Technical confirmation score: positive = technicals confirm the setup; negative = technicals contradict.") }}
+              {{ sort_th("Entry", "entry", align="right") }}
+              {{ sort_th("Stop", "stop", align="right") }}
+              {{ sort_th("Qty", "qty", align="right") }}
+              {{ sort_th("Date", "date") }}
+              <th class="text-center px-4 py-2">Trade</th>
               <th class="text-right px-4 py-2"></th>
             </tr>
           </thead>
@@ -136,6 +237,7 @@
             {% for sig in passing %}
               <tr>
                 <td class="px-4 py-2 font-mono font-semibold">{{ sig.symbol }}</td>
+                <td class="px-4 py-2">{{ badge(sig.side, "ok" if sig.side == "long" else "bad") }}</td>
                 <td class="px-4 py-2 text-ink-700">{{ sig.strategy_name }}</td>
                 <td class="px-4 py-2 text-right">{{ "%.2f"|format(sig.score|float) if sig.score else "—" }}</td>
                 <td class="px-4 py-2 text-center">{{ tech_score(sig.tech_score) }}</td>
@@ -143,6 +245,13 @@
                 <td class="px-4 py-2 text-right font-mono text-bad-600">${{ "%.2f"|format(sig.suggested_stop|float) }}</td>
                 <td class="px-4 py-2 text-right">{{ sig.suggested_qty or "—" }}</td>
                 <td class="px-4 py-2 text-ink-500 text-xs">{{ sig.as_of_date }}</td>
+                <td class="px-4 py-2 text-center">
+                  <a href="/signals/{{ sig.signal_id }}#paper-trade"
+                     class="inline-flex items-center gap-1 text-xs px-2 py-1 rounded border border-ok-600/30 bg-ok-100 text-ok-600 hover:bg-ok-600 hover:text-white transition-colors"
+                     title="Open paper trade from this signal">
+                    Trade
+                  </a>
+                </td>
                 <td class="px-4 py-2 text-right space-x-3">
                   <a href="/signals/{{ sig.signal_id }}/base-rates" class="text-xs underline">base rates</a>
                   <a href="/signals/{{ sig.signal_id }}" class="text-xs underline" title="Open signal detail">Open</a>
@@ -162,6 +271,7 @@
               <span class="text-xs text-ink-500">{{ sig.as_of_date }}</span>
             </div>
             <div class="text-xs text-ink-700 mt-0.5 flex items-center gap-2">
+              <span>{{ badge(sig.side, "ok" if sig.side == "long" else "bad") }}</span>
               <span>{{ sig.strategy_name }} · score {{ "%.2f"|format(sig.score|float) if sig.score else "—" }}</span>
               <span>tech {{ tech_score(sig.tech_score) }}</span>
             </div>
@@ -170,7 +280,12 @@
               · stop <span class="text-bad-600">${{ "%.2f"|format(sig.suggested_stop|float) }}</span>
               · qty {{ sig.suggested_qty or "—" }}
             </div>
-            <div class="mt-2 flex gap-3">
+            <div class="mt-2 flex gap-3 items-center">
+              <a href="/signals/{{ sig.signal_id }}#paper-trade"
+                 class="inline-flex items-center gap-1 text-xs px-2 py-1 rounded border border-ok-600/30 bg-ok-100 text-ok-600"
+                 title="Open paper trade from this signal">
+                Trade
+              </a>
               <a href="/signals/{{ sig.signal_id }}/base-rates" class="text-xs underline">base rates</a>
               <a href="/signals/{{ sig.signal_id }}" class="text-xs underline" title="Open signal detail">Open</a>
             </div>
@@ -178,7 +293,7 @@
         {% endfor %}
       </ul>
     {% else %}
-      {{ empty("No passing signals in the last " ~ days ~ " days.", "🔍") }}
+      {{ empty("No passing signals match your filters.", "🔍") }}
     {% endif %}
   {% endcall %}
 

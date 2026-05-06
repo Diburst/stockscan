@@ -35,13 +35,14 @@ class RawSignal:
 
 @dataclass(frozen=True, slots=True)
 class PositionSnapshot:
-    """Minimal position view passed to Strategy.exit_rules()."""
+    """Minimal position view passed to Strategy.exit_rules() and ratchet_stop()."""
 
     symbol: str
     qty: int
     avg_cost: Decimal
     opened_at: datetime
     strategy: str
+    current_stop: Decimal | None = None
 
 
 @dataclass(frozen=True, slots=True)

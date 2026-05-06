@@ -312,6 +312,60 @@ trade_notes = Table(
     CheckConstraint("note_type IN ('entry','mid','exit','free')"),
 )
 
+# ----------------------------------------------------------------------
+# Paper trades (in-app simulated positions)
+# ----------------------------------------------------------------------
+paper_trades = Table(
+    "paper_trades",
+    metadata,
+    Column("paper_trade_id", BigInteger, primary_key=True),
+    Column("signal_id", BigInteger, ForeignKey("signals.signal_id"), nullable=False),
+    Column("strategy_name", Text, nullable=False),
+    Column("strategy_version", Text, nullable=False),
+    Column("symbol", Text, nullable=False),
+    Column("side", Text, nullable=False),
+    Column("entry_price", Numeric(14, 6), nullable=False),
+    Column("stop_price", Numeric(14, 6), nullable=False),
+    Column("target_price", Numeric(14, 6)),
+    Column("qty", Integer, nullable=False),
+    Column("opened_at", TIMESTAMP(timezone=True), nullable=False, server_default="NOW()"),
+    Column("entry_signal_metadata", JSONB),
+    Column("entry_tech_score", JSONB),
+    Column("entry_regime", JSONB),
+    Column("entry_strategy_params", JSONB),
+    Column("current_price", Numeric(14, 6)),
+    Column("unrealised_pnl", Numeric(14, 4)),
+    Column("unrealised_pnl_pct", Numeric(8, 4)),
+    Column("max_favorable_excursion", Numeric(8, 4)),
+    Column("max_adverse_excursion", Numeric(8, 4)),
+    Column("last_mark_at", TIMESTAMP(timezone=True)),
+    Column("status", Text, nullable=False, server_default="'open'"),
+    Column("closed_at", TIMESTAMP(timezone=True)),
+    Column("exit_price", Numeric(14, 6)),
+    Column("exit_reason", Text),
+    Column("realized_pnl", Numeric(14, 4)),
+    Column("realized_pnl_pct", Numeric(8, 4)),
+    Column("holding_days", Integer),
+    Column("exit_signal_metadata", JSONB),
+    Column("exit_tech_score", JSONB),
+    Column("exit_regime", JSONB),
+    Column("exit_strategy_params", JSONB),
+    Column("auto_close_rules", JSONB),
+    CheckConstraint("side IN ('long','short')"),
+    CheckConstraint("status IN ('open','closed')"),
+    CheckConstraint("qty > 0"),
+    ForeignKeyConstraint(
+        ["strategy_name", "strategy_version"],
+        ["strategy_versions.strategy_name", "strategy_versions.strategy_version"],
+    ),
+)
+Index("idx_paper_trades_status", paper_trades.c.status)
+Index("idx_paper_trades_symbol", paper_trades.c.symbol)
+Index("idx_paper_trades_signal", paper_trades.c.signal_id)
+
+# ----------------------------------------------------------------------
+# Trade note revisions
+# ----------------------------------------------------------------------
 trade_note_revisions = Table(
     "trade_note_revisions",
     metadata,

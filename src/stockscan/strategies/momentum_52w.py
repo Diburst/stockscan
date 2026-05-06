@@ -30,8 +30,10 @@ Implementation choices for this codebase:
     tags its 52-week high after a single news pop.
   * **ATR-based stop**, consistent with Donchian. Initial stop at
     entry - 2 x ATR(20).
-  * **Time-based exit** at 60 trading days (~12 weeks), which matches
-    the holding period in the original George-Hwang study.
+  * **Ratcheting ATR stop** — every 14 trading bars, the stop is
+    recomputed from the current price (close - 2×ATR). The engine
+    only moves the stop UP, so winning trades gradually lock in
+    profit without being forced out by an arbitrary time limit.
 
 The strategy is long-only. Regime affinity favours trending markets;
 in choppy regimes the position size is cut to 40% (mostly to dampen
@@ -82,11 +84,16 @@ class Momentum52WParams(StrategyParams):
     )
     atr_period: int = Field(20, ge=10, le=40)
     atr_stop_mult: float = Field(2.0, ge=1.0, le=4.0)
-    holding_days: int = Field(
-        60,
-        ge=20,
-        le=180,
-        description="Time-based exit after this many trading days",
+    ratchet_interval: int = Field(
+        14,
+        ge=5,
+        le=60,
+        description=(
+            "Every N trading bars, recompute the ATR-based stop from "
+            "the current price. The engine only ratchets UP (never "
+            "lowers the stop), so winning trades gradually lock in "
+            "profit without being forced out by an arbitrary time limit."
+        ),
     )
 
 
@@ -186,19 +193,18 @@ Initial stop = entry - 2 x ATR(20). Same as Donchian. ATR-scaled stops
 sized to "two typical days of movement" survive normal volatility and
 exit decisively when the regime really turns.
 
-### Time-based exit
+### Ratcheting ATR stop
 
-Pure 12-week hold (60 trading days), matching the original George-
-Hwang study. No trailing stop, no momentum-decay test — just hold for
-60 days, then close. The reason: the 52-week-high alpha is *already*
-empirically front-loaded into the first 12 weeks; trying to hold
-longer adds little return but a lot of correlated drawdown across
-positions.
+Every 14 trading bars, the stop is recomputed: ``close - 2 × ATR(20)``.
+The engine only accepts the new level if it's *higher* than the current
+stop — so the stop ratchets upward as the trade wins, gradually locking
+in profit. A flat or declining stock sees no stop ratchet (the new
+level is below the existing one), and will eventually be stopped out at
+the original or a previously ratcheted level.
 
-The fixed-holding-period rule is the strategy's biggest difference
-from Donchian — Donchian rides winners as long as the chandelier stop
-allows, which in trending environments can mean year-long holds. This
-strategy deliberately cycles capital faster.
+This replaces the earlier fixed-60-day exit. The time-based rule
+exited winners and losers alike; the ratcheting stop lets winners run
+while tightening risk on trades that stall.
 
 ## The rules in plain English
 
@@ -218,19 +224,19 @@ strategy deliberately cycles capital faster.
 
   - Stop = entry - 2 x ATR(20).
 
-**Exit** (one rule, evaluated daily):
+**Exit** (ratcheting stop, evaluated by the engine):
 
-  - Time-based: close the position after 60 trading days regardless of
-    P&L. The strategy's edge concentrates inside this window.
+  - Every 14 trading bars, the ATR-based stop is recomputed from the
+    current price and only ratcheted upward. The position closes when
+    today's low breaches the (ratcheted) stop level.
 
 ## What to expect when running this
 
   - **Modest trade frequency.** Maybe 5-15 entries per month per
     quartile of the universe in normal markets, fewer in heavy
     drawdowns when nothing is near its high.
-  - **Three-month holds.** Capital cycles roughly 4x per year per
-    position. That's both a feature (faster compounding) and a cost
-    (more turnover, slightly more slippage).
+  - **Variable hold lengths.** Strong trends can be held for months;
+    stalling positions are stopped out quickly as the ratchet tightens.
   - **Higher win rate than Donchian.** Historically ~50-55% in the
     backtest range, vs. Donchian's 35-45%. The trade-off: smaller
     asymmetry between wins and losses.
@@ -276,8 +282,9 @@ trend sleeve than either alone.
     similar closeness.
   - `atr_period = 20`, `atr_stop_mult = 2.0` — ATR-based initial stop
     matched to Donchian for cross-strategy consistency.
-  - `holding_days = 60` — ~12 weeks. Original George-Hwang holding
-    period.
+  - `ratchet_interval = 14` — recompute the ATR stop every 14 trading
+    bars. Balances between tightening fast enough to lock in profit
+    and giving the trade enough room to breathe between resets.
 
 ## Source
 
@@ -358,7 +365,7 @@ Letters*.
                     "slope_quality": round(slope_q, 4),
                     "max_close_52w": round(float(max_close), 4),
                     "atr": round(float(atr_v), 4),
-                    "holding_days": self.params.holding_days,
+                    "ratchet_interval": self.params.ratchet_interval,
                 },
             )
         ]
@@ -370,18 +377,53 @@ Letters*.
         bars: pd.DataFrame,
         as_of: date,
     ) -> ExitDecision | None:
-        # Time-based exit only. Position carries opened_at; if it has been
-        # open for ``holding_days`` trading days (approximated by calendar
-        # days x 5/7 — close enough for daily-bar exits), close it.
+        # No strategy-level exits — the stop-loss (initial + ratcheted)
+        # is enforced by the engine. The ratcheting stop gradually
+        # tightens as the trade moves in our favour, removing the need
+        # for an arbitrary time-based exit.
+        return None
+
+    # ------------------------------------------------------------------
+    def ratchet_stop(
+        self,
+        position: PositionSnapshot,
+        bars: pd.DataFrame,
+        as_of: date,
+    ) -> Decimal | None:
+        """Every ``ratchet_interval`` bars, recompute the ATR-based stop.
+
+        Returns the new stop level (current_close - mult × ATR). The
+        engine only accepts it if it's higher than the current stop, so
+        the stop ratchets upward as the trade wins — locking in profit
+        without forcing an exit on a winning trend.
+
+        Returns None on non-ratchet bars and when data is insufficient.
+        """
         if position.opened_at is None:
             return None
-        # ``opened_at`` is a tz-aware datetime; compare on .date().
-        days_held = (as_of - position.opened_at.date()).days
-        # Convert calendar to trading days at the standard 252/365 ratio.
-        trading_days_held = int(days_held * (252 / 365))
-        if trading_days_held >= self.params.holding_days:
-            return ExitDecision(reason="time_based_exit_60d", qty=position.qty)
-        return None
+
+        view = self._slice(bars, as_of)
+        if len(view) < self.params.atr_period + 5:
+            return None
+
+        # Count actual trading bars since entry.
+        entry_date = position.opened_at.date()
+        bars_since = view[view.index.date > entry_date]
+        n_bars = len(bars_since)
+        if n_bars == 0 or n_bars % self.params.ratchet_interval != 0:
+            return None
+
+        high = view["high"]
+        low = view["low"]
+        close = view["close"]
+        last_close = float(close.iloc[-1])
+
+        atr_v = atr(high, low, close, self.params.atr_period).iloc[-1]
+        if pd.isna(atr_v) or float(atr_v) <= 0:
+            return None
+
+        new_stop = round(last_close - self.params.atr_stop_mult * float(atr_v), 4)
+        return Decimal(str(new_stop))
 
     # ------------------------------------------------------------------
     @staticmethod
