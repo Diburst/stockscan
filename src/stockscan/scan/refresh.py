@@ -33,6 +33,7 @@ from stockscan.data.backfill import refresh_recent_days_bulk, trading_days_since
 from stockscan.scan.runner import ScanRunner, ScanSummary
 from stockscan.strategies import STRATEGY_REGISTRY, discover_strategies
 from stockscan.universe import current_constituents
+from stockscan.watchlist import watchlist_symbols
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -124,8 +125,16 @@ def refresh_signals(
 
     # ------------------------------------------------------------------
     # Phase 1: Bars catch-up via the bulk EOD endpoint.
+    #
+    # The universe is the current S&P 500 PLUS every symbol on the user's
+    # watchlist. The bulk endpoint already returns all US symbols for the
+    # day, so adding watchlist names to ``filter_to`` costs zero extra API
+    # calls — it just stops us from discarding bars for non-S&P-500 names
+    # the user explicitly cares about (e.g., POET). Without this, a watched
+    # small-cap would show "no bars" forever.
     # ------------------------------------------------------------------
     universe = set(current_constituents(session=session))
+    universe |= watchlist_symbols(session=session)
     dates = _bulk_dates(days_back)
     bars_upserted = 0
     if dates:

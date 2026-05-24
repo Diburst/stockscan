@@ -20,6 +20,7 @@ from sqlalchemy.orm import Session
 
 from stockscan.config import settings
 from stockscan.data.providers.eodhd import EODHDError, EODHDProvider
+from stockscan.positions.paper_store import check_auto_close, mark_to_market
 from stockscan.regime import get_regime
 from stockscan.regime.store import MarketRegime
 from stockscan.scan import refresh_signals, signals_freshness
@@ -295,6 +296,12 @@ async def refresh_endpoint(
         try:
             with EODHDProvider(api_key=api_key) as provider:
                 result = refresh_signals(provider, days_back=7, session=s)
+
+            # Propagate fresh bar data to paper trades: update P/L then
+            # auto-close any that hit stop/target/time exits.
+            trades_marked = mark_to_market(session=s)
+            trades_auto_closed = check_auto_close(session=s)
+
             refresh_summary = {
                 "bars_upserted": result.bars_upserted,
                 "bars_days_covered": result.bars_days_covered,
@@ -306,6 +313,8 @@ async def refresh_endpoint(
                     for f in result.failures
                 ],
                 "duration_seconds": round(result.duration_seconds, 1),
+                "trades_marked": trades_marked,
+                "trades_auto_closed": len(trades_auto_closed),
             }
         except EODHDError as exc:
             log.warning("signals refresh: provider error: %s", exc)
@@ -342,10 +351,17 @@ async def refresh_endpoint(
         return attach_hx_toast(response, "error", "Signal refresh failed")
     if refresh_summary:
         n_new = refresh_summary.get("signals_emitted", 0)
+        parts = [f"{n_new} new signal{'s' if n_new != 1 else ''}"]
+        n_marked = refresh_summary.get("trades_marked", 0)
+        n_closed = refresh_summary.get("trades_auto_closed", 0)
+        if n_marked:
+            parts.append(f"{n_marked} trade{'s' if n_marked != 1 else ''} marked")
+        if n_closed:
+            parts.append(f"{n_closed} auto-closed")
         return attach_hx_toast(
             response,
             "success",
-            f"Signals refreshed — {n_new} new signal{'s' if n_new != 1 else ''}",
+            f"Refreshed — {', '.join(parts)}",
         )
     return response
 

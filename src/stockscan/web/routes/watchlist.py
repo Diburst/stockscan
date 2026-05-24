@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from decimal import Decimal, InvalidOperation
 from typing import Literal
 
@@ -9,8 +10,11 @@ from fastapi import APIRouter, Depends, Form, Query, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from sqlalchemy.orm import Session
 
-from datetime import date as _date
+from datetime import date as _date, timedelta as _timedelta
 
+from stockscan.config import settings
+from stockscan.data.backfill import backfill_symbol
+from stockscan.data.providers.eodhd import EODHDProvider
 from stockscan.data.store import get_bars
 from stockscan.technical import compute_technical_score
 from stockscan.watchlist.store import (
@@ -27,6 +31,41 @@ from stockscan.web.deps import (
     render,
     safe,
 )
+
+log = logging.getLogger(__name__)
+
+# ~380 calendar days ≈ 270 trading days — comfortably covers the 252-bar
+# (52-week) lookbacks the Analysis page and the watchlist technical score
+# need, with margin for holidays.
+_BACKFILL_CALENDAR_DAYS = 380
+
+
+def _backfill_history(symbol: str) -> str:
+    """Best-effort one-time historical backfill for a newly-watched symbol.
+
+    Runs synchronously inside the Add request so the Analysis page and
+    technical score work immediately rather than filling in over months
+    of daily refreshes. Returns a short suffix for the success toast
+    (e.g., " — 271 bars backfilled"); never raises — a provider failure
+    just means the symbol is added without history and the next Refresh
+    will start catching it up.
+    """
+    api_key = settings.eodhd_api_key.get_secret_value()
+    if not api_key:
+        return " (set EODHD_API_KEY to fetch price history)"
+
+    start = _date.today() - _timedelta(days=_BACKFILL_CALENDAR_DAYS)
+
+    def _run() -> int:
+        with EODHDProvider(api_key=api_key) as provider:
+            return backfill_symbol(provider, symbol, start=start)
+
+    n_bars = safe(_run, label=f"watchlist.backfill[{symbol}]")
+    if n_bars is None:
+        return " — history backfill failed (see logs); next Refresh will retry"
+    if n_bars > 0:
+        return f" — {n_bars} bars backfilled"
+    return ""  # already up to date — no need to mention it
 
 router = APIRouter(prefix="/watchlist")
 
@@ -123,14 +162,18 @@ async def watchlist_add(
             f"Couldn't add {symbol.upper()}: {exc}",
         )
 
+    # One-time historical backfill so the symbol shows up on the watchlist
+    # AND in Analysis right away (not after months of 7-day refreshes).
+    # Best-effort: the symbol is already added at this point.
+    sym = symbol.strip().upper()
+    backfill_suffix = _backfill_history(sym)
+    msg = f"Added {sym} to watchlist{backfill_suffix}"
+    kind = "warn" if "failed" in backfill_suffix else "success"
+
     if _is_htmx(request):
         # Replace the form in-place; no page reload, no scroll jump.
-        return hx_toast_response(
-            _WATCHING_SNIPPET, "success", f"Added {symbol.upper()} to watchlist"
-        )
-    return flash_redirect(
-        redirect_to, "success", f"Added {symbol.upper()} to watchlist"
-    )
+        return hx_toast_response(_WATCHING_SNIPPET, kind, msg)
+    return flash_redirect(redirect_to, kind, msg)
 
 
 @router.post("/{watchlist_id}/delete")

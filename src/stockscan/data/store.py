@@ -76,8 +76,44 @@ def get_bars(
     interval: str = "1d",
     *,
     session: Session | None = None,
+    adjust: bool = True,
 ) -> pd.DataFrame:
-    """Return bars as a DataFrame indexed by `bar_ts` (UTC)."""
+    """Return bars as a DataFrame indexed by ``bar_ts`` (UTC).
+
+    **Split / dividend adjustment** (default ``adjust=True``)
+    ----------------------------------------------------------
+    Returned ``open / high / low / close / volume`` are split- and
+    dividend-adjusted using the ratio ``adj_close / close`` per bar,
+    so historical analysis (indicators, returns, backtests, charts)
+    sees a continuous price series across corporate actions like
+    AAPL's 2014 7:1 and 2020 4:1 splits.
+
+    Specifically::
+
+        adj_factor = adj_close / close   # per bar, NaN-safe
+        open       = open   * adj_factor
+        high       = high   * adj_factor
+        low        = low    * adj_factor
+        close      = adj_close
+        volume     = volume / adj_factor   # split-adjusted
+        adj_close  = adj_close             # unchanged, for reference
+
+    The unadjusted source values are preserved in
+    ``open_raw / high_raw / low_raw / close_raw / volume_raw`` for
+    consumers that genuinely need them — live "current price" labels,
+    tax-lot accounting, or order-placement code that needs the actual
+    quote of the day.
+
+    Pass ``adjust=False`` to opt out and get raw bars (no rename, no
+    factor applied) — useful for diagnostics and for the rare consumer
+    that doesn't want EODHD's dividend portion folded into prices.
+
+    Edge cases:
+      * Bars with NULL ``adj_close`` (legacy rows or the StubProvider)
+        get ``adj_factor = 1.0`` — i.e., no adjustment, behaves like raw.
+      * Bars with ``close <= 0`` (data corruption) also fall back to
+        ``adj_factor = 1.0`` to avoid divide-by-zero / inf.
+    """
     if isinstance(start, date) and not isinstance(start, datetime):
         start_dt = datetime(start.year, start.month, start.day, tzinfo=timezone.utc)
     else:
@@ -104,17 +140,61 @@ def get_bars(
             {"symbol": symbol, "interval": interval, "start": start_dt, "end": end_dt},
         )
         df = pd.DataFrame(result.mappings().all())
-        if not df.empty:
-            df["bar_ts"] = pd.to_datetime(df["bar_ts"], utc=True)
-            df = df.set_index("bar_ts")
-            for col in ("open", "high", "low", "close", "adj_close"):
-                df[col] = df[col].astype(float)
+        if df.empty:
+            return df
+        df["bar_ts"] = pd.to_datetime(df["bar_ts"], utc=True)
+        df = df.set_index("bar_ts")
+        for col in ("open", "high", "low", "close", "adj_close"):
+            df[col] = df[col].astype(float)
+        df["volume"] = df["volume"].astype(float)
+        if adjust:
+            df = _apply_split_adjustment(df)
         return df
 
     if session is not None:
         return _run(session)
     with session_scope() as s:
         return _run(s)
+
+
+def _apply_split_adjustment(df: pd.DataFrame) -> pd.DataFrame:
+    """Replace OHLCV with split- and dividend-adjusted values; preserve raw.
+
+    The adjustment factor is ``adj_close / close`` per bar. Bars
+    missing ``adj_close`` or with a non-positive ``close`` use
+    ``adj_factor = 1.0`` (no-op) so we never produce NaN or inf in
+    the returned DataFrame.
+
+    Mutates ``df`` in place AND returns it for chaining.
+    """
+    close = df["close"]
+    adj_close = df["adj_close"]
+    safe_mask = close.gt(0) & close.notna() & adj_close.notna()
+    adj_factor = pd.Series(1.0, index=df.index, dtype=float)
+    if safe_mask.any():
+        adj_factor.loc[safe_mask] = adj_close.loc[safe_mask] / close.loc[safe_mask]
+
+    # Preserve raw (unadjusted) values for the rare consumer that
+    # needs the actual quote-of-the-day prices.
+    for raw_col in ("open", "high", "low", "close", "volume"):
+        df[f"{raw_col}_raw"] = df[raw_col]
+
+    # Apply the adjustment. close becomes adj_close exactly (avoids
+    # round-trip float drift from multiplying then dividing); the
+    # other prices are scaled by the ratio so OHLC stays internally
+    # consistent (e.g., ATR's true-range computation).
+    df["open"] = df["open"] * adj_factor
+    df["high"] = df["high"] * adj_factor
+    df["low"] = df["low"] * adj_factor
+    df["close"] = adj_close
+    # Volume scales inversely — a 4:1 split quadruples share count, so
+    # share-volume should multiply by 4 to keep dollar-volume
+    # consistent. Using the same factor folds in dividend adjustment
+    # too, but that fraction is tiny relative to splits and harmless
+    # for liquidity filters.
+    df["volume"] = df["volume"] / adj_factor
+
+    return df
 
 
 def latest_bar_date(symbol: str, *, session: Session | None = None) -> date | None:
