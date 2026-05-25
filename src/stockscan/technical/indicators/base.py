@@ -76,6 +76,21 @@ class TechnicalIndicator(ABC):
     description: ClassVar[str] = ""
     params_model: ClassVar[type[TechnicalIndicatorParams]]
 
+    # --- v2 composite metadata (signal-scoring spec §3/§6) ---
+    # kind: "directional" contributes a signed [-1,+1] vote to the reversal
+    #       composite; "confirmation" returns a [0,1] conviction multiplier that
+    #       can only scale |D|, never flip its sign.
+    kind: ClassVar[str] = "directional"
+    # weight: relative weight of a directional vote in the composite.
+    weight: ClassVar[float] = 1.0
+    # reinforce_only: a directional indicator (trend_location) that may only
+    #       *reinforce* the core reversal direction — when its sign disagrees
+    #       with the core it abstains rather than vetoing (spec §6).
+    reinforce_only: ClassVar[bool] = False
+    # in_score: legacy indicators (rsi/macd) set this False to stay registered
+    #       (and directly testable) while being excluded from the v2 score.
+    in_score: ClassVar[bool] = True
+
     __abstract__: ClassVar[bool] = False
 
     def __init__(self, params: TechnicalIndicatorParams | None = None) -> None:

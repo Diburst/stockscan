@@ -179,12 +179,12 @@ class TestApplicableRegimesShim:
 # --------------------------------------------------------------------------
 class TestShippedStrategiesAffinity:
     def test_donchian_trend(self):
-        from stockscan.strategies.donchian_trend import DonchianTrend
+        from stockscan.strategies.donchian_trend import DonchianBreakout
 
-        assert DonchianTrend.affinity_for("trending_up") == 1.0
-        assert DonchianTrend.affinity_for("trending_down") == 1.0
-        assert DonchianTrend.affinity_for("choppy") == 0.25
-        assert DonchianTrend.affinity_for("transitioning") == 0.5
+        assert DonchianBreakout.affinity_for("trending_up") == 1.0
+        assert DonchianBreakout.affinity_for("trending_down") == 1.0
+        assert DonchianBreakout.affinity_for("choppy") == 0.25
+        assert DonchianBreakout.affinity_for("transitioning") == 0.5
 
     def test_rsi2_meanrev_zeros_in_trending_down(self):
         from stockscan.strategies.rsi2_meanrev import RSI2MeanReversion
@@ -232,9 +232,9 @@ class TestAffinityDoesNotBreakStrategies:
             STRATEGY_REGISTRY._by_name.pop("test_live_strat", None)
 
     def test_affinity_for_returns_a_float(self):
-        from stockscan.strategies.donchian_trend import DonchianTrend
+        from stockscan.strategies.donchian_trend import DonchianBreakout
 
-        v = DonchianTrend.affinity_for("trending_up")
+        v = DonchianBreakout.affinity_for("trending_up")
         assert isinstance(v, float)
 
 

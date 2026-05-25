@@ -60,6 +60,18 @@ def run_nightly_scan(
     # 1. Refresh recent EOD bars via the bulk endpoint.
     bars_upserted = _refresh_recent_bars(as_of)
 
+    # 1b. Rebuild equal-weight sector composites from the freshly-refreshed bars,
+    #     BEFORE the scans so sector_rs sees today's data. Full rebuild is
+    #     idempotent and uses only local bars (no API calls); it can be swapped
+    #     for an incremental append later if the read cost becomes an issue.
+    try:
+        from stockscan.sectors.store import DEFAULT_BASE_START, refresh_sector_composites
+
+        composites = refresh_sector_composites(DEFAULT_BASE_START, as_of)
+        log.info("nightly: rebuilt %d sector composites", len(composites))
+    except Exception as exc:
+        log.error("nightly: sector-composite rebuild failed: %s", exc)
+
     # 2. Run every registered strategy.
     runner = ScanRunner()
     scans: list[ScanSummary] = []

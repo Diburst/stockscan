@@ -59,6 +59,11 @@ Watchlist + technical:
 Backtesting:
   stockscan backtest run STRATEGY        — event-driven backtest, persists results
   stockscan backtest list                — saved backtest runs
+  stockscan backtest debug SYMBOL        — per-day reversal-score breakdown for one
+                                            symbol: why entries/exits (don't) fire.
+                                            Recomputes the exact score the backtest
+                                            sees; flags ENTER days, top-exit days,
+                                            per-indicator sub-scores. --all / --csv.
 
 Scheduled jobs (production: invoked by launchd):
   stockscan jobs nightly-scan            — refresh + scan + alerts + notify
@@ -112,6 +117,10 @@ analysis_app = typer.Typer(
     help="Per-symbol technical analysis: levels, trend, vol, options context.",
     no_args_is_help=True,
 )
+composites_app = typer.Typer(
+    help="Equal-weight sector composites (for cross-sectional relative strength).",
+    no_args_is_help=True,
+)
 app.add_typer(db_app, name="db")
 app.add_typer(refresh_app, name="refresh")
 app.add_typer(strat_app, name="strategies")
@@ -123,6 +132,7 @@ app.add_typer(technical_app, name="technical")
 app.add_typer(ml_app, name="ml")
 app.add_typer(signals_app, name="signals")
 app.add_typer(analysis_app, name="analysis")
+app.add_typer(composites_app, name="composites")
 
 
 # ----------------------------------------------------------------------
@@ -1040,6 +1050,218 @@ def backtest_list(
     console.print(table)
 
 
+@backtest_app.command("debug")
+def backtest_debug(
+    symbol: str = typer.Argument(..., help="Ticker to inspect (e.g. TSLA)."),
+    strategy: str = typer.Option(
+        "reversal_swing", "--strategy", help="Registered strategy name."
+    ),
+    start: str = typer.Option("2022-01-01", "--from", help="ISO start date."),
+    end: str | None = typer.Option(None, "--to", help="ISO end date; default = today."),
+    show_all: bool = typer.Option(
+        False, "--all", help="Print every trading day, not just signal / near-threshold days."
+    ),
+    band: float = typer.Option(
+        0.10, "--band", help="'Near a threshold' = score within this of entry/exit threshold."
+    ),
+    csv_path: str | None = typer.Option(
+        None, "--csv", help="Write the full per-day breakdown to this CSV path."
+    ),
+) -> None:
+    """Per-day reversal-score breakdown for ONE symbol — why entries/exits (don't) fire.
+
+    Recomputes the *same* signed reversal score the backtester sees, on the same
+    sliced + tailed window, for every trading day in the range. For each day it
+    shows the composite score, its directional core ``D`` and confirmation factor
+    ``C``, every contributing indicator's sub-score, and whether the strategy
+    would ENTER (``signals()`` fires) or is at a top (score ≤ −exit_threshold).
+
+    Use it to localize a surprising backtest: too few entries, never exiting, one
+    indicator dominating, or two signals that never line up on the same day. The
+    summary panel reports score percentiles, per-indicator coverage, and a
+    bottom-signal co-occurrence check (the turn vs. the level firing together).
+    """
+    from datetime import date as _date, timedelta as _timedelta
+
+    import pandas as _pd
+
+    from stockscan.data.store import get_bars
+    from stockscan.technical.indicators import discover_technical_indicators
+    from stockscan.technical.score import compute_technical_score
+
+    discover_strategies()
+    discover_technical_indicators()
+    try:
+        cls = STRATEGY_REGISTRY.get(strategy)
+    except KeyError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1)
+
+    params = cls.params_model()
+    strat = cls(params)
+    entry_th = float(getattr(params, "entry_threshold", 0.35))
+    exit_th = float(getattr(params, "exit_threshold", 0.35))
+    req = strat.required_history()
+
+    start_d = _date.fromisoformat(start)
+    end_d = _date.fromisoformat(end) if end else _date.today()
+
+    # Same generous warmup window the backtest engine pulls (req + buffer), so the
+    # earliest in-range day already has enough history for the 200-day terms.
+    warmup = max(250, req) + 30
+    bars = get_bars(symbol, start_d - _timedelta(days=warmup * 2), end_d)
+    if bars is None or bars.empty:
+        console.print(
+            f"[red]No bars for {symbol}.[/red] Backfill first: "
+            f"[cyan]stockscan refresh bars {symbol}[/cyan]"
+        )
+        raise typer.Exit(1)
+    bars = bars.sort_index()
+    bars.attrs["symbol"] = symbol  # sector_rs reads this
+
+    trading_days = [d for d in sorted({ts.date() for ts in bars.index}) if start_d <= d <= end_d]
+    if not trading_days:
+        console.print(f"[yellow]No trading days for {symbol} in {start_d}..{end_d}.[/yellow]")
+        raise typer.Exit(1)
+
+    console.print(
+        f"[cyan]Debugging {cls.display_name} {cls.version} on {symbol}[/cyan]  "
+        f"{trading_days[0]} → {trading_days[-1]}  "
+        f"(entry ≥ {entry_th:+.2f}, top ≤ {-exit_th:+.2f})"
+    )
+
+    rows: list[dict] = []
+    for as_of in trading_days:
+        view = bars[bars.index.date <= as_of]
+        view.attrs["symbol"] = symbol
+        if len(view) < req:
+            rows.append({"date": as_of, "close": float(view["close"].iloc[-1]) if len(view) else None,
+                         "score": None, "decision": "warmup"})
+            continue
+        view_tail = view.tail(req + 5)
+        view_tail.attrs["symbol"] = symbol
+        sc = compute_technical_score(cls, view_tail, as_of)
+        fired = bool(strat.signals(view, as_of))  # authoritative ENTER (incl. ATR guard)
+
+        b = sc.breakdown if sc else {}
+        meta = b.get("_meta", {})
+        score = sc.score if sc else None
+        row = {
+            "date": as_of,
+            "close": round(float(view["close"].iloc[-1]), 2),
+            "score": None if score is None else round(score, 4),
+            "D": meta.get("D"),
+            "C": meta.get("C"),
+            "reversal_trigger": b.get("reversal_trigger", {}).get("score"),
+            "pivot_proximity": b.get("pivot_proximity", {}).get("score"),
+            "sector_rs": b.get("sector_rs", {}).get("score"),
+            "trend_location": b.get("trend_location", {}).get("score"),
+            "volume_confirm": b.get("volume_confirm", {}).get("multiplier"),
+        }
+        if fired:
+            row["decision"] = "ENTER"
+        elif score is not None and score <= -exit_th:
+            row["decision"] = "top"
+        else:
+            row["decision"] = ""
+        rows.append(row)
+
+    df = _pd.DataFrame(rows)
+
+    # ---- per-day table (filtered unless --all) ----
+    def _near(s) -> bool:
+        if s is None:
+            return False
+        return (s >= entry_th - band) or (s <= -exit_th + band)
+
+    if show_all:
+        shown = rows
+    else:
+        shown = [r for r in rows if r.get("decision") in ("ENTER", "top") or _near(r.get("score"))]
+
+    table = Table(title=f"{symbol} — per-day reversal score", show_lines=False)
+    for col in ("date", "close", "score", "D", "C", "trig", "pivot", "sec_rs", "trend", "vol×", ""):
+        table.add_column(col, justify="right" if col not in ("date", "") else "left")
+
+    def _f(x):
+        return f"{x:+.3f}" if isinstance(x, (int, float)) else "·"
+
+    if not shown:
+        console.print(
+            "[yellow]No ENTER, top, or near-threshold days to show.[/yellow] "
+            "Use [cyan]--all[/cyan] to print every day."
+        )
+    else:
+        for r in shown[:400]:
+            dec = r.get("decision", "")
+            dec_str = (
+                "[green]ENTER[/green]" if dec == "ENTER"
+                else "[red]top[/red]" if dec == "top"
+                else dec
+            )
+            table.add_row(
+                str(r["date"]),
+                f"{r['close']:.2f}" if r.get("close") is not None else "·",
+                _f(r.get("score")), _f(r.get("D")), _f(r.get("C")),
+                _f(r.get("reversal_trigger")), _f(r.get("pivot_proximity")),
+                _f(r.get("sector_rs")), _f(r.get("trend_location")),
+                _f(r.get("volume_confirm")), dec_str,
+            )
+        console.print(table)
+        if len(shown) > 400:
+            console.print(f"[dim]… {len(shown) - 400} more rows (use --csv to export all).[/dim]")
+
+    # ---- summary ----
+    scored = df[df["score"].notna()] if "score" in df else df.iloc[0:0]
+    n_days = len(df)
+    n_warmup = int((df.get("decision") == "warmup").sum()) if "decision" in df else 0
+    n_none = int(df["score"].isna().sum()) - n_warmup if "score" in df else 0
+    n_enter = int((df.get("decision") == "ENTER").sum()) if "decision" in df else 0
+    n_top = int((df.get("decision") == "top").sum()) if "decision" in df else 0
+
+    summary = Table(title="summary", show_header=False)
+    summary.add_column("k")
+    summary.add_column("v", justify="right")
+    summary.add_row("trading days", str(n_days))
+    summary.add_row("warmup (too little history)", str(n_warmup))
+    summary.add_row("score = None (all directional abstained)", str(n_none))
+    if len(scored):
+        s = scored["score"].astype(float)
+        summary.add_row("score min / median / max", f"{s.min():+.3f} / {s.median():+.3f} / {s.max():+.3f}")
+        summary.add_row("score p25 / p75", f"{s.quantile(.25):+.3f} / {s.quantile(.75):+.3f}")
+    summary.add_row(f"ENTER days (score ≥ {entry_th:+.2f}, ATR ok)", f"[green]{n_enter}[/green]")
+    summary.add_row(f"top days (score ≤ {-exit_th:+.2f})", f"[red]{n_top}[/red]")
+
+    # Per-indicator coverage + mean signed contribution (helps spot a dead/dominant signal).
+    for ind in ("reversal_trigger", "pivot_proximity", "sector_rs", "trend_location", "volume_confirm"):
+        if ind not in df:
+            continue
+        col = df[ind].dropna().astype(float)
+        if len(col) == 0:
+            summary.add_row(f"  {ind}", "[dim]never contributed[/dim]")
+        else:
+            cover = 100.0 * len(col) / max(n_days, 1)
+            summary.add_row(f"  {ind}", f"{cover:.0f}% of days, mean {col.mean():+.3f}")
+
+    # Bottom-signal co-occurrence: the turn (reversal_trigger) vs. the level
+    # (pivot_proximity). If each fires often alone but rarely together, the core
+    # never gets large enough to clear the entry threshold — the classic reason a
+    # reversal entry "almost" triggers but doesn't.
+    if {"reversal_trigger", "pivot_proximity"} <= set(df.columns):
+        rt = df["reversal_trigger"].fillna(0.0).astype(float)
+        pv = df["pivot_proximity"].fillna(0.0).astype(float)
+        turn = rt >= 0.5
+        level = pv >= 0.3
+        summary.add_row("turn (trig ≥ .50) days", str(int(turn.sum())))
+        summary.add_row("at-a-level (pivot ≥ .30) days", str(int(level.sum())))
+        summary.add_row("[bold]both same day[/bold]", f"[bold]{int((turn & level).sum())}[/bold]")
+    console.print(summary)
+
+    if csv_path:
+        df.to_csv(csv_path, index=False)
+        console.print(f"[green]✓[/green] wrote per-day breakdown → {csv_path}")
+
+
 # ----------------------------------------------------------------------
 # Provider context manager (handles cleanup)
 # ----------------------------------------------------------------------
@@ -1649,6 +1871,75 @@ def analysis_run_cmd(
             for obs in a.options_context.observations:
                 console.print(f"  • {obs}")
             console.print()
+
+
+@composites_app.command("build")
+def composites_build_cmd(
+    start: str = typer.Option(
+        "2007-01-01", "--start", help="ISO date for the initial backfill."
+    ),
+    end: str | None = typer.Option(
+        None, "--end", help="ISO date; default = today."
+    ),
+    min_members: int = typer.Option(
+        3, "--min-members", help="Min constituents with data for a sector's daily return to count."
+    ),
+) -> None:
+    """Build equal-weight, daily-rebalanced total-return sector composites and
+    upsert them as ``$EWSECTOR:<CODE>`` instruments in the bars hypertable.
+
+    These power the ``sector_rs`` relative-strength signal (signal-scoring spec
+    §4.3 / §8). Point-in-time correct: uses historical S&P 500 membership
+    (``universe_history``) and bars only up to each date — a full rebuild
+    reproduces the same series, so re-running is safe and idempotent.
+
+    Examples:
+        stockscan composites build                      # 2007-today
+        stockscan composites build --start 2015-01-01
+        stockscan composites build --min-members 5
+    """
+    from stockscan.sectors.store import refresh_sector_composites
+
+    start_d = date.fromisoformat(start)
+    end_d = date.fromisoformat(end) if end else date.today()
+
+    console.print(
+        f"[cyan]→[/cyan] building sector composites ({start_d} to {end_d}, "
+        f"min_members={min_members})"
+    )
+    counts = refresh_sector_composites(start_d, end_d, min_members=min_members)
+
+    if not counts:
+        console.print(
+            "[yellow]No composites written.[/yellow] Check that fundamentals "
+            "(sectors), universe membership, and bars are populated."
+        )
+        raise typer.Exit(1)
+
+    table = Table(title="Sector composites")
+    table.add_column("Symbol", style="cyan")
+    table.add_column("Bars", justify="right")
+    for sym in sorted(counts):
+        table.add_row(sym, f"{counts[sym]:,}")
+    console.print(table)
+    console.print(f"[green]✓[/green] {len(counts)} composites, {sum(counts.values()):,} bars upserted")
+
+
+@composites_app.command("symbol")
+def composites_symbol_cmd(
+    symbol: str = typer.Argument(..., help="Ticker to resolve to its sector composite."),
+) -> None:
+    """Show which ``$EWSECTOR:<CODE>`` composite a stock benchmarks against."""
+    from stockscan.sectors.store import sector_composite_symbol_for
+
+    comp = sector_composite_symbol_for(symbol.upper())
+    if comp is None:
+        console.print(
+            f"[yellow]{symbol.upper()}[/yellow] has no recorded sector — "
+            "sector_rs would abstain. Run `stockscan refresh fundamentals` first."
+        )
+        raise typer.Exit(1)
+    console.print(f"{symbol.upper()} → [cyan]{comp}[/cyan]")
 
 
 def main() -> None:

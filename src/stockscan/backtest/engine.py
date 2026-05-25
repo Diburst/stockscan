@@ -148,6 +148,18 @@ class BacktestEngine:
         # Regime label cache: date -> RegimeLabel | None. Computed once per
         # trading day from SPY bars. None means SPY data was insufficient.
         self._regime_cache: dict[date, str | None] = {}
+        # Point-in-time membership cache: members_as_of() is one DB query per
+        # trading day; cache it so a multi-year run pays it once per date.
+        self._members_cache: dict[date, list[str]] = {}
+
+        # Reset sector_rs's run-scoped caches so this run fetches fresh composites
+        # (and doesn't reuse a prior run's). Eliminates ~2 DB round-trips per
+        # (symbol, day) — the dominant backtest cost.
+        try:
+            from stockscan.technical.indicators.sector_rs import clear_cache as _clear_rs
+            _clear_rs()
+        except Exception:
+            pass
 
         self.filter_chain = FilterChain.default(
             max_positions=config.max_positions,
@@ -496,7 +508,11 @@ class BacktestEngine:
     def _daily_universe(self, today: date) -> list[str]:
         if self.config.universe is not None:
             return self.config.universe
-        return members_as_of(today)
+        cached = self._members_cache.get(today)
+        if cached is None:
+            cached = members_as_of(today)
+            self._members_cache[today] = cached
+        return cached
 
     def _bars(self, symbol: str, as_of: date) -> pd.DataFrame:
         cached = self._bars_cache.get(symbol)
@@ -511,7 +527,15 @@ class BacktestEngine:
             self._bars_cache[symbol] = cached
         if cached.empty:
             return cached
-        return cached[cached.index.date <= as_of]
+        # Slice to bars on/before `as_of` via O(log n) searchsorted on the sorted
+        # index, returning a view. The old `cached[cached.index.date <= as_of]`
+        # built a Python-date object array and a boolean-mask copy on EVERY call
+        # (millions of times in a full-universe run) — the single biggest CPU sink.
+        bound = pd.Timestamp(as_of) + pd.Timedelta(days=1)  # midnight after as_of
+        if cached.index.tz is not None:
+            bound = bound.tz_localize(cached.index.tz)
+        pos = cached.index.searchsorted(bound, side="left")
+        return cached.iloc[:pos]
 
     # ---------------------------------------------------------------------
     # Regime

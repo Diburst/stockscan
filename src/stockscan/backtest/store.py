@@ -15,6 +15,7 @@ from sqlalchemy.orm import Session
 
 from stockscan.backtest.engine import BacktestResult
 from stockscan.db import session_scope
+from stockscan.strategies.registration import ensure_strategy_version
 
 
 def save_run(result: BacktestResult, *, note: str | None = None) -> int:
@@ -45,6 +46,9 @@ def save_run(result: BacktestResult, *, note: str | None = None) -> int:
     )
 
     with session_scope() as s:
+        # A backtest of a brand-new strategy may be the first time it's seen —
+        # ensure its strategy_versions row exists (backtest_runs FKs to it).
+        ensure_strategy_version(cfg.strategy_cls, session=s)
         row = s.execute(
             insert_run,
             {

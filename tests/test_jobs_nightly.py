@@ -141,8 +141,8 @@ def test_skipped_strategy_appears_in_body_not_in_totals():
     assert "donchian_trend" in body
     # The skipped one should show the paused marker
     assert "paused" in body
-    # Strategies run count should note the pause
-    assert "paused by regime" in body
+    # The pause marker should attribute the cause to the regime.
+    assert "paused (regime=" in body
 
 
 def test_no_regime_shows_unknown():

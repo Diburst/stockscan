@@ -50,14 +50,37 @@ def test_no_signal_when_below_recent_high(strategy):
         assert float(s.suggested_entry) > chan
 
 
-def test_signal_fires_on_breakout(strategy):
-    """Build a trending series that ends at a fresh 20-day high."""
+def test_signal_fires_on_breakout():
+    """The CORE breakout trigger fires on a fresh 20-day high.
+
+    This targets the breakout mechanics, so the v1.2 *quality* filters
+    (tight-base consolidation, volatility contraction, already-soared cap,
+    pre-breakout RSI cap, volume multiple, relative strength, turtle-1L) are
+    disabled via the documented backward-compat toggles — those filters have
+    their own dedicated tests. A 30-day ramp to new highs is exactly the
+    "already soared / no tight base" shape v1.2 rejects, which is correct
+    behavior, not a breakout-trigger bug.
+    """
+    core = DonchianBreakout(
+        DonchianParams(
+            adx_min=10.0,
+            require_base_consolidation=False,
+            require_vol_contraction=False,
+            max_pct_above_sma50=0.0,      # 0 disables the already-soared cap
+            max_rsi_pre_breakout=100.0,   # disables the pre-breakout RSI cap
+            volume_mult=1.0,              # constant test volume → no volume filter
+            require_vol_expansion=False,
+            enable_turtle_1l=False,
+            enable_relative_strength=False,  # no benchmark bars in a unit test
+            entry_periods=[20],
+        )
+    )
     # 70 days flat in [98, 102], then a 30-day uptrend pushing to new highs.
     rng = np.random.default_rng(0)
     flat = (100 + rng.normal(0, 0.5, 70)).tolist()
     up = np.linspace(102, 130, 30).tolist()
     bars = _make_bars(flat + up)
-    sigs = strategy.signals(bars, as_of=bars.index[-1].date())
+    sigs = core.signals(bars, as_of=bars.index[-1].date())
     assert len(sigs) == 1
     sig = sigs[0]
     assert sig.side == "long"

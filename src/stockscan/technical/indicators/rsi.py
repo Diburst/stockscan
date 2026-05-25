@@ -42,6 +42,9 @@ class TechnicalRSI(TechnicalIndicator):
         "high (but not extreme) RSI confirms trend-following entries."
     )
     params_model = RSITechParams
+    # Retired from the v2 reversal score (its momentum is captured more
+    # orthogonally by reversal_trigger). Kept registered + directly testable.
+    in_score = False
 
     # ------------------------------------------------------------------
     def values(self, bars: pd.DataFrame, as_of: date) -> dict[str, float] | None:

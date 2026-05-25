@@ -53,6 +53,8 @@ class TechnicalMACD(TechnicalIndicator):
         "histogram that's accelerating."
     )
     params_model = MACDTechParams
+    # Retired from the v2 reversal score (collinear with RSI). Kept registered.
+    in_score = False
 
     def values(self, bars: pd.DataFrame, as_of: date) -> dict[str, float] | None:
         # Need at least slow + signal periods + a bit of warmup for two

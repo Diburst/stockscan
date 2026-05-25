@@ -46,6 +46,7 @@ from stockscan.strategies import (
     Strategy,
     discover_strategies,
 )
+from stockscan.strategies.registration import ensure_strategy_version
 from stockscan.technical import compute_technical_score, upsert_score
 from stockscan.universe import current_constituents, members_as_of
 
@@ -329,29 +330,9 @@ class ScanRunner:
         strategy_cls: type[Strategy],
     ) -> tuple[int, Any]:
         """Make sure strategy_versions + strategy_configs rows exist; return config_id + params."""
-        # version row
-        s.execute(
-            text(
-                """
-                INSERT INTO strategy_versions
-                    (strategy_name, strategy_version, display_name, description, tags,
-                     params_json_schema, code_fingerprint)
-                VALUES
-                    (:n, :v, :dn, :d, :t,
-                     CAST(:schema AS JSONB), :fp)
-                ON CONFLICT (strategy_name, strategy_version) DO NOTHING;
-                """
-            ),
-            {
-                "n": strategy_cls.name,
-                "v": strategy_cls.version,
-                "dn": strategy_cls.display_name,
-                "d": strategy_cls.description,
-                "t": list(strategy_cls.tags),
-                "schema": json.dumps(strategy_cls.params_json_schema()),
-                "fp": strategy_cls.code_fingerprint(),
-            },
-        )
+        # version row — shared with the backtester (backtest.store) so a strategy
+        # registers identically whether it's first seen by a scan or a backtest.
+        ensure_strategy_version(strategy_cls, session=s)
 
         # active config — if none exists, create with defaults
         existing = s.execute(

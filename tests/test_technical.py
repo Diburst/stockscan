@@ -51,6 +51,24 @@ def _bars_with_uptrend(n: int = 80) -> pd.DataFrame:
     }, index=idx)
 
 
+def _bars_with_moderate_uptrend(n: int = 80) -> pd.DataFrame:
+    """A rising-but-not-extreme uptrend (repeating +1,+1,-1 deltas) so RSI(14)
+    lands in the high band (~69) rather than pinned near 100. The monotonic
+    _bars_with_uptrend saturates RSI ≥ 80, which the trend branch correctly caps
+    at +0.5 (covered by test_rsi_extreme_high_capped_for_trend)."""
+    deltas = [(1, 1, -1)[i % 3] for i in range(n)]
+    closes = list(80 + np.cumsum(deltas))
+    idx = pd.date_range("2024-01-02", periods=n, freq="B", tz="UTC")
+    return pd.DataFrame({
+        "open": closes,
+        "high": [c + 1 for c in closes],
+        "low": [c - 1 for c in closes],
+        "close": closes,
+        "adj_close": closes,
+        "volume": [1_000_000] * n,
+    }, index=idx)
+
+
 def _strategy(*tags: str) -> SimpleNamespace:
     return SimpleNamespace(name="fake", tags=tags)
 
@@ -79,8 +97,9 @@ def test_rsi_low_value_contradicts_trend_following():
 
 
 def test_rsi_high_value_confirms_trend_following():
-    """In a sustained uptrend, RSI is high → confirms a breakout entry."""
-    bars = _bars_with_uptrend(80)
+    """In a healthy (not extreme) uptrend, RSI is high → confirms a breakout
+    entry with a score above the neutral 0.5 but below the exhaustion cap."""
+    bars = _bars_with_moderate_uptrend(80)
     rsi = TechnicalRSI()
     values = rsi.values(bars, bars.index[-1].date())
     score = rsi.score(values, _strategy("trend_following", "breakout"))
@@ -200,14 +219,16 @@ def test_macd_histogram_definition():
 # ----------------------------------------------------------------------
 # Composite scoring
 # ----------------------------------------------------------------------
-def test_composite_averages_indicator_scores():
+def test_composite_uses_v2_reversal_indicators():
     bars = _bars_with_uptrend(80)
     result = compute_technical_score(_strategy("trend_following"), bars, bars.index[-1].date())
     assert result is not None
     assert -1 <= result.score <= 1
-    # Both indicators should have weighed in
-    assert result.contributing >= 1
-    assert "rsi" in result.breakdown
+    # v2 reversal indicators contribute; legacy rsi/macd are retired from the score.
+    assert "reversal_trigger" in result.breakdown
+    assert "rsi" not in result.breakdown
+    assert "macd" not in result.breakdown
+    assert result.breakdown["_meta"]["methodology_version"] == 2
 
 
 def test_composite_returns_none_on_empty_bars():
@@ -216,24 +237,24 @@ def test_composite_returns_none_on_empty_bars():
     assert result is None
 
 
-def test_composite_strategy_aware():
-    """Same bars, different strategies → different composite scores."""
+def test_composite_is_signed_and_bounded():
+    """v2 reversal score is signed and in [-1, 1]. (The only strategy-tag-sensitive
+    input, sector_rs, needs the DB and abstains in unit tests, so the reversal
+    score is effectively strategy-independent here — a deliberate v2 change.)"""
     bars = _bars_with_constant_then_dip(60, 4)
     as_of = bars.index[-1].date()
-    mr = compute_technical_score(_strategy("mean_reversion"), bars, as_of)
-    tf = compute_technical_score(_strategy("trend_following"), bars, as_of)
-    assert mr is not None and tf is not None
-    # Pullback environment confirms MR, contradicts TF
-    assert mr.score > tf.score
+    r = compute_technical_score(_strategy("mean_reversion"), bars, as_of)
+    assert r is not None
+    assert -1.0 <= r.score <= 1.0
+    assert r.breakdown["_meta"]["methodology_version"] == 2
 
 
 def test_composite_neutral_mode():
-    """strategy=None should produce a real score (bullish bias) without
-    requiring any specific tag."""
+    """strategy=None (watchlist) still produces a real signed score in range."""
     bars = _bars_with_uptrend(80)
     result = compute_technical_score(None, bars, bars.index[-1].date())
     assert result is not None
-    assert result.score > 0  # uptrend → bullish bias
+    assert -1.0 <= result.score <= 1.0
 
 
 def test_composite_breakdown_round_trips_to_dict():

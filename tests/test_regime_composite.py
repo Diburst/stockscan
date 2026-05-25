@@ -75,7 +75,10 @@ class TestNoLookAhead:
     def test_hy_oas_zscore_is_truncation_invariant(self, hy_oas_synthetic, truncate_at):
         full = hy_oas_zscore(hy_oas_synthetic)
         truncated = hy_oas_zscore(hy_oas_synthetic.iloc[: truncate_at + 1])
-        assert truncated.iloc[-1] == pytest.approx(full.iloc[truncate_at], rel=1e-12)
+        # nan_ok: at the series tail the synthetic walk hits the 2.5 clip floor,
+        # so a trailing 252-window can have zero variance → z is NaN. NaN==NaN is
+        # still truncation-invariant, which is what this property asserts.
+        assert truncated.iloc[-1] == pytest.approx(full.iloc[truncate_at], rel=1e-12, nan_ok=True)
 
     @pytest.mark.parametrize("truncate_at", [260, 300, 400, 499])
     def test_credit_stress_flag_is_truncation_invariant(self, hy_oas_synthetic, truncate_at):
@@ -180,16 +183,18 @@ class TestTrendScore:
     def test_strong_uptrend_close_above_sma_with_rising_sma(self):
         # close 5%+ above sma200, sma200 trending up -> score ≈ 1.0.
         idx = pd.date_range("2024-01-01", periods=100, freq="B")
-        sma = pd.Series(np.linspace(100.0, 110.0, 100), index=idx)  # rising
-        close = sma * 1.10  # 10% above (saturates at 5% band)
+        sma = pd.Series(np.linspace(100.0, 130.0, 100), index=idx)  # rising steeply
+        close = sma * 1.10  # 10% above (saturates the 5% position band)
         out = trend_score(close, sma)
+        # 30% ramp also saturates the 2%/20d slope band → 0.5 + 0.25*(1+1) = 1.0.
         assert out.iloc[-1] == pytest.approx(1.0, abs=1e-10)
 
     def test_strong_downtrend(self):
         idx = pd.date_range("2024-01-01", periods=100, freq="B")
-        sma = pd.Series(np.linspace(110.0, 100.0, 100), index=idx)  # falling
+        sma = pd.Series(np.linspace(130.0, 100.0, 100), index=idx)  # falling steeply
         close = sma * 0.90  # 10% below
         out = trend_score(close, sma)
+        # Both position and the 30% downslope saturate at -1 → 0.5 + 0.25*(-2) = 0.0.
         assert out.iloc[-1] == pytest.approx(0.0, abs=1e-10)
 
     def test_neutral_close_at_sma_flat_slope(self):

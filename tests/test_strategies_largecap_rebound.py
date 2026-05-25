@@ -51,13 +51,19 @@ def _make_bars(closes: list[float], symbol: str = "AAPL") -> pd.DataFrame:
     )
 
 
-def _downtrend_then_recovery(n_down: int = 240, n_recovery: int = 12) -> list[float]:
-    """Long downtrend (puts close well below SMA(200)), then a sharp recovery
-    that drives RSI > 50 + rising AND MACD histogram > 0 + rising."""
+def _downtrend_then_recovery(n_down: int = 280, n_recovery: int = 12) -> list[float]:
+    """Long downtrend (puts close well below SMA(200)), then a GENTLE early
+    rebound: enough to lift RSI above the threshold (and rising) and flip the
+    MACD histogram positive but ≤ 1 — the strategy deliberately skips rebounds
+    already underway (histogram > 1).
+
+    Length must clear ``required_history()`` (283); the default 280-bar downtrend
+    + 12-bar recovery = 292 bars. (The earlier 240+12 = 252 was below
+    required_history, so the strategy returned [] before reaching any gate.)"""
     down = list(np.linspace(150, 80, n_down))
-    # Sharp V-bottom: 4 days flat, then ramp up steeply enough to flip MACD.
+    # Shallow V-bottom: 4 days flat, then a gentle ramp so MACD just crosses 0.
     flat = [80.0] * 4
-    ramp = list(np.linspace(82.0, 100.0, n_recovery - 4))
+    ramp = list(np.linspace(81.0, 86.0, n_recovery - 4))
     return down + flat + ramp
 
 

@@ -48,7 +48,9 @@ def test_normalize_uppercases():
 
 
 def test_normalize_rejects_invalid():
-    for bad in ["", "1AAPL", "@@", "a" * 11, "lower"]:
+    # NB: lowercase is valid input (it gets uppercased — see test_normalize_uppercases),
+    # so it must NOT be in this reject list. Use a space-containing string instead.
+    for bad in ["", "1AAPL", "@@", "a" * 11, "AB CD"]:
         with pytest.raises(ValueError):
             _normalize_symbol(bad)
 

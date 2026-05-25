@@ -170,13 +170,14 @@ def test_trades_record_exit_reason_and_entry_metadata(bars_loader, bars_df):
 
     trade = result.trades[0]
     # Exit reason should be either a strategy-defined reason
-    # ('mean_reverted_above_sma5', 'hard_stop', 'time_stop') or
-    # 'end_of_backtest' if force-closed at the run boundary. NOT None,
-    # NOT 'backtest' (the previous placeholder).
+    # ('mean_reverted_above_sma5', 'hard_stop', 'time_stop'), the engine-level
+    # intrabar stop ('stop_hit', which takes priority over strategy exit_rules —
+    # see BacktestEngine), or 'end_of_backtest' if force-closed at the run
+    # boundary. NOT None, NOT 'backtest' (the previous placeholder).
     assert trade.exit_reason is not None
     assert trade.exit_reason != "backtest"
     assert trade.exit_reason in {
-        "mean_reverted_above_sma5", "hard_stop", "time_stop", "end_of_backtest"
+        "mean_reverted_above_sma5", "hard_stop", "time_stop", "stop_hit", "end_of_backtest"
     }
 
     # Entry metadata should be a dict carrying the strategy's indicator

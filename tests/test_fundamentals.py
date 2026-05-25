@@ -97,7 +97,7 @@ def test_extract_columns_handles_empty_payload():
     cols = _extract_columns({})
     assert cols["symbol"] is None
     assert cols["market_cap"] is None
-    assert cols["raw_payload"] not in cols  # raw_payload is set by upsert, not extract
+    assert "raw_payload" not in cols  # raw_payload is set by upsert, not extract
 
 
 def test_extract_columns_uses_top_level_code_fallback():

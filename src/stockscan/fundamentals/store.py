@@ -12,6 +12,8 @@ ESG scores, holders, etc.) for later extraction without a migration.
 from __future__ import annotations
 
 import json
+import logging
+import math
 from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import Decimal
@@ -21,6 +23,8 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from stockscan.db import session_scope
+
+log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------
@@ -106,13 +110,101 @@ def _to_date(v: Any) -> date | None:
         return None
 
 
+# ---------------------------------------------------------------------
+# Defensive numeric coercion — keep one bad field from aborting a row
+# ---------------------------------------------------------------------
+# (precision, scale) for every NUMERIC column. MUST mirror the schema
+# (migrations 0005 + 0014). A NUMERIC(p, s) holds |value| < 10**(p - s); the
+# provider occasionally returns values past that (e.g. payout_ratio = 153.75,
+# extreme margins/ROE on tiny-revenue names). Before 0014 + this guard, such a
+# value raised psycopg's NumericValueOutOfRange and aborted the *entire* INSERT,
+# so the symbol got no row at all — no sector, no market cap, dropped from the
+# sector composites. We now coerce out-of-range / non-finite numbers to NULL,
+# which is exactly the "missing field" semantics used everywhere else (callers
+# abstain on None rather than acting on a bogus value).
+_INT_MAX = 2**31 - 1  # INTEGER column ceiling (analyst_count)
+_BIGINT_MAX = 2**63 - 1  # BIGINT column ceiling (shares_*)
+
+_NUMERIC_PRECISION: dict[str, tuple[int, int]] = {
+    "market_cap": (20, 2),
+    "pe_ratio": (12, 4),
+    "forward_pe": (12, 4),
+    "peg_ratio": (12, 4),
+    "eps_ttm": (12, 4),
+    "eps_estimate_cy": (12, 4),
+    "book_value": (14, 4),
+    "price_to_book": (12, 4),
+    "price_to_sales_ttm": (12, 4),
+    "profit_margin": (12, 6),  # widened from (8,6) in migration 0014
+    "operating_margin": (12, 6),
+    "return_on_equity": (12, 6),
+    "return_on_assets": (12, 6),
+    "revenue_ttm": (20, 2),
+    "revenue_per_share_ttm": (14, 4),
+    "gross_profit_ttm": (20, 2),
+    "ebitda": (20, 2),
+    "debt_to_equity": (12, 4),
+    "dividend_yield": (12, 6),
+    "dividend_share": (10, 4),
+    "payout_ratio": (12, 6),
+    "beta": (8, 4),
+    "week_52_high": (14, 4),
+    "week_52_low": (14, 4),
+    "day_50_ma": (14, 4),
+    "day_200_ma": (14, 4),
+    "analyst_rating": (4, 2),
+    "analyst_target": (14, 4),
+}
+
+
+def _fit_numeric(value: Any, precision: int, scale: int, *, col: str) -> float | None:
+    """Coerce ``value`` to fit ``NUMERIC(precision, scale)``, else return None.
+
+    Returns None — never raises — for None, non-numeric, non-finite (NaN/±inf),
+    or magnitudes at/beyond the column's integer-part capacity. Otherwise rounds
+    to ``scale`` (Postgres would round the fractional part anyway; the overflow
+    error is only ever about the integer part).
+    """
+    if value is None:
+        return None
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(v):
+        log.warning("fundamentals: %s=%r is non-finite; storing NULL", col, value)
+        return None
+    limit = 10 ** (precision - scale)  # exclusive integer-part bound
+    if abs(v) >= limit:
+        log.warning(
+            "fundamentals: %s=%r exceeds NUMERIC(%d,%d) capacity; storing NULL",
+            col, v, precision, scale,
+        )
+        return None
+    return round(v, scale)
+
+
+def _fit_int(value: Any, max_abs: int, *, col: str) -> int | None:
+    """Coerce an integer to fit its column, else None (never raises)."""
+    if value is None:
+        return None
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        return None
+    if abs(n) > max_abs:
+        log.warning("fundamentals: %s=%r exceeds column capacity; storing NULL", col, n)
+        return None
+    return n
+
+
 def _extract_columns(payload: dict[str, Any]) -> dict[str, Any]:
     """Pull our typed columns out of the EODHD fundamentals payload.
 
     Field paths verified against EODHD's documented response shape; missing
     fields silently become None (we'd rather have a partial row than fail).
     """
-    return {
+    cols: dict[str, Any] = {
         "symbol":              _g(payload, "General", "Code") or _g(payload, "Code"),
         "name":                _g(payload, "General", "Name"),
         "sector":              _g(payload, "General", "Sector"),
@@ -160,6 +252,18 @@ def _extract_columns(payload: dict[str, Any]) -> dict[str, Any]:
             sum(_to_int(v) or 0 for v in (_g(payload, "AnalystRatings") or {}).values())
         ),
     }
+
+    # Defensive coercion so a single out-of-range / non-finite field can never
+    # abort the whole row (psycopg NumericValueOutOfRange). Out-of-bounds values
+    # become NULL — the same "missing" semantics used elsewhere.
+    for c, (prec, scale) in _NUMERIC_PRECISION.items():
+        cols[c] = _fit_numeric(cols.get(c), prec, scale, col=c)
+    cols["analyst_count"] = _fit_int(cols.get("analyst_count"), _INT_MAX, col="analyst_count")
+    cols["shares_outstanding"] = _fit_int(
+        cols.get("shares_outstanding"), _BIGINT_MAX, col="shares_outstanding"
+    )
+    cols["shares_float"] = _fit_int(cols.get("shares_float"), _BIGINT_MAX, col="shares_float")
+    return cols
 
 
 # ---------------------------------------------------------------------
