@@ -362,32 +362,181 @@
     </div>
   {% endif %}
 
-  {# ---- Technical confirmation score ---- #}
-  {% if tech_score is not none %}
-    {%- set tech_val = tech_score.score|float -%}
-    {%- set tech_color = 'ok-600' if tech_val > 0.05 else ('bad-600' if tech_val < -0.05 else 'ink-500') -%}
+  {# ---- Score derivation (strategy-owned) ----
+     ReversalSwing.reversal_score stashes its per-input breakdown under
+     metadata.score_breakdown; we render it with trader-language labels so a
+     reader can see exactly what each input said and how they combined. #}
+  {%- set score_breakdown = (signal.metadata or {}).get('score_breakdown') if (signal and signal.metadata) else none -%}
+  {% if score_breakdown %}
+    {%- set sb_meta = score_breakdown.get('_meta', {}) -%}
+    {%- set sb_val = sb_meta.get('score') -%}
+    {%- set d_val = sb_meta.get('D') -%}
+    {%- set c_val = sb_meta.get('C') -%}
+    {%- set sb_color = 'ok-600' if (sb_val is not none and sb_val > 0.05) else ('bad-600' if (sb_val is not none and sb_val < -0.05) else 'ink-500') -%}
+
+    {# --- Trader-language labels + one-line descriptions for each input. --- #}
+    {%- set INPUT_DESCRIPTIONS = {
+        "reversal_trigger": [
+          "The turn",
+          "RSI(2) reached an extreme AND the very next bar is hooking back the other way. The hook is load-bearing — being oversold alone is a falling knife; we want the bar that says buyers (or sellers) have shown up.",
+        ],
+        "pivot_proximity": [
+          "The level",
+          "Distance (in ATR units) to the nearest confirmed swing support below price (for a bottom) or resistance above (for a top). Confirmation needs k bars on each side of the pivot, so the most recent k bars never form an eligible level (no look-ahead).",
+        ],
+        "sector_rs": [
+          "The leader",
+          "63-day return spread vs the stock’s equal-weight sector composite, blended 70/30 with the slope of the RS line. Positive = a relative leader (reinforces a bottom). Negative = a laggard (reinforces a top).",
+        ],
+        "trend_location": [
+          "The trend (reinforce-only)",
+          "Where price sits vs 50/200-day SMAs plus the 50-day slope. Counts ONLY when its sign agrees with the core direction — boosts with-trend setups, abstains rather than vetoing counter-trend ones.",
+        ],
+        "volume_confirm": [
+          "Volume (confirmation multiplier)",
+          "A climax / absorption bar — heavy volume rejecting the day’s extreme (down day closing off its low, or up day closing off its high). Scales |conviction| in [vol_floor, 1]; can attenuate but never flip the sign.",
+        ],
+    } -%}
+
+    {# Helper macro: render one core/trend row. #}
+    {% macro _input_row(key, values, kind) %}
+      {%- set label, desc = INPUT_DESCRIPTIONS[key] -%}
+      <div class="px-3 py-2 rounded border border-ink-300/40">
+        <div class="flex items-baseline justify-between gap-3 flex-wrap">
+          <div>
+            <span class="font-semibold">{{ label }}</span>
+            <span class="text-xs text-ink-500 ml-2 font-mono">{{ key }}</span>
+          </div>
+          {% if values %}
+            {% if kind == "multiplier" %}
+              {%- set m = values.get("multiplier") -%}
+              <div class="text-sm font-mono">
+                multiplier <span class="font-semibold">{{ "%.3f"|format(m|float) if m is not none else "—" }}</span>
+              </div>
+            {% else %}
+              {%- set s = values.get("score") -%}
+              {%- set w = values.get("weight") -%}
+              {%- set sc = "ok-600" if (s is not none and s > 0.05) else ("bad-600" if (s is not none and s < -0.05) else "ink-500") -%}
+              <div class="text-sm font-mono">
+                score <span class="font-semibold text-{{ sc }}">{{ "%+.3f"|format(s|float) if s is not none else "—" }}</span>
+                <span class="text-ink-500">·</span> weight {{ "%.2f"|format(w|float) if w is not none else "—" }}
+              </div>
+            {% endif %}
+          {% else %}
+            <div class="text-xs text-ink-500 italic">abstained (insufficient data)</div>
+          {% endif %}
+        </div>
+        <p class="text-xs text-ink-500 mt-1">{{ desc }}</p>
+
+        {% if values %}
+          {# Compact "what we measured" line, formatted per-input. #}
+          <div class="text-xs font-mono mt-2 text-ink-700">
+            {% if key == "reversal_trigger" %}
+              RSI(2): {{ "%.1f"|format(values.get("rsi2", 0)|float) }}
+              <span class="text-ink-500">(prev {{ "%.1f"|format(values.get("rsi2_prev", 0)|float) }})</span>
+              <span class="text-ink-500">·</span> raw {{ "%+.3f"|format(values.get("raw", 0)|float) }}
+            {% elif key == "pivot_proximity" %}
+              {% if values.get("support") is not none %}
+                support {{ "%.2f"|format(values.support|float) }}
+                <span class="text-ink-500">({{ "%+.2f"|format(values.get("dist_sup_atr", 0)|float) }} ATR away)</span>
+              {% endif %}
+              {% if values.get("resistance") is not none %}
+                {% if values.get("support") is not none %}<span class="text-ink-500">·</span>{% endif %}
+                resistance {{ "%.2f"|format(values.resistance|float) }}
+                <span class="text-ink-500">({{ "%+.2f"|format(values.get("dist_res_atr", 0)|float) }} ATR away)</span>
+              {% endif %}
+              {% if values.get("support") is none and values.get("resistance") is none %}
+                <span class="text-ink-500">no confirmed level within range</span>
+              {% endif %}
+              <span class="text-ink-500">·</span> raw {{ "%+.3f"|format(values.get("raw", 0)|float) }}
+            {% elif key == "sector_rs" %}
+              {% set spread_pct = (values.get("spread", 0)|float) * 100 %}
+              spread {{ "%+.1f"|format(spread_pct) }}%
+              <span class="text-ink-500">·</span> rs {{ "%+.2f"|format(values.get("rs", 0)|float) }}
+              <span class="text-ink-500">·</span> slope {{ "%+.2f"|format(values.get("slope_n", 0)|float) }}
+              <span class="text-ink-500">·</span> raw {{ "%+.3f"|format(values.get("raw", 0)|float) }}
+            {% elif key == "trend_location" %}
+              pos50 {{ "%+.2f"|format(values.get("pos50", 0)|float) }}
+              {% if values.get("pos200") is not none %}
+                <span class="text-ink-500">·</span> pos200 {{ "%+.2f"|format(values.pos200|float) }}
+              {% endif %}
+              <span class="text-ink-500">·</span> slope {{ "%+.2f"|format(values.get("slope_n", 0)|float) }}
+              <span class="text-ink-500">·</span> sma50 {{ "%.2f"|format(values.get("sma50", 0)|float) }}
+            {% elif key == "volume_confirm" %}
+              rvol {{ "%.2f"|format(values.get("rvol_med", 0)|float) }}×&nbsp;median
+              <span class="text-ink-500">·</span> close-location {{ "%+.2f"|format(values.get("clv", 0)|float) }}
+              <span class="text-ink-500">·</span> rejection {{ "%+.2f"|format(values.get("reject", 0)|float) }}
+            {% endif %}
+          </div>
+
+          {# Reinforce-only note for trend: did it actually fold into D? #}
+          {% if key == "trend_location" %}
+            {%- set ts = values.get("score") -%}
+            {%- set reinforced = (ts is not none and d_val is not none and ((ts > 0 and d_val > 0) or (ts < 0 and d_val < 0))) -%}
+            <div class="text-xs mt-1 italic text-{{ 'ok-600' if reinforced else 'ink-500' }}">
+              {%- if reinforced %}✓ Reinforced — sign agreed with core D, so trend folded in and boosted conviction.
+              {%- else %}— Did not reinforce — sign disagreed with core (or was zero), so trend abstained from D.{% endif %}
+            </div>
+          {% endif %}
+        {% endif %}
+      </div>
+    {% endmacro %}
+
     {% call card(
-         title="Technical confirmation",
-         subtitle="Independent score evaluating whether technicals support the setup",
+         title="Score derivation",
+         subtitle="How this strategy thinks about this setup, broken down input by input",
     ) %}
+      {# Headline score #}
+      {% if sb_val is not none %}
       <div class="flex items-baseline gap-3">
-        <div class="text-3xl font-mono font-semibold text-{{ tech_color }}">
-          {{ "%+.3f"|format(tech_val) }}
+        <div class="text-3xl font-mono font-semibold text-{{ sb_color }}">
+          {{ "%+.3f"|format(sb_val|float) }}
         </div>
         <div class="text-sm text-ink-500">
-          On a [-1, +1] scale. Positive = technicals confirm the setup;
-          negative = they contradict it; near zero = neutral.
+          On a [-1, +1] scale. Positive = a confirmed bottom (long);
+          negative = a confirmed top (exit); near zero = neutral.
+          <a href="/strategies/{{ signal.strategy_name }}"
+             class="ml-1 text-ink-700 underline decoration-ink-300 hover:decoration-ink-700">
+            How is this scored?
+          </a>
         </div>
       </div>
-      {% if tech_score.breakdown %}
-        <details class="mt-3 text-xs">
-          <summary class="text-ink-500 cursor-pointer">Per-indicator breakdown</summary>
-          <pre class="mt-2 bg-ink-100 p-2 rounded overflow-auto">{{ tech_score.breakdown|tojson(indent=2) }}</pre>
-        </details>
       {% endif %}
-      <p class="text-xs text-ink-500 mt-2">
-        Computed at {{ tech_score.computed_at.strftime('%Y-%m-%d %H:%M UTC') }}.
-      </p>
+
+      {# Per-input rows — core directional, then reinforce-only trend, then volume multiplier. #}
+      <div class="mt-5 space-y-3">
+        {% for key in ["reversal_trigger", "pivot_proximity", "sector_rs"] %}
+          {{ _input_row(key, score_breakdown.get(key), "core") }}
+        {% endfor %}
+        {{ _input_row("trend_location", score_breakdown.get("trend_location"), "reinforce") }}
+        {{ _input_row("volume_confirm", score_breakdown.get("volume_confirm"), "multiplier") }}
+      </div>
+
+      {# Math summary — D, C, S. #}
+      {% if d_val is not none and c_val is not none and sb_val is not none %}
+      <div class="mt-5 pt-3 border-t border-ink-300/40">
+        <div class="text-xs text-ink-500 uppercase tracking-wide mb-2">How the score was derived</div>
+        <div class="font-mono text-sm space-y-1">
+          <div class="flex justify-between">
+            <span><span class="text-ink-500">D </span>= weighted average of contributing core inputs (+ trend if it reinforced)</span>
+            <span class="font-semibold">{{ "%+.3f"|format(d_val|float) }}</span>
+          </div>
+          <div class="flex justify-between">
+            <span><span class="text-ink-500">C </span>= volume confirmation multiplier</span>
+            <span class="font-semibold">{{ "%.3f"|format(c_val|float) }}</span>
+          </div>
+          <div class="flex justify-between pt-1 border-t border-ink-300/40">
+            <span><span class="text-ink-500">S </span>= clip(D × C, -1, +1)</span>
+            <span class="font-semibold text-{{ sb_color }}">{{ "%+.3f"|format(sb_val|float) }}</span>
+          </div>
+        </div>
+      </div>
+      {% endif %}
+
+      <details class="mt-4 text-xs">
+        <summary class="text-ink-500 cursor-pointer">View raw JSON</summary>
+        <pre class="mt-2 bg-ink-100 p-2 rounded overflow-auto">{{ score_breakdown|tojson(indent=2) }}</pre>
+      </details>
     {% endcall %}
   {% endif %}
 
@@ -418,24 +567,28 @@
     {% endcall %}
   {% endif %}
 
-  {# ---- Strategy parameters used at scan time ---- #}
-  {% if signal.params_json %}
+  {# ---- Strategy version pointer ----
+     The retired strategy_configs snapshot lived here; the strategy file is the
+     single source of truth now, so we link to the current version's manual. #}
+  {% if signal.strategy_name and signal.strategy_version %}
     {% call card(
-         title="Strategy parameters",
-         subtitle="The exact config the strategy used when this signal fired",
+         title="Strategy at scan time",
+         subtitle="Knobs live in the strategy file; a version bump is the unit of change",
     ) %}
-      <p class="text-sm text-ink-500 mb-2">
-        These are the per-strategy knobs (lookback windows, thresholds, ATR
-        multipliers) that fed the calculation. Pinned by ``params_hash``
-        so a strategy-level config change doesn't retroactively change
-        what this signal "meant."
+      <p class="text-sm">
+        Generated by
+        <a href="/strategies/{{ signal.strategy_name }}"
+           class="font-mono text-ink-900 underline decoration-ink-300 hover:decoration-ink-700">
+          {{ signal.strategy_name }}
+        </a>
+        version <code class="font-mono">{{ signal.strategy_version }}</code>.
       </p>
-      <pre class="text-xs bg-ink-100 p-3 rounded overflow-auto">{{ signal.params_json|tojson(indent=2) }}</pre>
-      {% if signal.params_hash %}
-        <p class="text-xs text-ink-500 mt-2">
-          Params hash: <code class="font-mono">{{ signal.params_hash[:16] }}…</code>
-        </p>
-      {% endif %}
+      <p class="text-xs text-ink-500 mt-2">
+        Open the strategy page to see the current knob values and the
+        per-input scoring recipe. If the strategy has been bumped to a newer
+        version since this signal fired, the current page reflects the
+        latest knobs — bumping version is how a tuning change is recorded.
+      </p>
     {% endcall %}
   {% endif %}
 

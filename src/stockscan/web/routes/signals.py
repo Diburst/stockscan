@@ -59,7 +59,6 @@ _SORT_COLUMNS: dict[str, str] = {
     "symbol": "s.symbol",
     "strategy": "s.strategy_name",
     "score": "s.score",
-    "tech": "t.score",
     "entry": "s.suggested_entry",
     "stop": "s.suggested_stop",
     "qty": "s.suggested_qty",
@@ -79,8 +78,6 @@ def _query_signals_view(
     side: str | None = None,
     score_min: float | None = None,
     score_max: float | None = None,
-    tech_min: float | None = None,
-    tech_max: float | None = None,
     # Sorting
     sort: str | None = None,
     sort_dir: str | None = None,
@@ -120,20 +117,6 @@ def _query_signals_view(
         where.append("s.score <= :score_max")
         params["score_max"] = score_max
 
-    # Tech score range filters (applied via HAVING-style post-filter
-    # since tech_score comes from a LEFT JOIN; we use a subquery wrapper
-    # instead to keep it clean with WHERE).
-    tech_filter_clauses: list[str] = []
-    if tech_min is not None:
-        tech_filter_clauses.append("t.score >= :tech_min")
-        params["tech_min"] = tech_min
-    if tech_max is not None:
-        tech_filter_clauses.append("t.score <= :tech_max")
-        params["tech_max"] = tech_max
-    if tech_filter_clauses:
-        # When filtering by tech score, require it exists (not null)
-        where.extend(tech_filter_clauses)
-
     # Restrict to the CURRENT registered version of each strategy.
     version_clause, version_params = current_version_filter(prefix="s")
     where.append(version_clause)
@@ -152,13 +135,8 @@ def _query_signals_view(
         SELECT s.signal_id, s.run_id, s.strategy_name, s.symbol, s.side,
                s.score, s.status, s.as_of_date,
                s.suggested_entry, s.suggested_stop, s.suggested_qty,
-               s.rejected_reason, s.metadata,
-               t.score AS tech_score
+               s.rejected_reason, s.metadata
         FROM signals s
-        LEFT JOIN technical_scores t
-          ON t.symbol = s.symbol
-         AND t.as_of_date = s.as_of_date
-         AND t.strategy_name = s.strategy_name
         WHERE {" AND ".join(where)}
         ORDER BY {order_by}
         LIMIT 500
@@ -181,8 +159,6 @@ def _query_signals_view(
         "filter_side": side or "",
         "filter_score_min": score_min,
         "filter_score_max": score_max,
-        "filter_tech_min": tech_min,
-        "filter_tech_max": tech_max,
         # Sort state
         "sort_key": sort_key or "",
         "sort_dir": sort_dir or "desc",
@@ -200,8 +176,6 @@ async def signals_list(
     side: str | None = Query(None),
     score_min: str | None = Query(None),
     score_max: str | None = Query(None),
-    tech_min: str | None = Query(None),
-    tech_max: str | None = Query(None),
     # Sort
     sort: str | None = Query(None),
     dir: str | None = Query(None),
@@ -216,8 +190,6 @@ async def signals_list(
         side=side,
         score_min=_to_float(score_min),
         score_max=_to_float(score_max),
-        tech_min=_to_float(tech_min),
-        tech_max=_to_float(tech_max),
         sort=sort,
         sort_dir=dir,
     )
@@ -241,8 +213,6 @@ async def refresh_endpoint(
     side: str | None = Query(None),
     score_min: str | None = Query(None),
     score_max: str | None = Query(None),
-    tech_min: str | None = Query(None),
-    tech_max: str | None = Query(None),
     sort: str | None = Query(None),
     dir: str | None = Query(None),
     s: Session = Depends(get_session),
@@ -261,7 +231,6 @@ async def refresh_endpoint(
     _filter_kwargs = dict(
         symbol=symbol, side=side,
         score_min=_to_float(score_min), score_max=_to_float(score_max),
-        tech_min=_to_float(tech_min), tech_max=_to_float(tech_max),
         sort=sort, sort_dir=dir,
     )
 
@@ -374,11 +343,11 @@ async def signal_detail(
 ):
     """Full attribution view: every input that produced this signal's score.
 
-    Pulls together (1) the signal row + JSONB strategy metadata,
-    (2) the regime row at the same as_of_date for component-level
-    context, (3) the technical_scores breakdown if computed, (4) the
+    Pulls together (1) the signal row + JSONB strategy metadata (which
+    carries the strategy-owned score breakdown), (2) the regime row at
+    the same as_of_date for component-level context, (3) the
     strategy_configs row for the exact params used at scan time, and
-    (5) the strategy class itself so we can show the regime-affinity
+    (4) the strategy class itself so we can show the regime-affinity
     table and the human-readable manual.
 
     Each lookup soft-fails to ``None`` so a missing row in any one
@@ -386,20 +355,18 @@ async def signal_detail(
     """
     discover_strategies()
 
-    # ---- 1. The signal itself, joined with its run + config metadata.
+    # ---- 1. The signal itself, joined with its run metadata.
     sig_sql = text(
         """
-        SELECT s.signal_id, s.run_id, s.config_id, s.strategy_name,
+        SELECT s.signal_id, s.run_id, s.strategy_name,
                s.strategy_version, s.symbol, s.side, s.score, s.status,
                s.as_of_date, s.suggested_entry, s.suggested_stop,
                s.suggested_target, s.suggested_qty, s.rejected_reason,
                s.metadata,
                r.universe_size, r.signals_emitted, r.rejected_count,
-               r.run_at,
-               c.params_json, c.params_hash
+               r.run_at
         FROM signals s
         LEFT JOIN strategy_runs    r ON r.run_id    = s.run_id
-        LEFT JOIN strategy_configs c ON c.config_id = s.config_id
         WHERE s.signal_id = :sid
         """
     )
@@ -411,7 +378,6 @@ async def signal_detail(
             signal=None,
             strategy_cls=None,
             regime=None,
-            tech_score=None,
         )
 
     # ---- 2. Regime context at the signal's as_of_date.
@@ -420,23 +386,7 @@ async def signal_detail(
         label=f"signal_detail[{signal_id}].get_regime",
     )
 
-    # ---- 3. Technical-confirmation score for (symbol, as_of, strategy).
-    tech_sql = text(
-        """
-        SELECT score, breakdown, computed_at
-        FROM technical_scores
-        WHERE symbol = :sym AND as_of_date = :d AND strategy_name = :n
-        """
-    )
-    tech_score = safe(
-        lambda: s.execute(
-            tech_sql,
-            {"sym": signal.symbol, "d": signal.as_of_date, "n": signal.strategy_name},
-        ).first(),
-        label=f"signal_detail[{signal_id}].tech_score",
-    )
-
-    # ---- 4. The strategy class — used for affinity lookups, the
+    # ---- 3. The strategy class — used for affinity lookups, the
     #         description-and-manual block, and parameter-schema.
     strategy_cls: type[Strategy] | None
     try:
@@ -445,7 +395,7 @@ async def signal_detail(
         # Strategy was de-registered or renamed since the signal fired.
         strategy_cls = None
 
-    # ---- 5. Derived sizing breakdown — only meaningful when we have
+    # ---- 4. Derived sizing breakdown — only meaningful when we have
     #         both a strategy class (for affinity) and a regime row.
     sizing_breakdown: dict[str, object] | None = _sizing_breakdown(
         signal, strategy_cls, regime
@@ -457,7 +407,6 @@ async def signal_detail(
         signal=signal,
         strategy_cls=strategy_cls,
         regime=regime,
-        tech_score=tech_score,
         sizing_breakdown=sizing_breakdown,
     )
 

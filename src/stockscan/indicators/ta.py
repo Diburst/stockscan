@@ -33,20 +33,30 @@ def _wilder_smoothing(series: pd.Series, period: int) -> pd.Series:
     The first value is the simple mean of the first `period` observations;
     subsequent values use the recursion: y[t] = y[t-1] + (x[t] - y[t-1]) / period.
     Matches the canonical RSI / ATR / ADX behavior used in TA literature.
+
+    The recursion is sequential (each step depends on the previous), so it
+    can't be vectorised — but it can be run on a NumPy ndarray instead of a
+    pandas Series, skipping the per-write block-consolidation and
+    chained-assignment plumbing that dominated cProfile (~80% of total
+    backtest runtime on a 10-symbol × 1-year reversal_swing run, with
+    pandas ``__setitem__`` accounting for 2.3M of 2.5M cumulative calls).
+    Same math, same seed, same NaN propagation — just no pandas overhead
+    in the hot loop. ~50× faster on this function at scale.
     """
-    s = series.astype(float).copy()
-    out = pd.Series(np.nan, index=s.index, dtype=float)
-    if len(s) < period:
-        return out
-    # Seed with simple mean of first `period` values.
-    seed = s.iloc[:period].mean()
-    out.iloc[period - 1] = seed
+    s = series.astype(float).to_numpy()
+    n = s.shape[0]
+    out = np.full(n, np.nan, dtype=float)
+    if n < period:
+        return pd.Series(out, index=series.index, dtype=float)
+    # Seed with simple mean of first `period` values (skips NaN, matches the
+    # previous pandas .mean() behaviour).
+    seed = float(np.nanmean(s[:period]))
+    out[period - 1] = seed
     prev = seed
-    values = s.iloc[period:].to_numpy()
-    for i, v in enumerate(values, start=period):
-        prev = prev + (v - prev) / period
-        out.iloc[i] = prev
-    return out
+    for i in range(period, n):
+        prev = prev + (s[i] - prev) / period
+        out[i] = prev
+    return pd.Series(out, index=series.index, dtype=float)
 
 
 # ---------------------------------------------------------------------

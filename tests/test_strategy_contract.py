@@ -131,7 +131,7 @@ def sample_bars() -> pd.DataFrame:
 
 @pytest.mark.parametrize("strategy_cls", _all_strategies(), ids=lambda c: c.name)
 def test_required_history_is_positive(strategy_cls: type[Strategy]) -> None:
-    inst = strategy_cls(strategy_cls.params_model())
+    inst = strategy_cls()
     n = inst.required_history()
     assert isinstance(n, int)
     assert 0 < n < 1000
@@ -139,7 +139,7 @@ def test_required_history_is_positive(strategy_cls: type[Strategy]) -> None:
 
 @pytest.mark.parametrize("strategy_cls", _all_strategies(), ids=lambda c: c.name)
 def test_signals_idempotent(strategy_cls: type[Strategy], sample_bars: pd.DataFrame) -> None:
-    inst = strategy_cls(strategy_cls.params_model())
+    inst = strategy_cls()
     a = inst.signals(sample_bars.copy(), as_of=sample_bars.index[-1].date())
     b = inst.signals(sample_bars.copy(), as_of=sample_bars.index[-1].date())
     assert a == b
@@ -148,7 +148,7 @@ def test_signals_idempotent(strategy_cls: type[Strategy], sample_bars: pd.DataFr
 @pytest.mark.parametrize("strategy_cls", _all_strategies(), ids=lambda c: c.name)
 def test_signals_no_lookahead(strategy_cls: type[Strategy], sample_bars: pd.DataFrame) -> None:
     """Slicing future bars off must produce identical output."""
-    inst = strategy_cls(strategy_cls.params_model())
+    inst = strategy_cls()
     as_of = sample_bars.index[20].date()
     truncated = sample_bars[sample_bars.index.date <= as_of]
     full = sample_bars
@@ -161,7 +161,7 @@ def test_signals_no_lookahead(strategy_cls: type[Strategy], sample_bars: pd.Data
 def test_exit_rules_returns_none_or_exit(
     strategy_cls: type[Strategy], sample_bars: pd.DataFrame
 ) -> None:
-    inst = strategy_cls(strategy_cls.params_model())
+    inst = strategy_cls()
     pos = PositionSnapshot(
         symbol="AAPL",
         qty=10,

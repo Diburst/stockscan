@@ -21,7 +21,11 @@ from stockscan.strategies.registration import ensure_strategy_version
 def save_run(result: BacktestResult, *, note: str | None = None) -> int:
     """Persist a BacktestResult; returns the run_id."""
     cfg = result.config
-    params_json = cfg.params.model_dump(mode="json")
+    # Strategies without a params_model carry their knobs as ClassVar constants;
+    # snapshot the empty dict so the (name, version, params_hash, start, end,
+    # capital) idempotency key is still meaningful — a version bump changes the
+    # captured strategy_version + the code_fingerprint on strategy_versions.
+    params_json = cfg.params.model_dump(mode="json") if cfg.params is not None else {}
     params_hash = cfg.strategy_cls.hash_params(cfg.params)
 
     metrics_json = result.report.to_dict()

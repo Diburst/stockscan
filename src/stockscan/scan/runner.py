@@ -47,7 +47,6 @@ from stockscan.strategies import (
     discover_strategies,
 )
 from stockscan.strategies.registration import ensure_strategy_version
-from stockscan.technical import compute_technical_score, upsert_score
 from stockscan.universe import current_constituents, members_as_of
 
 log = logging.getLogger(__name__)
@@ -151,8 +150,12 @@ class ScanRunner:
         as_of: date,
         symbols: list[str] | None,
     ) -> ScanSummary:
-        # 1. Ensure strategy_versions + active strategy_configs row exist.
-        config_id, params = self._ensure_strategy_config(s, strategy_cls)
+        # 1. Ensure the strategy's version row exists, then instantiate it.
+        #    Knobs come from the strategy file itself — no DB-shadowed
+        #    strategy_configs row (retired in migration 0016). For strategies
+        #    that still declare a params_model, the file defaults are used.
+        ensure_strategy_version(strategy_cls, session=s)
+        params = strategy_cls.params_model() if strategy_cls.params_model is not None else None
         strategy = strategy_cls(params)
 
         # 1b. Resolve the regime soft-sizing multiplier. Replaces the v1
@@ -291,24 +294,23 @@ class ScanRunner:
         #     filtering (TODO: meta-label rejection threshold).
         passing = self._meta_score_pass(passing, bars_cache, as_of, strategy_cls, regime_factor)
 
-        # 5. Persist signals, then technical scores for each.
+        # 5. Persist signals. The strategy owns its own score (and, if it uses
+        #    a composite, the per-input breakdown stashed in metadata) — the
+        #    runner no longer computes a parallel "technical score" annotation.
         run_id = self._persist_run(
             s,
             strategy_cls,
-            config_id,
             as_of,
             len(symbols),
             len(passing),
             len(rejected),
         )
         for sig, qty in passing:
-            self._persist_signal(s, run_id, strategy_cls, config_id, as_of, sig, qty, "new", None)
-            self._persist_tech_score(s, strategy_cls, sig.symbol, as_of, bars_cache.get(sig.symbol))
+            self._persist_signal(s, run_id, strategy_cls, as_of, sig, qty, "new", None)
         for sig, qty, reason in rejected:
             self._persist_signal(
-                s, run_id, strategy_cls, config_id, as_of, sig, qty, "rejected", reason
+                s, run_id, strategy_cls, as_of, sig, qty, "rejected", reason
             )
-            self._persist_tech_score(s, strategy_cls, sig.symbol, as_of, bars_cache.get(sig.symbol))
 
         return ScanSummary(
             run_id=run_id,
@@ -324,49 +326,6 @@ class ScanRunner:
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
-    def _ensure_strategy_config(
-        self,
-        s: Session,
-        strategy_cls: type[Strategy],
-    ) -> tuple[int, Any]:
-        """Make sure strategy_versions + strategy_configs rows exist; return config_id + params."""
-        # version row — shared with the backtester (backtest.store) so a strategy
-        # registers identically whether it's first seen by a scan or a backtest.
-        ensure_strategy_version(strategy_cls, session=s)
-
-        # active config — if none exists, create with defaults
-        existing = s.execute(
-            text(
-                "SELECT config_id, params_json FROM strategy_configs "
-                "WHERE strategy_name = :n AND active = TRUE LIMIT 1"
-            ),
-            {"n": strategy_cls.name},
-        ).first()
-        if existing:
-            params = strategy_cls.params_model(**existing.params_json)
-            return int(existing.config_id), params
-
-        params = strategy_cls.params_model()
-        params_json = params.model_dump(mode="json")
-        params_hash = strategy_cls.hash_params(params)
-        row = s.execute(
-            text(
-                """
-                INSERT INTO strategy_configs
-                    (strategy_name, strategy_version, params_json, params_hash,
-                     created_by, note)
-                VALUES (:n, :v, CAST(:p AS JSONB), :h, 'system', 'auto-created defaults')
-                RETURNING config_id;
-                """
-            ),
-            {
-                "n": strategy_cls.name,
-                "v": strategy_cls.version,
-                "p": json.dumps(params_json),
-                "h": params_hash,
-            },
-        ).one()
-        return int(row.config_id), params
 
     def _size(self, signal: RawSignal) -> int:
         # Quick pass through the sizer using config defaults.
@@ -596,7 +555,6 @@ class ScanRunner:
         self,
         s: Session,
         strategy_cls: type[Strategy],
-        config_id: int,
         as_of: date,
         universe_size: int,
         n_pass: int,
@@ -606,16 +564,15 @@ class ScanRunner:
             text(
                 """
                 INSERT INTO strategy_runs
-                    (strategy_name, strategy_version, config_id, as_of_date,
+                    (strategy_name, strategy_version, as_of_date,
                      universe_size, signals_emitted, rejected_count)
-                VALUES (:n, :v, :c, :d, :u, :s, :r)
+                VALUES (:n, :v, :d, :u, :s, :r)
                 RETURNING run_id;
                 """
             ),
             {
                 "n": strategy_cls.name,
                 "v": strategy_cls.version,
-                "c": config_id,
                 "d": as_of,
                 "u": universe_size,
                 "s": n_pass,
@@ -624,35 +581,11 @@ class ScanRunner:
         ).one()
         return int(row.run_id)
 
-    def _persist_tech_score(
-        self,
-        s: Session,
-        strategy_cls: type[Strategy],
-        symbol: str,
-        as_of: date,
-        bars: pd.DataFrame | None,
-    ) -> None:
-        """Compute and upsert the technical confirmation score for one signal."""
-        if bars is None or bars.empty:
-            return
-        try:
-            score = compute_technical_score(strategy_cls, bars, as_of)
-        except Exception as exc:
-            log.debug("tech score failed for %s: %s", symbol, exc)
-            return
-        if score is None:
-            return
-        try:
-            upsert_score(symbol, as_of, strategy_cls.name, score, session=s)
-        except Exception as exc:
-            log.error("tech score upsert failed for %s: %s", symbol, exc)
-
     def _persist_signal(
         self,
         s: Session,
         run_id: int,
         strategy_cls: type[Strategy],
-        config_id: int,
         as_of: date,
         sig: RawSignal,
         qty: int,
@@ -668,18 +601,17 @@ class ScanRunner:
             text(
                 """
                 INSERT INTO signals
-                    (run_id, strategy_name, strategy_version, config_id,
+                    (run_id, strategy_name, strategy_version,
                      symbol, side, score, as_of_date,
                      suggested_entry, suggested_stop, suggested_target, suggested_qty,
                      rejected_reason, metadata, status)
-                VALUES (:run_id, :n, :v, :c,
+                VALUES (:run_id, :n, :v,
                         :symbol, :side, :score, :as_of,
                         :entry, :stop, :target, :qty,
                         :reason, CAST(:meta AS JSONB), :status)
                 ON CONFLICT (symbol, strategy_name, strategy_version, as_of_date)
                 DO UPDATE SET
                     run_id          = EXCLUDED.run_id,
-                    config_id       = EXCLUDED.config_id,
                     side            = EXCLUDED.side,
                     score           = EXCLUDED.score,
                     suggested_entry = EXCLUDED.suggested_entry,
@@ -695,7 +627,6 @@ class ScanRunner:
                 "run_id": run_id,
                 "n": strategy_cls.name,
                 "v": strategy_cls.version,
-                "c": config_id,
                 "symbol": sig.symbol,
                 "side": sig.side,
                 "score": sig.score,

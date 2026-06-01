@@ -190,7 +190,38 @@ Build a personal swing-trading toolkit that:
   - Trade log persisted as a `backtest_trades` table; CSV export available on demand.
   - Metrics: CAGR, Sharpe, Sortino, max drawdown, max DD duration, win rate, avg win/loss, profit factor, expectancy, exposure %.
   - Optional: walk-forward analysis (rolling train/test windows).
-- CLI: `stockscan backtest rsi2 --from 2010-01-01 --to 2024-12-31 --capital 100000`.
+- CLI: `stockscan backtest run rsi2_meanrev --from 2010-01-01 --to 2024-12-31 --capital 100000`.
+
+#### 4.4.1 Performance shape
+
+The backtest's working baseline on a 10-symbol × 1-year `reversal_swing` run is ~12 seconds; full S&P 500 × 4 years extrapolates to ~40 minutes. Three architectural facts about where the time goes — keep these in mind before any perf change:
+
+**The DB is not the bottleneck.** Counter-intuitive but well-established by profiling. Three caches do the heavy lifting:
+
+  - `engine._bars()` pulls each symbol's full bar history once per run and slices via O(log n) `searchsorted` on every subsequent call (the old `cached[cached.index.date <= as_of]` mask built a Python `date` object array on every hit — the original sink). One DB round-trip per symbol.
+  - `relative_strength` has two run-scoped caches: `_SECTOR_MAP` (symbol → composite symbol, fetched once) and `_COMPOSITE_BARS` (one bar fetch per sector composite, ~11 total). Plus `_COMPOSITE_CLOSES_BY_DATE` pre-normalizes each composite's close series to tz-naive midnight once, so per-call `_by_date` work only happens on the stock side.
+  - `_members_cache` keys point-in-time S&P 500 membership by date.
+
+  For a 4-year × 500-symbol run that's ~1,500 DB queries total against ~500K (symbol, day) strategy evaluations. The cost is in compute, not I/O. If a profile ever shows `get_bars` or `psycopg` in the top of `cumtime`, a cache is stale or someone introduced a new DB-touching primitive — fix that, don't reach for more caching.
+
+**The cost lives in the per-(symbol, day) indicator recompute.** Every scoring call runs RSI(2), RSI(14), ATR(14), the pivot scan, the 5-bar volume scan, and the relative-strength reindex on a 235-bar trailing tail. ~500 × 1,000 days = 500K scoring calls × ~10 pandas-heavy operations each. That's the floor.
+
+**The pandas anti-pattern that catches you twice.** Two history-worthy fixes both took the same shape — writing into a pandas Series one cell at a time:
+
+  - `_wilder_smoothing` in `indicators/ta.py` originally seeded with a simple mean and iterated `out.iloc[i] = prev + (v - prev) / period` in Python. Each `.iloc[i] = ...` goes through chained-assignment detection, block consolidation, and cache invalidation — ~1ms of pandas overhead per write, dwarfing the float arithmetic. Backtest profile: 55s cumulative, 2.3 million `__setitem__` calls. Fix: run the recurrence on a NumPy `ndarray`, wrap to Series at the end. Same math, same NaN propagation, 55× faster on the function and ~5× on the whole backtest.
+  - `_composite_closes` in `indicators/relative_strength.py` sliced via `full.loc[full.index.date <= as_of, "close"]`, which builds a 6,000-element Python `date` object array every call. Fix: `searchsorted` on the datetime index, same pattern as the engine's `_bars()` slice.
+
+  The lesson: **pandas is fast in C, slow in Python.** Anywhere a hot loop touches a Series one element at a time — `.iloc[i] = ...`, `.iat[i, j] = ...`, per-element `.index.date` extraction, `.apply(func)` over rows — is a candidate for moving to NumPy and wrapping back to Series at the end. Vectorized pandas (`.rolling().mean()`, `.ewm(...).mean()`) is fine. Per-cell pandas in a loop is not.
+
+**The discipline: profile before you optimize.** The DB-caching hypothesis sounded right and was wrong — the actual bottleneck was Wilder smoothing, which nobody would have guessed from reading the code. Use `stockscan backtest profile STRATEGY` (cProfile around `BacktestEngine.run()`, code in `stockscan.backtest.profile`); it takes the same arguments as `backtest run` and dumps a sorted hotspot list. Sort by `cumtime` first ("where wall-clock goes"); sort by `tottime` to find leaf-level hotspots (per-call dict / float / Series construction). `python tools/profile_backtest.py` is a thin shim for the same command. Snapshot of the journey:
+
+  | After | Total run | Top function | Cumulative speedup |
+  | --- | --- | --- | --- |
+  | (baseline) | 69.0s | `_wilder_smoothing` 55.7s | 1.0× |
+  | Wilder fix | 13.7s | `reversal_score` 11.8s | 5.0× |
+  | RS date-handling fix | 11.7s | `reversal_score` 9.9s | 5.9× |
+
+  Past 5.9× the top of the profile becomes diffuse — `series.__init__`, `where`, `clip`, `__getitem__`, `_arith_method` — death by a thousand cuts. The next meaningful jump would require a per-symbol feature cache (precompute RSI/ATR/SMA series once per symbol when bars are first loaded; strategies look up at `today`'s index instead of recomputing the rolling window). That's the natural Phase-N optimization if S&P 500 × 4y becomes painful in the iterative loop.
 
 ### 4.5 Position Manager (`stockscan.positions`)
 
@@ -1190,7 +1221,7 @@ A nightly `stockscan export bars` job dumps `bars` to partitioned Parquet under 
 | First strategy to ship | RSI(2) mean-reversion | Faster signal-to-validation loop than TF (more trades per backtest year) |
 | **Strategy hot reload** | **No — restart required to pick up new/edited strategies** | Simpler, safer (no stale-state bugs from `importlib.reload`). Mac mini restart of the FastAPI process is <5 seconds. Reconsider in v1.5 if iteration friction becomes painful. |
 | **Strategy web upload** | **No — files on disk only, edited via your editor of choice** | Web upload would mean executing arbitrary user-uploaded Python on the server. Even single-user, that's an unnecessary attack surface (session hijack → RCE). Strategy code is committed to the repo and deployed via the normal app deploy. |
-| **Parameter sweeps** | **Engine supports them in v1; UI ships in v1.5** | Backtester accepts a parameter grid and runs the cartesian product in parallel. CLI-only access in v1 (`stockscan backtest rsi2 --sweep params/sweep.yaml`); web UI for sweep config + heatmap output deferred to v1.5. |
+| **Parameter sweeps** | **Engine supports them in v1; UI ships in v1.5** | Backtester accepts a parameter grid and runs the cartesian product in parallel. CLI-only access in v1 (`stockscan backtest run rsi2_meanrev --sweep params/sweep.yaml`); web UI for sweep config + heatmap output deferred to v1.5. |
 | **Strategy tags** | `('mean_reversion', 'trend_following', 'breakout', 'momentum', 'long_only', 'short_only', 'pairs')` as the initial vocabulary | Free-form strings are allowed; UI surfaces tags as filter chips on the Strategies page and in scan grouping. |
 
 If any of those defaults look wrong, flag them — otherwise I'll bake them into Phase 0.

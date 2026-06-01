@@ -18,8 +18,9 @@ class Level:
     """One support or resistance level with strength scoring.
 
     Levels are price values where the symbol has historically reversed.
-    The ``strength`` field is a [0, 1] composite of touch count and
-    recency - higher means more historically significant.
+    The ``strength`` field is a [0, 1] composite of volume-weighted
+    touches, recency, and pivot prominence — higher means more
+    historically significant.
 
     **Polarity / role-reversal.** ``kind`` is set from the level's
     relationship to the *current* close, not from the pivot type that
@@ -31,6 +32,15 @@ class Level:
     ``is_flipped`` property to detect that case in the UI; flipped
     levels are notable setups in classical TA and worth surfacing
     distinctly from never-tested levels.
+
+    **Weekly confirmation.** ``confirmed_by_weekly`` is True when the
+    level's cluster price also matches a pivot on the weekly resample
+    of the bar history (within the same cluster tolerance). Multi-
+    timeframe confirmation is a long-standing strength tiebreak in
+    classical TA — a level that shows up on both timeframes is harder
+    structure than one that only shows up daily. Use this flag to
+    visually emphasise such levels (e.g., a thicker / solid line vs.
+    dashed for daily-only).
     """
 
     price: float
@@ -40,6 +50,7 @@ class Level:
     last_touch_days_ago: int  # 0 = today, larger = older
     distance_pct: float  # signed % from current close (negative = below)
     origin: str = "pivot_high"  # 'pivot_high' | 'pivot_low' — pivot type that produced this level
+    confirmed_by_weekly: bool = False  # True if a weekly-pivot exists within cluster tolerance
 
     @property
     def is_flipped(self) -> bool:

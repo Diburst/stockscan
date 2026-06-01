@@ -46,10 +46,27 @@ async def strategy_detail(name: str, request: Request):
     # cheaper than walking the whole models dir).
     model_artifact = safe(lambda: load_model(name), label=f"load_model[{name}]")
 
+    # Strategies that keep their knobs as ClassVar constants in the file
+    # (no params_model) get a "Tuning knobs" table built from the class's
+    # own primitive attributes; strategies with a params_model fall through
+    # to the JSON-schema panel.
+    knobs: list[tuple[str, object]] | None = None
+    if cls.params_model is None:
+        skip = {"name", "version", "display_name", "description", "manual",
+                "tags", "regime_affinity", "default_affinity",
+                "applicable_regimes", "params_model"}
+        knobs = [
+            (k, v) for k, v in vars(cls).items()
+            if not k.startswith("_")
+            and k not in skip
+            and isinstance(v, (int, float, str, bool))
+        ]
+
     return render(
         request,
         "strategies/detail.html",
         strategy=cls,
         schema=cls.params_json_schema(),
+        knobs=knobs,
         model=model_artifact,
     )

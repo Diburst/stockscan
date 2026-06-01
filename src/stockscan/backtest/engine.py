@@ -66,7 +66,9 @@ log = logging.getLogger(__name__)
 @dataclass(frozen=True, slots=True)
 class BacktestConfig:
     strategy_cls: type[Strategy]
-    params: StrategyParams
+    # ``None`` when the strategy declares no params_model (knobs live as
+    # ClassVar constants on the strategy class — edit-and-bump model).
+    params: StrategyParams | None
     start_date: date
     end_date: date
     starting_capital: Decimal = Decimal("1000000")
@@ -152,11 +154,11 @@ class BacktestEngine:
         # trading day; cache it so a multi-year run pays it once per date.
         self._members_cache: dict[date, list[str]] = {}
 
-        # Reset sector_rs's run-scoped caches so this run fetches fresh composites
-        # (and doesn't reuse a prior run's). Eliminates ~2 DB round-trips per
-        # (symbol, day) — the dominant backtest cost.
+        # Reset relative-strength's run-scoped caches so this run fetches fresh
+        # composites (and doesn't reuse a prior run's). Eliminates ~2 DB
+        # round-trips per (symbol, day) — the dominant backtest cost.
         try:
-            from stockscan.technical.indicators.sector_rs import clear_cache as _clear_rs
+            from stockscan.indicators.relative_strength import clear_cache as _clear_rs
             _clear_rs()
         except Exception:
             pass

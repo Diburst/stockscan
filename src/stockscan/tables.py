@@ -121,24 +121,10 @@ strategy_versions = Table(
     PrimaryKeyConstraint("strategy_name", "strategy_version"),
 )
 
-strategy_configs = Table(
-    "strategy_configs",
-    metadata,
-    Column("config_id", BigInteger, primary_key=True),
-    Column("strategy_name", Text, nullable=False),
-    Column("strategy_version", Text, nullable=False),
-    Column("params_json", JSONB, nullable=False),
-    Column("params_hash", Text, nullable=False),
-    Column("risk_pct_override", Numeric(5, 4)),
-    Column("active", Boolean, nullable=False, server_default="true"),
-    Column("created_at", TIMESTAMP(timezone=True), nullable=False, server_default="NOW()"),
-    Column("created_by", Text),
-    Column("note", Text),
-    ForeignKeyConstraint(
-        ["strategy_name", "strategy_version"],
-        ["strategy_versions.strategy_name", "strategy_versions.strategy_version"],
-    ),
-)
+# NOTE: strategy_configs was retired in migration 0016. Strategy tunable knobs
+# now live in the strategy file (ClassVar constants for the "edit-and-bump"
+# model, pydantic Field defaults for params_model strategies) and the live
+# runner uses file defaults directly — no DB shadow.
 
 strategy_runs = Table(
     "strategy_runs",
@@ -146,7 +132,6 @@ strategy_runs = Table(
     Column("run_id", BigInteger, primary_key=True),
     Column("strategy_name", Text, nullable=False),
     Column("strategy_version", Text, nullable=False),
-    Column("config_id", BigInteger, ForeignKey("strategy_configs.config_id"), nullable=False),
     Column("run_at", TIMESTAMP(timezone=True), nullable=False, server_default="NOW()"),
     Column("as_of_date", Date, nullable=False),
     Column("universe_size", Integer, nullable=False),
@@ -168,7 +153,6 @@ signals = Table(
     Column("run_id", BigInteger, ForeignKey("strategy_runs.run_id")),
     Column("strategy_name", Text, nullable=False),
     Column("strategy_version", Text, nullable=False),
-    Column("config_id", BigInteger, ForeignKey("strategy_configs.config_id"), nullable=False),
     Column("symbol", Text, nullable=False),
     Column("side", Text, nullable=False),
     Column("score", Numeric(10, 6)),

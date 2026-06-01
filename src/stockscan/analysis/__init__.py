@@ -29,6 +29,7 @@ from __future__ import annotations
 
 from stockscan.analysis.batch import analyze_watchlist
 from stockscan.analysis.chart import render_chart_svg
+from stockscan.analysis.chart_data import build_chart_payload
 from stockscan.analysis.engine import analyze_symbol
 from stockscan.analysis.state import (
     ExpectedRange,
@@ -50,5 +51,6 @@ __all__ = [
     "VolatilityState",
     "analyze_symbol",
     "analyze_watchlist",
+    "build_chart_payload",
     "render_chart_svg",
 ]

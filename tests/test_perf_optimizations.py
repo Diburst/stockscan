@@ -4,9 +4,9 @@ These don't measure speed — they prove the fast paths produce identical result
 to the slow ones they replaced:
 
   1. engine._bars searchsorted slice == the old `index.date <= as_of` mask.
-  2. compute_technical_score on a tail window == on the full history
+  2. ReversalSwing.reversal_score on a tail window == on the full history
      (the basis for reversal_swing bounding its indicator compute).
-  3. sector_rs caches the sector map + composite bars (one fetch each per run).
+  3. relative_strength caches the sector map + composite bars (one fetch each per run).
 """
 
 from __future__ import annotations
@@ -17,10 +17,9 @@ from decimal import Decimal
 import numpy as np
 import pandas as pd
 
-import stockscan.technical.indicators.sector_rs as srs
+import stockscan.indicators.relative_strength as srs
 from stockscan.backtest.engine import BacktestConfig, BacktestEngine
-from stockscan.strategies.reversal_swing import ReversalSwing, ReversalSwingParams
-from stockscan.technical.score import compute_technical_score
+from stockscan.strategies.reversal_swing import ReversalSwing
 
 
 def _frame(n: int, start: str = "2022-01-03") -> pd.DataFrame:
@@ -51,7 +50,7 @@ def test_bars_searchsorted_matches_date_mask():
 
     cfg = BacktestConfig(
         strategy_cls=ReversalSwing,
-        params=ReversalSwingParams(),
+        params=None,
         start_date=date(2022, 6, 1),
         end_date=date(2023, 6, 1),
         universe=["X"],
@@ -69,6 +68,12 @@ def test_bars_searchsorted_matches_date_mask():
 # ======================================================================
 def _bottom_frame(n: int = 420) -> pd.DataFrame:
     up = list(np.linspace(70, 100, n - 23))
+    # v1.4.0 pivot floor gate requires a confirmed swing low BELOW the
+    # eventual hook close inside the trailing 60-bar lookback. Insert a 7-bar
+    # V into the up-trend at a fixed offset before the dip — well within the
+    # pivot lookback regardless of n.
+    v_idx = len(up) - 21  # ~17 bars before the shelf starts
+    up[v_idx:v_idx + 7] = [98.0, 96.0, 95.0, 94.0, 95.0, 96.0, 98.0]
     shelf = [100, 102, 100, 102, 99, 101, 100, 102, 99, 101, 100, 102]
     dip = [99, 97, 95, 94]
     hook = [96.5]
@@ -93,8 +98,9 @@ def _bottom_frame(n: int = 420) -> pd.DataFrame:
 def test_compute_score_is_tail_invariant():
     full = _bottom_frame(420)
     as_of = full.index[-1].date()
-    s_full = compute_technical_score(None, full, as_of)
-    s_tail = compute_technical_score(None, full.tail(240), as_of)
+    strat = ReversalSwing()
+    s_full = strat.reversal_score(full, as_of)
+    s_tail = strat.reversal_score(full.tail(240), as_of)
     assert s_full is not None and s_tail is not None
     assert s_tail.score == s_full.score  # identical: trailing-window indicators
 

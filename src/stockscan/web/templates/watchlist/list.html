@@ -16,14 +16,32 @@
     </div>
   {% endif %}
 
-  <!-- Quick actions strip -->
-  <div class="flex justify-end">
-    <a href="/analysis"
-       class="inline-flex items-center gap-1.5 text-sm px-3 py-2 rounded
-              bg-ink-900 text-white hover:bg-ink-800 transition-colors min-h-[40px]"
-       title="Run a fresh per-symbol technical analysis (with charts) for every watched name">
-      📊 Analyse all watched
-    </a>
+  <!-- Quick actions strip: data-freshness indicator + refresh + analysis link -->
+  <div class="flex items-center justify-between flex-wrap gap-3">
+    <div class="text-xs text-ink-500"
+         title="Date of the most recent end-of-day bar across all watched symbols. Click Refresh to pull the latest from the data provider.">
+      {% if bars_as_of %}
+        Bars as of <span class="font-mono">{{ bars_as_of }}</span>
+      {% else %}
+        No bars stored yet
+      {% endif %}
+    </div>
+    <div class="flex items-center gap-2">
+      <form action="/watchlist/refresh-bars" method="post">
+        <button type="submit"
+                class="inline-flex items-center gap-1.5 text-sm px-3 py-2 rounded
+                       border border-ink-300 bg-white hover:bg-ink-100 transition-colors min-h-[40px]"
+                title="Pull the latest end-of-day bars for the S&P 500 universe + every watched symbol, re-run all strategies, then jump to Analysis. Equivalent to `stockscan refresh daily`.">
+          ↻ Refresh bars
+        </button>
+      </form>
+      <a href="/analysis"
+         class="inline-flex items-center gap-1.5 text-sm px-3 py-2 rounded
+                bg-ink-900 text-white hover:bg-ink-800 transition-colors min-h-[40px]"
+         title="Run a fresh per-symbol technical analysis (with charts) for every watched name">
+        📊 Analyse all watched
+      </a>
+    </div>
   </div>
 
   <!-- Add a symbol -->
@@ -74,7 +92,7 @@
           {"label": "Last close", "align": "right", "help": "Most recent end-of-day close"},
           {"label": "Δ", "align": "right", "help": "Today's percentage change vs. prior close"},
           {"label": "Volume", "align": "right", "help": "Today's traded share volume"},
-          {"label": "Tech", "align": "center", "help": "Direction-agnostic technical bias from RSI(14) + MACD. Positive = bullish recent action; negative = bearish."},
+          {"label": "Tech", "align": "center", "help": "reversal_swing composite score (RSI(2) + MACD + ATR + pivots + sector RS + volume confirm). Click for the full per-symbol Analysis."},
           {"label": "Target", "align": "left", "help": "Optional price target — triggers an alert when crossed"},
           {"label": "Alert", "align": "center", "help": "Whether the price-target alert is currently armed"},
           {"label": "", "align": "right"},
@@ -98,7 +116,11 @@
                 {% if w.last_volume %}{{ "{:,}".format(w.last_volume) }}{% else %}—{% endif %}
               </td>
               <td class="px-4 py-2 text-center align-middle">
-                {{ tech_score(tech_scores.get(w.symbol)) }}
+                <a href="/analysis/{{ w.symbol }}"
+                   class="inline-block hover:opacity-75 transition-opacity"
+                   title="Open the per-symbol Analysis (chart + trend / volatility / momentum breakdown)">
+                  {{ tech_score(tech_scores.get(w.symbol)) }}
+                </a>
               </td>
               <!-- Target editor -->
               <td class="px-4 py-2 align-middle">
@@ -177,10 +199,12 @@
           {% if w.last_volume %}
             <div class="text-xs text-ink-500">vol {{ "{:,}".format(w.last_volume) }}</div>
           {% endif %}
-          <div class="mt-1 text-xs flex items-center gap-2">
+          <a href="/analysis/{{ w.symbol }}"
+             class="mt-1 text-xs flex items-center gap-2 hover:opacity-75 transition-opacity"
+             title="Open the per-symbol Analysis (chart + trend / volatility / momentum breakdown)">
             <span class="text-ink-500">tech</span>
             {{ tech_score(tech_scores.get(w.symbol)) }}
-          </div>
+          </a>
 
           <form action="/watchlist/{{ w.watchlist_id }}/target" method="post"
                 class="mt-3 flex items-center gap-1">

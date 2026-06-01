@@ -120,10 +120,21 @@
       {% endif %}
 
       {% if chart_bars %}
-        <div id="price-chart" style="width:100%; height: 380px;"></div>
+        <div id="price-chart-wrap" style="position: relative;">
+          <div id="price-chart" style="width:100%; height: 380px;"></div>
+          <div id="price-chart-tooltip"
+               style="position: absolute; display: none; pointer-events: none;
+                      top: 8px; left: 12px; z-index: 5;
+                      background: rgba(255,255,255,0.96); border: 1px solid #cbd5e1;
+                      border-radius: 6px; padding: 8px 10px;
+                      font: 12px/1.4 ui-monospace, SFMono-Regular, monospace;
+                      color: #1e293b; box-shadow: 0 2px 6px rgba(0,0,0,0.08); min-width: 180px;">
+          </div>
+        </div>
         <script>
           document.addEventListener('DOMContentLoaded', function() {
             const el = document.getElementById('price-chart');
+            const tooltip = document.getElementById('price-chart-tooltip');
             const chart = LightweightCharts.createChart(el, {
               layout: { background: { color: '#ffffff' }, textColor: '#334155' },
               grid: { vertLines: { color: '#f1f5f9' }, horzLines: { color: '#f1f5f9' } },
@@ -137,8 +148,64 @@
               wickUpColor: '#059669', wickDownColor: '#dc2626',
               borderUpColor: '#059669', borderDownColor: '#dc2626',
             });
-            series.setData({{ chart_bars|tojson }});
+            // Candles occupy the top 75% of the chart; volume gets the bottom 25%.
+            series.priceScale().applyOptions({ scaleMargins: { top: 0.05, bottom: 0.28 } });
+
+            const rawBars = {{ chart_bars|tojson }};
+            series.setData(rawBars);
             series.setMarkers({{ chart_markers|tojson }});
+
+            // Volume histogram on an overlay price scale. Up-day bars are green,
+            // down-day bars red — matching the candle convention.
+            const volumeSeries = chart.addHistogramSeries({
+              priceFormat: { type: 'volume' },
+              priceScaleId: '',  // overlay, doesn't share the candle axis
+            });
+            volumeSeries.priceScale().applyOptions({ scaleMargins: { top: 0.78, bottom: 0 } });
+            volumeSeries.setData(rawBars.map(b => ({
+              time:  b.time,
+              value: b.volume,
+              color: b.close >= b.open ? 'rgba(5,150,105,0.5)' : 'rgba(220,38,38,0.5)',
+            })));
+
+            // Hover tooltip — Lightweight Charts has no built-in OHLCV readout, so we
+            // subscribe to crosshair moves and render our own. Shows date, open, high,
+            // low, close (color-coded vs open) and the day's volume.
+            const fmt2 = v => v == null ? '—' : v.toFixed(2);
+            const fmtVol = v => {
+              if (v == null) return '—';
+              if (v >= 1e9) return (v / 1e9).toFixed(2) + 'B';
+              if (v >= 1e6) return (v / 1e6).toFixed(2) + 'M';
+              if (v >= 1e3) return (v / 1e3).toFixed(1) + 'K';
+              return v.toLocaleString();
+            };
+            chart.subscribeCrosshairMove(param => {
+              if (!param.time || !param.point
+                  || param.point.x < 0 || param.point.x > el.clientWidth
+                  || param.point.y < 0 || param.point.y > el.clientHeight) {
+                tooltip.style.display = 'none';
+                return;
+              }
+              const c = param.seriesData.get(series);
+              const v = param.seriesData.get(volumeSeries);
+              if (!c) { tooltip.style.display = 'none'; return; }
+              const dirColor = c.close >= c.open ? '#059669' : '#dc2626';
+              const dirArrow = c.close >= c.open ? '▲' : '▼';
+              tooltip.innerHTML =
+                '<div style="font-weight:600; margin-bottom:4px;">' + param.time + '</div>' +
+                '<div><span style="color:#64748b">O</span> ' + fmt2(c.open) + '</div>' +
+                '<div><span style="color:#64748b">H</span> ' + fmt2(c.high) + '</div>' +
+                '<div><span style="color:#64748b">L</span> ' + fmt2(c.low)  + '</div>' +
+                '<div><span style="color:#64748b">C</span> ' +
+                  '<span style="color:' + dirColor + '; font-weight:600;">' +
+                    fmt2(c.close) + ' ' + dirArrow +
+                  '</span></div>' +
+                '<div style="margin-top:4px; padding-top:4px; border-top:1px solid #e2e8f0;">' +
+                  '<span style="color:#64748b">Vol</span> ' + fmtVol(v ? v.value : null) +
+                '</div>';
+              tooltip.style.display = 'block';
+            });
+
             chart.timeScale().fitContent();
             new ResizeObserver(() => chart.applyOptions({ width: el.clientWidth }))
                 .observe(el);

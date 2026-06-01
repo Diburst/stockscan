@@ -13,11 +13,11 @@
      days                    — int
      signals_refresh_error   — str | None
      signals_refresh_summary — dict | None
-     filter_symbol, filter_side, filter_score_min, filter_score_max,
-     filter_tech_min, filter_tech_max — current filter values
+     filter_symbol, filter_side, filter_score_min, filter_score_max
+                              — current filter values
      sort_key, sort_dir       — current sort state
 #}
-{% from "_macros.html" import card, badge, empty, pill_link, time_ago, tech_score, loading_spinner %}
+{% from "_macros.html" import card, badge, empty, pill_link, time_ago, loading_spinner %}
 
 {# ---- Helper: build a URL preserving all current filter/sort/strategy state ---- #}
 {#  Only emit params that carry a value — empty-string floats cause FastAPI
@@ -29,8 +29,6 @@ days={{ days }}&show_rejected={{ 'true' if show_rejected else 'false' }}
 {%- if filter_side %}&side={{ filter_side }}{% endif -%}
 {%- if filter_score_min is not none %}&score_min={{ filter_score_min }}{% endif -%}
 {%- if filter_score_max is not none %}&score_max={{ filter_score_max }}{% endif -%}
-{%- if filter_tech_min is not none %}&tech_min={{ filter_tech_min }}{% endif -%}
-{%- if filter_tech_max is not none %}&tech_max={{ filter_tech_max }}{% endif -%}
 {%- endmacro -%}
 
 {# ---- Helper: sortable column header ---- #}
@@ -180,26 +178,12 @@ days={{ days }}&show_rejected={{ 'true' if show_rejected else 'false' }}
                placeholder="1.00"
                class="px-2 py-1.5 rounded border border-ink-300 text-sm font-mono w-20">
       </div>
-      <div>
-        <label class="block text-xs text-ink-500 mb-1">Tech min</label>
-        <input type="number" step="0.01" name="tech_min"
-               value="{{ filter_tech_min if filter_tech_min is not none else '' }}"
-               placeholder="-1.00"
-               class="px-2 py-1.5 rounded border border-ink-300 text-sm font-mono w-20">
-      </div>
-      <div>
-        <label class="block text-xs text-ink-500 mb-1">Tech max</label>
-        <input type="number" step="0.01" name="tech_max"
-               value="{{ filter_tech_max if filter_tech_max is not none else '' }}"
-               placeholder="1.00"
-               class="px-2 py-1.5 rounded border border-ink-300 text-sm font-mono w-20">
-      </div>
       <div class="flex gap-2">
         <button type="submit"
                 class="px-3 py-1.5 rounded bg-ink-900 text-white text-xs">
           Filter
         </button>
-        {% if filter_symbol or filter_side or filter_score_min is not none or filter_score_max is not none or filter_tech_min is not none or filter_tech_max is not none %}
+        {% if filter_symbol or filter_side or filter_score_min is not none or filter_score_max is not none %}
           <a href="/signals?{% if active_strategy %}strategy={{ active_strategy }}&{% endif %}days={{ days }}&show_rejected={{ 'true' if show_rejected else 'false' }}{% if sort_key %}&sort={{ sort_key }}&dir={{ sort_dir }}{% endif %}"
              class="px-3 py-1.5 rounded border border-ink-300 text-xs text-ink-500 hover:bg-ink-100">
             Clear
@@ -212,7 +196,7 @@ days={{ days }}&show_rejected={{ 'true' if show_rejected else 'false' }}
   <!-- Passing signals -->
   {% call card(
     title="Passing signals (" ~ passing|length ~ ")",
-    subtitle="Last " ~ days ~ " days" ~ (" · filtered" if filter_symbol or filter_side or filter_score_min is not none or filter_score_max is not none or filter_tech_min is not none or filter_tech_max is not none else "")
+    subtitle="Last " ~ days ~ " days" ~ (" · filtered" if filter_symbol or filter_side or filter_score_min is not none or filter_score_max is not none else "")
   ) %}
     {% if passing %}
       {# Desktop table #}
@@ -224,7 +208,6 @@ days={{ days }}&show_rejected={{ 'true' if show_rejected else 'false' }}
               {{ sort_th("Side", "side") }}
               {{ sort_th("Strategy", "strategy") }}
               {{ sort_th("Score", "score", align="right") }}
-              {{ sort_th("Tech", "tech", align="center", help="Technical confirmation score: positive = technicals confirm the setup; negative = technicals contradict.") }}
               {{ sort_th("Entry", "entry", align="right") }}
               {{ sort_th("Stop", "stop", align="right") }}
               {{ sort_th("Qty", "qty", align="right") }}
@@ -240,7 +223,6 @@ days={{ days }}&show_rejected={{ 'true' if show_rejected else 'false' }}
                 <td class="px-4 py-2">{{ badge(sig.side, "ok" if sig.side == "long" else "bad") }}</td>
                 <td class="px-4 py-2 text-ink-700">{{ sig.strategy_name }}</td>
                 <td class="px-4 py-2 text-right">{{ "%.2f"|format(sig.score|float) if sig.score else "—" }}</td>
-                <td class="px-4 py-2 text-center">{{ tech_score(sig.tech_score) }}</td>
                 <td class="px-4 py-2 text-right font-mono">${{ "%.2f"|format(sig.suggested_entry|float) }}</td>
                 <td class="px-4 py-2 text-right font-mono text-bad-600">${{ "%.2f"|format(sig.suggested_stop|float) }}</td>
                 <td class="px-4 py-2 text-right">{{ sig.suggested_qty or "—" }}</td>
@@ -273,7 +255,6 @@ days={{ days }}&show_rejected={{ 'true' if show_rejected else 'false' }}
             <div class="text-xs text-ink-700 mt-0.5 flex items-center gap-2">
               <span>{{ badge(sig.side, "ok" if sig.side == "long" else "bad") }}</span>
               <span>{{ sig.strategy_name }} · score {{ "%.2f"|format(sig.score|float) if sig.score else "—" }}</span>
-              <span>tech {{ tech_score(sig.tech_score) }}</span>
             </div>
             <div class="text-xs mt-1 font-mono">
               entry <span class="font-semibold">${{ "%.2f"|format(sig.suggested_entry|float) }}</span>

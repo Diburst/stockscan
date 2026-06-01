@@ -103,7 +103,11 @@ class Strategy(ABC):
     description: ClassVar[str] = ""  # one-paragraph teaser (UI cards)
     manual: ClassVar[str] = ""  # long-form, beginner-friendly walkthrough
     tags: ClassVar[tuple[str, ...]] = ()
-    params_model: ClassVar[type[StrategyParams]]
+    # Optional. Set this on a subclass when the strategy wants pydantic-validated
+    # params (useful for backtest parameter sweeps). Strategies that prefer to
+    # keep all knobs as ClassVar constants in the file (the "edit-and-bump"
+    # model) leave this as None and instantiate with no arguments.
+    params_model: ClassVar[type[StrategyParams] | None] = None
     default_risk_pct: ClassVar[float] = 0.01
 
     # ----- Regime preferences (v2 — soft sizing) -----
@@ -127,7 +131,20 @@ class Strategy(ABC):
     # (e.g., abstract intermediate base classes).
     __abstract__: ClassVar[bool] = False
 
-    def __init__(self, params: StrategyParams) -> None:
+    def __init__(self, params: StrategyParams | None = None) -> None:
+        # Strategies that declare ``params_model`` accept a pydantic instance
+        # (and validate it); strategies that keep their knobs as ClassVar
+        # constants accept no params at all and ``self.params`` is None.
+        if self.params_model is None:
+            if params is not None:
+                raise TypeError(
+                    f"{type(self).__name__} declares no params_model — "
+                    f"instantiate with no arguments (got {type(params).__name__})."
+                )
+            self.params: StrategyParams | None = None
+            return
+        if params is None:
+            params = self.params_model()
         if not isinstance(params, self.params_model):
             raise TypeError(
                 f"{type(self).__name__} expected params of type "
@@ -184,18 +201,25 @@ class Strategy(ABC):
             return "unknown"
 
     @classmethod
-    def params_json_schema(cls) -> dict[str, object]:
-        """JSON Schema for the strategy's params (used by UI form rendering)."""
+    def params_json_schema(cls) -> dict[str, object] | None:
+        """JSON Schema for the strategy's params, or None when the strategy
+        doesn't expose a pydantic params model."""
+        if cls.params_model is None:
+            return None
         return cls.params_model.model_json_schema()
 
     @classmethod
-    def hash_params(cls, params: StrategyParams) -> str:
-        """Stable SHA-256 of canonical-JSON params. Used for params_hash in DB."""
-        canonical = json.dumps(
-            params.model_dump(mode="json"),
-            sort_keys=True,
-            separators=(",", ":"),
-        )
+    def hash_params(cls, params: StrategyParams | None) -> str:
+        """Stable SHA-256 of canonical-JSON params (or of the empty object when
+        the strategy has no params_model)."""
+        if params is None:
+            canonical = "{}"
+        else:
+            canonical = json.dumps(
+                params.model_dump(mode="json"),
+                sort_keys=True,
+                separators=(",", ":"),
+            )
         return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
     @classmethod
@@ -222,7 +246,9 @@ class Strategy(ABC):
         if getattr(cls, "__abstract__", False):
             return
         # Verify required class attributes exist before registering.
-        for attr in ("name", "version", "display_name", "params_model"):
+        # params_model is intentionally NOT in this set — it is optional;
+        # strategies that keep their knobs as ClassVar constants leave it None.
+        for attr in ("name", "version", "display_name"):
             if not hasattr(cls, attr):
                 raise TypeError(
                     f"Strategy subclass {cls.__name__} is missing required class "

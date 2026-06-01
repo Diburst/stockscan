@@ -1,7 +1,7 @@
 """`stockscan backtest debug SYMBOL` — the per-day reversal-score inspector.
 
 Runs the CLI command end-to-end against a synthetic sawtooth (no DB) by
-monkeypatching ``get_bars`` and making ``sector_rs`` abstain (as it does in a
+monkeypatching ``get_bars`` and making relative strength abstain (as it does in a
 single-symbol run with no composite). Asserts the tool runs, writes a
 full-precision CSV with the expected schema, and reports the score breakdown.
 
@@ -52,9 +52,9 @@ def _patched(monkeypatch):
         "stockscan.data.store.get_bars",
         lambda symbol, start, end, *a, **k: (df if symbol == "TSLA" else pd.DataFrame()),
     )
-    # No sector composite in a single-symbol run → sector_rs abstains cleanly.
+    # No sector composite in a single-symbol run → relative strength abstains cleanly.
     monkeypatch.setattr(
-        "stockscan.technical.indicators.sector_rs._composite_symbol_for",
+        "stockscan.indicators.relative_strength._composite_symbol_for",
         lambda *a, **k: None,
     )
     return df
@@ -64,8 +64,9 @@ def test_debug_runs_and_writes_csv(_patched, tmp_path):
     csv = tmp_path / "tsla_debug.csv"
     res = CliRunner().invoke(
         app,
-        ["backtest", "debug", "TSLA", "--from", "2023-01-02", "--to", "2024-01-10",
-         "--csv", str(csv)],
+        ["backtest", "debug", "reversal_swing", "TSLA",
+         "--from", "2023-01-02", "--to", "2024-01-10",
+         "--out", str(csv)],
     )
     assert res.exit_code == 0, res.output
     assert csv.exists()
@@ -74,22 +75,25 @@ def test_debug_runs_and_writes_csv(_patched, tmp_path):
     for col in ("date", "close", "score", "D", "C", "reversal_trigger",
                 "pivot_proximity", "trend_location", "volume_confirm", "decision"):
         assert col in out.columns
-    # The score was actually computed on most days (not all-None / all-warmup).
-    assert out["score"].notna().sum() > 100
+    # The score is computed on the hook days (positive trigger). With the v1.2.0
+    # gate, "no-turn" days legitimately return None, so most days are blank —
+    # what we want to verify is that the hook days actually produced a real
+    # number, not that "most days have a score."
+    assert out["score"].notna().sum() > 0
 
 
 def test_debug_bottoms_now_enter(_patched, tmp_path):
-    """After the fix: the turn and the level co-occur on V-bottoms, so entries fire.
-
-    The 3-bar pivot approach window means the dip low printed 1–2 bars before the
-    up-hook still counts as 'at the level' on the hook day, so bottoms clear
-    entry_threshold instead of topping out just under it.
-    """
+    """After the v1.2.0 gate: the turn and the level co-occur on V-bottoms, so
+    entries fire on the hook day. (The pre-v1.2.0 test also asserted ``top``
+    days were flagged — that branch is unreachable now because top setups
+    return None from reversal_score, so the debug command never marks a day
+    as ``top``. Stops and time-stop carry exits.)"""
     csv = tmp_path / "out.csv"
     res = CliRunner().invoke(
         app,
-        ["backtest", "debug", "TSLA", "--from", "2023-01-02", "--to", "2024-01-10",
-         "--csv", str(csv)],
+        ["backtest", "debug", "reversal_swing", "TSLA",
+         "--from", "2023-01-02", "--to", "2024-01-10",
+         "--out", str(csv)],
     )
     assert res.exit_code == 0, res.output
     out = pd.read_csv(csv)
@@ -98,9 +102,10 @@ def test_debug_bottoms_now_enter(_patched, tmp_path):
     pv = out["pivot_proximity"].fillna(0.0)
     turn = rt >= 0.5            # the bounce/hook fired
     level = pv >= 0.3           # price at a support level
-    # The two bottom signals now line up on the same day at least once...
+    # The two bottom signals line up on the same day at least once...
     assert (turn & level).sum() > 0
-    # ...so bottoms actually generate entries (previously zero on this sawtooth).
+    # ...so bottoms actually generate entries.
     assert (out["decision"] == "ENTER").sum() > 0
-    # Tops still register as exits.
-    assert (out["decision"] == "top").sum() > 0
+    # And the gate prevents any day from being flagged as a top (the score
+    # is None for top setups, so the "top" decision branch is never entered).
+    assert (out["decision"] == "top").sum() == 0

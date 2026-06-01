@@ -114,6 +114,10 @@ async def backtest_detail(
                     "high": float(row["high"]),
                     "low": float(row["low"]),
                     "close": float(row["close"]),
+                    # Volume rides along with each bar so the chart can render a
+                    # histogram in the bottom panel; soft-fail if the column is
+                    # missing (some test fixtures don't include it).
+                    "volume": float(row["volume"]) if "volume" in row and row["volume"] is not None else 0.0,
                 })
 
         # Trades for the selected symbol; build chart markers from them.

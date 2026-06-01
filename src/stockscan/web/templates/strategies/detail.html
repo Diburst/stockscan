@@ -125,10 +125,40 @@
     {% endcall %}
   {% endif %}
 
-  {% call card(title="Parameter schema",
-               subtitle="Editing in v1.5; for now, override defaults via strategy_configs SQL or in code") %}
-    <pre class="text-xs bg-ink-100 p-3 rounded overflow-auto">{{ schema|tojson(indent=2) }}</pre>
-  {% endcall %}
+  {% if knobs %}
+    {% call card(title="Tuning knobs",
+                 subtitle="Edit these in the strategy file and bump version — they take effect on the next scan with no DB shadow") %}
+      <table class="w-full text-sm">
+        <thead class="text-xs uppercase text-ink-500 border-b border-ink-300/40">
+          <tr>
+            <th class="text-left px-3 py-2">Knob</th>
+            <th class="text-right px-3 py-2">Value</th>
+            <th class="text-left px-3 py-2 pl-6">Type</th>
+          </tr>
+        </thead>
+        <tbody class="divide-y divide-ink-300/40">
+          {% for k, v in knobs %}
+            <tr>
+              <td class="px-3 py-2 font-mono">{{ k }}</td>
+              <td class="px-3 py-2 text-right font-mono font-semibold">{{ v }}</td>
+              <td class="px-3 py-2 pl-6 text-ink-500 font-mono">{{ v.__class__.__name__ }}</td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      <p class="text-xs text-ink-500 mt-3">
+        Source of truth lives in
+        <code class="bg-ink-100 px-1 rounded font-mono">stockscan.strategies.{{ strategy.name }}</code>.
+        To change a value: edit the constant, bump <code class="bg-ink-100 px-1 rounded font-mono">version</code>,
+        and redeploy. Past versions stay queryable; new signals tag with the new version.
+      </p>
+    {% endcall %}
+  {% elif schema %}
+    {% call card(title="Parameter schema",
+                 subtitle="Pydantic schema for backtest sweeps and per-call overrides") %}
+      <pre class="text-xs bg-ink-100 p-3 rounded overflow-auto">{{ schema|tojson(indent=2) }}</pre>
+    {% endcall %}
+  {% endif %}
 
   <a href="/strategies" class="inline-flex items-center px-4 py-2 rounded border border-ink-300 text-sm">
     ← Back to strategies

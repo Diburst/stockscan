@@ -14,20 +14,23 @@ from datetime import date as _date, timedelta as _timedelta
 
 from stockscan.config import settings
 from stockscan.data.backfill import backfill_symbol
-from stockscan.data.providers.eodhd import EODHDProvider
+from stockscan.data.providers.eodhd import EODHDError, EODHDProvider
 from stockscan.data.store import get_bars
-from stockscan.technical import compute_technical_score
+from stockscan.scan import refresh_signals
+from stockscan.strategies.reversal_swing import ReversalSwing
 from stockscan.watchlist.store import (
     add_to_watchlist,
     list_watchlist,
     remove_from_watchlist,
     set_target,
     toggle_alert,
+    watchlist_symbols,
 )
 from stockscan.web.deps import (
     flash_redirect,
     get_session,
     hx_toast_response,
+    rate_limit_check,
     render,
     safe,
 )
@@ -70,6 +73,16 @@ def _backfill_history(symbol: str) -> str:
 router = APIRouter(prefix="/watchlist")
 
 
+def _bars_as_of(items: list) -> _date | None:
+    """Latest bar date seen across the watchlist (i.e. data freshness)."""
+    dates = [it.last_bar_date for it in items if it.last_bar_date is not None]
+    if not dates:
+        return None
+    latest = max(dates)
+    # `last_bar_date` is a datetime in UTC on the WatchlistItem; coerce to date.
+    return latest.date() if hasattr(latest, "date") else latest
+
+
 @router.get("")
 async def watchlist_list(
     request: Request,
@@ -77,11 +90,13 @@ async def watchlist_list(
     s: Session = Depends(get_session),
 ):
     items = list_watchlist(session=s)
-    # Compute neutral-mode technical scores for each symbol on the fly. The
-    # watchlist is small (~20-50 names), and bars are already in the local DB,
-    # so this is fast — sub-100ms typical. No caching layer needed at this scale.
+    # Show each watched symbol's reversal_swing score on the fly. The watchlist
+    # is small (~20-50 names) and bars are already local, so this is fast
+    # (sub-100ms typical). We go through the strategy class because the strategy
+    # is the only home for its scoring — same code path the scanner uses.
     today = _date.today()
     one_year_ago = today.replace(year=today.year - 1)
+    revsw = ReversalSwing()
     tech_scores: dict[str, float | None] = {}
     for item in items:
         bars = safe(
@@ -92,8 +107,8 @@ async def watchlist_list(
             tech_scores[item.symbol] = None
             continue
         result = safe(
-            lambda b=bars: compute_technical_score(None, b, today),
-            label=f"watchlist.compute_technical_score[{item.symbol}]",
+            lambda b=bars: revsw.reversal_score(b, today),
+            label=f"watchlist.reversal_score[{item.symbol}]",
         )
         tech_scores[item.symbol] = result.score if result is not None else None
     return render(
@@ -101,8 +116,121 @@ async def watchlist_list(
         "watchlist/list.html",
         items=items,
         tech_scores=tech_scores,
+        bars_as_of=_bars_as_of(items),
         err=err,
     )
+
+
+# How many calendar days to backfill in the per-symbol watchlist pass.
+# Matches the bulk refresh window (days_back=7) so the two passes cover the
+# same range. The per-symbol path is idempotent (it checks ``latest_bar_date``
+# and only fetches gaps) so a few extra days of overlap cost nothing.
+_WATCHLIST_REFRESH_DAYS = 7
+
+
+@router.post("/refresh-bars")
+async def watchlist_refresh_bars(
+    request: Request,
+    s: Session = Depends(get_session),
+):
+    """Pull fresh EOD bars for the S&P 500 universe + watchlist, re-run all
+    strategies, then redirect to /analysis so the freshly-derived indicators
+    are visible immediately.
+
+    Two-phase fetch scope:
+
+      1. **Bulk-EOD** over the S&P 500 universe ∪ watchlist (via
+         ``refresh_signals``), pulled one trading day at a time on the US
+         exchange. This covers the vast majority of names cheaply (one API
+         call per day, not per symbol).
+
+      2. **Per-symbol backfill** over every watchlist symbol. The bulk
+         endpoint is exchange-scoped (``US``), so names listed on other
+         exchanges — and freshly-added watchlist names without prior
+         history — are NOT covered by phase 1. Phase 2 plugs that gap.
+         ``backfill_symbol`` is idempotent: it reads ``latest_bar_date``
+         and fetches only the missing window, so for names already updated
+         in phase 1 this is a zero-cost no-op.
+
+    Equivalent to ``stockscan refresh daily`` from the CLI plus the
+    explicit watchlist coverage guarantee. Per the "indicators must follow
+    bars" requirement, lazily-computed indicators on /watchlist and
+    /analysis will pick up the new bars on the next page load — that's the
+    redirect target.
+    """
+    cooldown_remaining = rate_limit_check("watchlist.refresh", cooldown_seconds=15)
+    if cooldown_remaining is not None:
+        return flash_redirect(
+            "/analysis",
+            "warn",
+            f"Just refreshed — try again in {int(cooldown_remaining) + 1}s",
+        )
+
+    api_key = settings.eodhd_api_key.get_secret_value()
+    if not api_key:
+        return flash_redirect(
+            "/watchlist",
+            "error",
+            "EODHD_API_KEY is not set. Add it to your .env to refresh bars.",
+        )
+
+    watchlist_backfilled = 0
+    per_symbol_failures: list[str] = []
+    try:
+        with EODHDProvider(api_key=api_key) as provider:
+            # ---- Phase 1: bulk S&P 500 + watchlist via the universe filter ----
+            result = refresh_signals(
+                provider, days_back=_WATCHLIST_REFRESH_DAYS, session=s
+            )
+
+            # ---- Phase 2: per-symbol catch-up for every watchlist name ----
+            # Belt-and-suspenders. Catches non-US-exchange names and
+            # freshly-added symbols whose bars never made it through the
+            # bulk filter. Soft-fail per symbol — one bad ticker shouldn't
+            # blank out the whole refresh.
+            watched = watchlist_symbols(session=s)
+            start = _date.today() - _timedelta(days=_WATCHLIST_REFRESH_DAYS)
+            for sym in sorted(watched):
+                try:
+                    watchlist_backfilled += backfill_symbol(provider, sym, start=start)
+                except Exception as exc:
+                    log.warning(
+                        "watchlist refresh: per-symbol backfill failed for %s: %s",
+                        sym, exc,
+                    )
+                    per_symbol_failures.append(sym)
+    except EODHDError as exc:
+        log.warning("watchlist refresh: provider error: %s", exc)
+        try:
+            s.rollback()
+        except Exception as roll_exc:
+            log.warning("watchlist refresh: rollback failed: %s", roll_exc)
+        return flash_redirect("/watchlist", "error", f"Provider error: {exc}")
+    except Exception as exc:
+        log.exception("watchlist refresh: unexpected error")
+        try:
+            s.rollback()
+        except Exception as roll_exc:
+            log.warning("watchlist refresh: rollback failed: %s", roll_exc)
+        return flash_redirect("/watchlist", "error", f"Refresh failed: {exc}")
+
+    msg_parts = [
+        f"{result.bars_upserted} bulk bar(s) across {result.bars_days_covered} day(s)",
+    ]
+    if watchlist_backfilled:
+        msg_parts.append(f"{watchlist_backfilled} extra watchlist bar(s)")
+    msg_parts.append(
+        f"{result.signals_emitted} signal(s) across "
+        f"{result.strategies_run} strategy(ies)"
+    )
+    if per_symbol_failures:
+        msg_parts.append(
+            f"{len(per_symbol_failures)} watchlist fetch(es) failed "
+            f"({', '.join(per_symbol_failures[:3])}{'…' if len(per_symbol_failures) > 3 else ''})"
+        )
+    msg = "Bars refreshed — " + "; ".join(msg_parts)
+    kind = "warn" if (result.failures or per_symbol_failures) else "success"
+    return flash_redirect("/analysis", kind, msg)
 
 
 # Inline replacement returned to HTMX requests after a successful add — the

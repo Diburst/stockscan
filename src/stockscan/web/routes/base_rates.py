@@ -25,8 +25,7 @@ async def base_rates_for_signal(
     sig = s.execute(
         text(
             """
-            SELECT signal_id, strategy_name, strategy_version, symbol, as_of_date,
-                   config_id
+            SELECT signal_id, strategy_name, strategy_version, symbol, as_of_date
             FROM signals WHERE signal_id = :sid
             """
         ),
@@ -35,14 +34,11 @@ async def base_rates_for_signal(
     if sig is None:
         return render(request, "base_rates/show.html", signal=None, report=None)
 
+    # File defaults — strategy_configs is retired; the strategy file is the
+    # source of truth for params. Strategies without a params_model are
+    # instantiated with no args.
     cls = STRATEGY_REGISTRY.get(sig.strategy_name)
-    config_row = s.execute(
-        text("SELECT params_json FROM strategy_configs WHERE config_id = :cid"),
-        {"cid": sig.config_id},
-    ).first()
-    params = (
-        cls.params_model(**config_row.params_json) if config_row else cls.params_model()
-    )
+    params = cls.params_model() if cls.params_model is not None else None
     as_of: date = sig.as_of_date
 
     try:

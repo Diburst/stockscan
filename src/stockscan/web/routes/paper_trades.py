@@ -59,16 +59,15 @@ async def create_paper_trade(
             f"/signals/{signal_id}", "error", "Quantity must be positive."
         )
 
-    # Fetch the signal + its context
+    # Fetch the signal + its context (strategy_configs is retired; we snapshot
+    # params from the strategy class itself at trade-open time below).
     sig_sql = text(
         """
         SELECT s.signal_id, s.strategy_name, s.strategy_version,
                s.symbol, s.side, s.as_of_date, s.metadata,
                s.suggested_entry, s.suggested_stop, s.suggested_target,
-               s.suggested_qty,
-               c.params_json
+               s.suggested_qty
         FROM signals s
-        LEFT JOIN strategy_configs c ON c.config_id = s.config_id
         WHERE s.signal_id = :sid
         """
     )
@@ -76,26 +75,16 @@ async def create_paper_trade(
     if signal is None:
         return flash_redirect("/signals", "error", "Signal not found.")
 
-    # Grab technical score snapshot
-    tech_sql = text(
-        """
-        SELECT score, breakdown, computed_at
-        FROM technical_scores
-        WHERE symbol = :sym AND as_of_date = :d AND strategy_name = :n
-        """
-    )
-    tech_row = safe(
-        lambda: s.execute(
-            tech_sql,
-            {"sym": signal.symbol, "d": signal.as_of_date, "n": signal.strategy_name},
-        ).first(),
-        label="paper_trade.tech_score",
-    )
+    # Snapshot the strategy-owned score breakdown at open time. Strategies that
+    # compose their score from indicator primitives stash it under
+    # metadata.score_breakdown; the parallel technical_scores annotation is gone.
     tech_snapshot = None
-    if tech_row:
+    _sb = (signal.metadata or {}).get("score_breakdown") if signal.metadata else None
+    if isinstance(_sb, dict) and _sb:
+        _sb_meta = _sb.get("_meta", {})
         tech_snapshot = {
-            "score": float(tech_row.score) if tech_row.score else None,
-            "breakdown": tech_row.breakdown,
+            "score": _sb_meta.get("score") if isinstance(_sb_meta, dict) else None,
+            "breakdown": _sb,
         }
 
     # Grab regime snapshot
@@ -115,16 +104,38 @@ async def create_paper_trade(
             "credit_score": float(regime.credit_score) if regime.credit_score else None,
         }
 
-    # Build auto-close rules from signal metadata + strategy params
+    # Build auto-close rules from signal metadata + the strategy class itself.
+    # We snapshot the current-version params at open time (strategy_configs is
+    # retired; the file is the source of truth — a version bump is the unit of
+    # change). For strategies with no params_model, the knobs are read off the
+    # class directly.
     auto_close_rules: dict = {
         "stop_price": float(stop),
     }
     if target:
         auto_close_rules["target_price"] = float(target)
-    # Extract time-stop from strategy params if available
-    params_json = signal.params_json or {}
-    if isinstance(params_json, str):
-        params_json = json.loads(params_json)
+
+    from stockscan.strategies import STRATEGY_REGISTRY, discover_strategies
+    discover_strategies()
+    params_json: dict = {}
+    try:
+        sig_cls = STRATEGY_REGISTRY.get(signal.strategy_name)
+        if sig_cls.params_model is not None:
+            params_json = sig_cls.params_model().model_dump(mode="json")
+        else:
+            # Surface the strategy's ClassVar knobs by name. Only attributes the
+            # strategy itself declared (not inherited from Strategy) are
+            # interesting here.
+            params_json = {
+                k: getattr(sig_cls, k)
+                for k in vars(sig_cls)
+                if isinstance(getattr(sig_cls, k), (int, float, str, bool))
+                and not k.startswith("_")
+                and k not in {"name", "version", "display_name", "description", "manual"}
+            }
+    except KeyError:
+        params_json = {}
+
     if "holding_days" in (signal.metadata or {}):
         auto_close_rules["time_stop_days"] = signal.metadata["holding_days"]
     elif "max_holding_days" in params_json:

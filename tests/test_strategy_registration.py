@@ -29,7 +29,7 @@ def test_ensure_strategy_version_upserts_with_conflict_guard():
     assert "INSERT INTO strategy_versions" in sql
     assert "ON CONFLICT (strategy_name, strategy_version) DO NOTHING" in sql
     assert params["n"] == "reversal_swing"
-    assert params["v"] == "1.0.0"
+    assert params["v"] == ReversalSwing.version
     assert params["dn"]  # display_name present
     assert isinstance(params["t"], list)  # tags as a list (TEXT[])
     assert isinstance(params["schema"], str)  # JSON-serialized params schema

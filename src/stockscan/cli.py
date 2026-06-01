@@ -52,18 +52,41 @@ Watchlist + technical:
   stockscan watchlist add SYMBOL         — add with optional --target / --direction
   stockscan watchlist remove ID
   stockscan watchlist check-alerts       — fire any pending price-target alerts now
-  stockscan technical list               — registered technical indicators
-  stockscan technical backfill           — fill missing scores for past signals
-  stockscan technical recompute --since  — overwrite existing scores from a date
 
-Backtesting:
-  stockscan backtest run STRATEGY        — event-driven backtest, persists results
-  stockscan backtest list                — saved backtest runs
-  stockscan backtest debug SYMBOL        — per-day reversal-score breakdown for one
-                                            symbol: why entries/exits (don't) fire.
-                                            Recomputes the exact score the backtest
-                                            sees; flags ENTER days, top-exit days,
-                                            per-indicator sub-scores. --all / --csv.
+Backtesting (shared shape: positional STRATEGY first, then options):
+  stockscan backtest run STRATEGY               — event-driven backtest, persists
+                                                   results. Omit --symbol = full
+                                                   historical S&P 500.
+  stockscan backtest list                       — saved backtest runs (--strategy
+                                                   to filter).
+  stockscan backtest debug STRATEGY SYMBOL      — per-day reversal-score breakdown
+                                                   for one symbol: why entries /
+                                                   exits (don't) fire. Recomputes
+                                                   the same score the backtest sees,
+                                                   flags ENTER days, top-exit days,
+                                                   per-indicator sub-scores. --all
+                                                   prints every day; --out PATH writes
+                                                   the full breakdown to CSV.
+  stockscan backtest export RUN_ID              — dump one run to JSON (trades +
+                                                   score breakdowns + equity +
+                                                   per-day recompute + regime
+                                                   overlay) — review-ready file.
+  stockscan backtest profile STRATEGY           — wrap BacktestEngine.run() in
+                                                   cProfile and dump the top-N
+                                                   hotspots. Same arg shape as
+                                                   `run`. Use BEFORE proposing any
+                                                   perf change (DESIGN §4.4.1
+                                                   "Performance shape").
+                                                   `python tools/profile_backtest.py`
+                                                   is a thin shim for the same
+                                                   command — useful when the venv
+                                                   `stockscan` script isn't on PATH.
+
+Standard option shape across backtest commands:
+  -s/--symbol SYMBOL   repeatable; omit = sensible default per command
+  --from ISO_DATE      default: 5 years before --to
+  --to ISO_DATE        default: today
+  --out/-o PATH        output file path (CSV / JSON / .prof — implied by command)
 
 Scheduled jobs (production: invoked by launchd):
   stockscan jobs nightly-scan            — refresh + scan + alerts + notify
@@ -107,7 +130,6 @@ backtest_app = typer.Typer(help="Run and inspect backtests.", no_args_is_help=Tr
 scan_app = typer.Typer(help="Run live or backdated scans.", no_args_is_help=True)
 jobs_app = typer.Typer(help="Scheduled job orchestration.", no_args_is_help=True)
 watchlist_app = typer.Typer(help="Manage the watchlist.", no_args_is_help=True)
-technical_app = typer.Typer(help="Technical-confirmation scoring.", no_args_is_help=True)
 ml_app = typer.Typer(help="Meta-labeling: train + inspect XGBoost models.", no_args_is_help=True)
 signals_app = typer.Typer(
     help="Signal-table operations (e.g., backfill historical scans).",
@@ -128,7 +150,6 @@ app.add_typer(backtest_app, name="backtest")
 app.add_typer(scan_app, name="scan")
 app.add_typer(jobs_app, name="jobs")
 app.add_typer(watchlist_app, name="watchlist")
-app.add_typer(technical_app, name="technical")
 app.add_typer(ml_app, name="ml")
 app.add_typer(signals_app, name="signals")
 app.add_typer(analysis_app, name="analysis")
@@ -606,182 +627,6 @@ def strategies_show(name: str) -> None:
 
 
 # ----------------------------------------------------------------------
-# Technical-score commands
-# ----------------------------------------------------------------------
-@technical_app.command("list")
-def technical_list_cmd() -> None:
-    """Show registered technical indicators."""
-    from stockscan.technical import TECH_REGISTRY, discover_technical_indicators
-
-    discover_technical_indicators()
-    if not TECH_REGISTRY:
-        console.print("[yellow]No technical indicators registered.[/yellow]")
-        return
-    table = Table(title="Registered technical indicators")
-    table.add_column("Name")
-    table.add_column("Description")
-    table.add_column("Default params")
-    for cls in TECH_REGISTRY.all():
-        defaults = cls.params_model().model_dump()
-        table.add_row(
-            cls.name,
-            cls.description,
-            ", ".join(f"{k}={v}" for k, v in defaults.items()),
-        )
-    console.print(table)
-
-
-def _backfill_tech_scores(
-    *,
-    since: str | None,
-    limit: int,
-    strategy: str | None,
-    force: bool,
-) -> tuple[int, int, int]:
-    """Shared work for backfill / recompute. Returns (succeeded, skipped, failed)."""
-    from datetime import date as _date
-    from datetime import timedelta as _td
-
-    from sqlalchemy import text
-
-    from stockscan.data.store import get_bars
-    from stockscan.db import session_scope
-    from stockscan.technical import compute_technical_score, upsert_score
-
-    discover_strategies()
-
-    where_clauses = []
-    params: dict[str, object] = {}
-    if not force:
-        where_clauses.append(
-            "NOT EXISTS (SELECT 1 FROM technical_scores t "
-            "WHERE t.symbol = s.symbol AND t.as_of_date = s.as_of_date "
-            "AND t.strategy_name = s.strategy_name)"
-        )
-    if since:
-        where_clauses.append("s.as_of_date >= :since")
-        params["since"] = _date.fromisoformat(since)
-    if strategy:
-        where_clauses.append("s.strategy_name = :strat")
-        params["strat"] = strategy
-    where_sql = (" WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
-    limit_sql = f" LIMIT {int(limit)}" if limit > 0 else ""
-
-    sql = text(
-        f"""
-        SELECT s.signal_id, s.symbol, s.strategy_name, s.as_of_date
-        FROM signals s
-        {where_sql}
-        ORDER BY s.as_of_date DESC, s.symbol
-        {limit_sql}
-        """
-    )
-
-    succeeded = skipped = failed = 0
-    with session_scope() as sess:
-        rows = sess.execute(sql, params).all()
-    if not rows:
-        return 0, 0, 0
-
-    console.print(f"[cyan]→[/cyan] processing {len(rows):,} signal(s)")
-
-    # Group rows by symbol so we load bars once per symbol per range.
-    bars_cache: dict[str, pd.DataFrame] = {}  # type: ignore[name-defined]
-
-    for i, row in enumerate(rows, 1):
-        if i % 200 == 0:
-            console.print(f"  … {i:,} processed")
-        try:
-            strategy_cls = STRATEGY_REGISTRY.get(row.strategy_name)
-        except KeyError:
-            skipped += 1
-            log.debug(
-                "tech-backfill: skipping signal %s — strategy %s not registered",
-                row.signal_id,
-                row.strategy_name,
-            )
-            continue
-        try:
-            bars = bars_cache.get(row.symbol)
-            if bars is None or bars.index[-1].date() < row.as_of_date:
-                # Load a year of history up to the most recent date we'll need
-                # for this symbol. Re-querying for later dates is rare since
-                # we sort DESC by date.
-                end = row.as_of_date
-                start = end - _td(days=400)
-                bars = get_bars(row.symbol, start, end)
-                bars_cache[row.symbol] = bars
-            view = bars[bars.index.date <= row.as_of_date] if not bars.empty else bars
-            if view.empty:
-                skipped += 1
-                continue
-            view.attrs["symbol"] = row.symbol
-            score = compute_technical_score(strategy_cls, view, row.as_of_date)
-            if score is None:
-                skipped += 1
-                continue
-            upsert_score(row.symbol, row.as_of_date, row.strategy_name, score)
-            succeeded += 1
-        except Exception as exc:
-            failed += 1
-            log.error("tech-backfill failed for signal %s: %s", row.signal_id, exc)
-
-    return succeeded, skipped, failed
-
-
-@technical_app.command("backfill")
-def technical_backfill_cmd(
-    since: str | None = typer.Option(
-        None, "--since", help="Only process signals on or after this ISO date"
-    ),
-    limit: int = typer.Option(0, "--limit", help="Max signals to process (0 = all)"),
-    strategy: str | None = typer.Option(
-        None, "--strategy", help="Restrict to one strategy (e.g. rsi2_meanrev)"
-    ),
-) -> None:
-    """Compute technical scores for existing signals that don't have one.
-
-    Idempotent: signals that already have a score are skipped (use
-    `technical recompute` to overwrite). Uses local bars only — no API calls.
-    """
-    succeeded, skipped, failed = _backfill_tech_scores(
-        since=since, limit=limit, strategy=strategy, force=False
-    )
-    if succeeded == skipped == failed == 0:
-        console.print("[green]✓[/green] no missing tech scores")
-        return
-    console.print(
-        f"[green]✓[/green] {succeeded:,} scored · {skipped:,} skipped · {failed:,} failed"
-    )
-
-
-@technical_app.command("recompute")
-def technical_recompute_cmd(
-    since: str | None = typer.Option(
-        None, "--since", help="Only process signals on or after this ISO date"
-    ),
-    limit: int = typer.Option(0, "--limit", help="Max signals to process (0 = all)"),
-    strategy: str | None = typer.Option(None, "--strategy"),
-    yes: bool = typer.Option(False, "--yes", help="Skip confirmation"),
-) -> None:
-    """Recompute and OVERWRITE technical scores. Use after changing scoring
-    formulas or indicator parameters."""
-    if not yes:
-        ok = typer.confirm(
-            "This will overwrite existing technical scores. Continue?", default=False
-        )
-        if not ok:
-            console.print("[yellow]Aborted.[/yellow]")
-            raise typer.Exit(0)
-    succeeded, skipped, failed = _backfill_tech_scores(
-        since=since, limit=limit, strategy=strategy, force=True
-    )
-    console.print(
-        f"[green]✓[/green] {succeeded:,} recomputed · {skipped:,} skipped · {failed:,} failed"
-    )
-
-
-# ----------------------------------------------------------------------
 # Watchlist commands
 # ----------------------------------------------------------------------
 @watchlist_app.command("list")
@@ -942,21 +787,34 @@ def scan_run(
 # ----------------------------------------------------------------------
 @backtest_app.command("run")
 def backtest_run(
-    strategy: str = typer.Argument(..., help="Registered strategy name (e.g. rsi2_meanrev)"),
-    start: str = typer.Option("2020-01-01", "--from", help="ISO start date"),
-    end: str | None = typer.Option(None, "--to", help="ISO end date; default = today"),
+    # Positional: the thing the command operates on.
+    strategy: str = typer.Argument(..., help="Registered strategy name (e.g. reversal_swing)"),
+    # Universe selection.
+    universe: list[str] | None = typer.Option(
+        None, "--symbol", "-s",
+        help="Restrict to these symbols (repeatable). Omit = historical S&P 500.",
+    ),
+    # Date range. None defaults are resolved in the body — typer can't compute
+    # "5 years before today" at module-import time. The 5-year default avoids
+    # drifting historical anchors (the old hard-coded 2020-01-01 became less
+    # useful each year).
+    start: str | None = typer.Option(
+        None, "--from", help="ISO start date. Default: 5 years before --to.",
+    ),
+    end: str | None = typer.Option(
+        None, "--to", help="ISO end date. Default: today.",
+    ),
+    # Execution / sizing parameters.
     capital: float = typer.Option(1_000_000.0, "--capital"),
     risk_pct: float = typer.Option(0.01, "--risk-pct"),
     slippage_bps: float = typer.Option(5.0, "--slippage-bps"),
     commission: float = typer.Option(0.0, "--commission"),
-    universe: list[str] | None = typer.Option(
-        None, "--symbol", "-s", help="Restrict to these symbols (repeatable)"
-    ),
+    # Output / persistence.
     save: bool = typer.Option(True, "--save/--no-save", help="Persist results to DB"),
     note: str | None = typer.Option(None, "--note"),
 ) -> None:
     """Run a backtest and print the performance report."""
-    from datetime import date as _date
+    from datetime import date as _date, timedelta as _timedelta
     from decimal import Decimal as _Dec
 
     from stockscan.backtest import (
@@ -967,11 +825,13 @@ def backtest_run(
 
     discover_strategies()
     cls = STRATEGY_REGISTRY.get(strategy)
+    end_d = _date.fromisoformat(end) if end else _date.today()
+    start_d = _date.fromisoformat(start) if start else end_d - _timedelta(days=5 * 365)
     cfg = BacktestConfig(
         strategy_cls=cls,
-        params=cls.params_model(),
-        start_date=_date.fromisoformat(start),
-        end_date=_date.fromisoformat(end) if end else _date.today(),
+        params=cls.params_model() if cls.params_model is not None else None,
+        start_date=start_d,
+        end_date=end_d,
         starting_capital=_Dec(str(capital)),
         risk_pct=_Dec(str(risk_pct)),
         commission_per_trade=_Dec(str(commission)),
@@ -1052,20 +912,31 @@ def backtest_list(
 
 @backtest_app.command("debug")
 def backtest_debug(
+    # Positional order: strategy first (the lens), then symbol (the subject).
+    # Matches `backtest run STRATEGY` and `backtest profile STRATEGY` so the
+    # mental model is "every backtest verb starts with the strategy."
+    strategy: str = typer.Argument(..., help="Registered strategy name (e.g. reversal_swing)."),
     symbol: str = typer.Argument(..., help="Ticker to inspect (e.g. TSLA)."),
-    strategy: str = typer.Option(
-        "reversal_swing", "--strategy", help="Registered strategy name."
+    # Date range — same shape as `run`. None defaults resolve in the body.
+    start: str | None = typer.Option(
+        None, "--from", help="ISO start date. Default: 5 years before --to.",
     ),
-    start: str = typer.Option("2022-01-01", "--from", help="ISO start date."),
-    end: str | None = typer.Option(None, "--to", help="ISO end date; default = today."),
+    end: str | None = typer.Option(
+        None, "--to", help="ISO end date. Default: today.",
+    ),
+    # Output.
+    out_path: str | None = typer.Option(
+        None, "--out", "-o",
+        help="Write the full per-day breakdown to this CSV path.",
+    ),
+    # Command-specific.
     show_all: bool = typer.Option(
-        False, "--all", help="Print every trading day, not just signal / near-threshold days."
+        False, "--all",
+        help="Print every trading day, not just signal / near-threshold days.",
     ),
     band: float = typer.Option(
-        0.10, "--band", help="'Near a threshold' = score within this of entry/exit threshold."
-    ),
-    csv_path: str | None = typer.Option(
-        None, "--csv", help="Write the full per-day breakdown to this CSV path."
+        0.10, "--band",
+        help="'Near a threshold' = score within this of entry/exit threshold.",
     ),
 ) -> None:
     """Per-day reversal-score breakdown for ONE symbol — why entries/exits (don't) fire.
@@ -1086,25 +957,28 @@ def backtest_debug(
     import pandas as _pd
 
     from stockscan.data.store import get_bars
-    from stockscan.technical.indicators import discover_technical_indicators
-    from stockscan.technical.score import compute_technical_score
 
     discover_strategies()
-    discover_technical_indicators()
     try:
         cls = STRATEGY_REGISTRY.get(strategy)
     except KeyError as exc:
         console.print(f"[red]{exc}[/red]")
         raise typer.Exit(1)
 
-    params = cls.params_model()
-    strat = cls(params)
-    entry_th = float(getattr(params, "entry_threshold", 0.35))
-    exit_th = float(getattr(params, "exit_threshold", 0.35))
+    strat = cls()  # uses file defaults for both pydantic + ClassVar-knob strategies
+    if not hasattr(strat, "reversal_score"):
+        console.print(
+            f"[red]{cls.name} does not expose a reversal_score(view, as_of) method.[/red]\n"
+            "[dim]`backtest debug` requires a strategy with a public reversal_score(view, as_of) "
+            "method (currently only reversal_swing).[/dim]"
+        )
+        raise typer.Exit(1)
+    entry_th = float(getattr(strat, "entry_threshold", 0.35))
+    exit_th = float(getattr(strat, "exit_threshold", 0.35))
     req = strat.required_history()
 
-    start_d = _date.fromisoformat(start)
     end_d = _date.fromisoformat(end) if end else _date.today()
+    start_d = _date.fromisoformat(start) if start else end_d - _timedelta(days=5 * 365)
 
     # Same generous warmup window the backtest engine pulls (req + buffer), so the
     # earliest in-range day already has enough history for the 200-day terms.
@@ -1140,7 +1014,7 @@ def backtest_debug(
             continue
         view_tail = view.tail(req + 5)
         view_tail.attrs["symbol"] = symbol
-        sc = compute_technical_score(cls, view_tail, as_of)
+        sc = strat.reversal_score(view_tail, as_of)
         fired = bool(strat.signals(view, as_of))  # authoritative ENTER (incl. ATR guard)
 
         b = sc.breakdown if sc else {}
@@ -1257,9 +1131,183 @@ def backtest_debug(
         summary.add_row("[bold]both same day[/bold]", f"[bold]{int((turn & level).sum())}[/bold]")
     console.print(summary)
 
-    if csv_path:
-        df.to_csv(csv_path, index=False)
-        console.print(f"[green]✓[/green] wrote per-day breakdown → {csv_path}")
+    if out_path:
+        df.to_csv(out_path, index=False)
+        console.print(f"[green]✓[/green] wrote per-day breakdown → {out_path}")
+
+
+@backtest_app.command("export")
+def backtest_export(
+    run_id: int = typer.Argument(..., help="backtest_runs.run_id to export."),
+    output: str = typer.Option(
+        None, "--out", "-o",
+        help="Output path. Default: ./bt<run_id>.json in the current directory.",
+    ),
+    include_per_day: bool = typer.Option(
+        True, "--per-day/--no-per-day",
+        help="Include per-symbol per-day reversal-score recompute over the run "
+             "window. Slow but lets a reviewer see near-miss days and which "
+             "inputs were trending. Disable for a faster trade-only export.",
+    ),
+    include_regime: bool = typer.Option(
+        True, "--regime/--no-regime",
+        help="Include the daily market-regime overlay across the run window.",
+    ),
+    indent: int = typer.Option(
+        2, "--indent",
+        help="JSON indentation. Pass 0 for the smallest file size.",
+    ),
+) -> None:
+    """Export a backtest result to a single JSON file ready for offline review.
+
+    The export bundles: the backtest_runs row + expanded metrics, derived
+    summary statistics (win rate, R-multiple distribution, exit-reason mix,
+    per-input contribution averages on winners vs losers), every trade with
+    its strategy-supplied entry_metadata (which carries the per-input score
+    breakdown for composite strategies), the equity curve, the per-day
+    reversal-score recompute per traded symbol, and the daily market regime
+    overlay.
+
+    Hand the resulting file to a reviewer (or paste-up to a Claude session)
+    and they have full context to evaluate decisions and propose tuning. The
+    JSON is self-describing — every section is keyed clearly and the schema
+    version is in the top-level payload.
+
+    Examples:
+
+      stockscan backtest export 20
+      stockscan backtest export 20 --out /tmp/bt20.json
+      stockscan backtest export 20 --no-per-day      # faster trade-only export
+    """
+    import json as _json
+    from pathlib import Path as _Path
+
+    from stockscan.backtest.export import export_run
+
+    out_path = _Path(output) if output else _Path(f"bt{run_id}.json")
+
+    try:
+        payload = export_run(
+            run_id,
+            include_per_day=include_per_day,
+            include_regime=include_regime,
+        )
+    except LookupError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1)
+
+    # ``default=str`` covers any Decimal/date/datetime that the loaders didn't
+    # explicitly stringify (defensive — the loaders already render them).
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(
+        _json.dumps(payload, indent=indent or None, default=str, sort_keys=False)
+    )
+
+    n_trades = len(payload.get("trades") or [])
+    n_eq     = len(payload.get("equity_curve") or [])
+    n_regime = len(payload.get("regime_overlay") or []) if include_regime else 0
+    pds      = payload.get("per_day_scores") or {}
+    n_syms   = len((pds.get("symbols") or {})) if include_per_day else 0
+    size_kb  = out_path.stat().st_size // 1024
+
+    console.print(
+        f"[green]✓[/green] exported run #{run_id} → "
+        f"[cyan]{out_path}[/cyan] ({size_kb:,} KB)"
+    )
+    bits = [f"{n_trades} trades", f"{n_eq} equity points"]
+    if include_per_day:
+        bits.append(f"{n_syms} symbols × per-day scores")
+    if include_regime:
+        bits.append(f"{n_regime} regime days")
+    console.print(f"  [dim]{' · '.join(bits)}[/dim]")
+
+
+@backtest_app.command("profile")
+def backtest_profile(
+    # Same positional + option shape as `run` so the two are interchangeable.
+    # Profile-specific flags (--top / --sort / --callers / --out) come last.
+    strategy: str = typer.Argument(..., help="Registered strategy name (e.g. reversal_swing)."),
+    # Universe selection — `profile` defaults to a small liquid set so iterative
+    # profiling stays fast; full S&P 500 under cProfile takes ~40 min. Pass
+    # explicit --symbol values or --sp500 to override.
+    universe: list[str] | None = typer.Option(
+        None, "--symbol", "-s",
+        help="Restrict to these symbols (repeatable). Default: small liquid dev set.",
+    ),
+    sp500: bool = typer.Option(
+        False, "--sp500",
+        help="Use historical S&P 500 membership. Mutually exclusive with --symbol.",
+    ),
+    # Date range (same shape as `run`).
+    start: str | None = typer.Option(
+        None, "--from", help="ISO start date. Default: 5 years before --to.",
+    ),
+    end: str | None = typer.Option(
+        None, "--to", help="ISO end date. Default: today.",
+    ),
+    # Execution parameters (same defaults as `run`).
+    capital: float = typer.Option(1_000_000.0, "--capital"),
+    risk_pct: float = typer.Option(0.01, "--risk-pct"),
+    slippage_bps: float = typer.Option(5.0, "--slippage-bps"),
+    # Profile-specific knobs.
+    top: int = typer.Option(30, "--top", help="How many ranked lines to print."),
+    sort: str = typer.Option(
+        "cumtime", "--sort",
+        help="pstats sort key: cumtime (where wall-clock goes), tottime (self-time hotspots), ncalls.",
+    ),
+    callers: str | None = typer.Option(
+        None, "--callers",
+        help="Optional regex; for each matched function print its top callers.",
+    ),
+    out_path: str | None = typer.Option(
+        None, "--out", "-o",
+        help="Optional path to dump the raw .prof file (open with snakeviz / pyinstrument).",
+    ),
+) -> None:
+    """Profile a backtest under cProfile and dump the top-N hotspots.
+
+    Use BEFORE proposing any performance change — the bottleneck is rarely
+    where you expect, and the architecture has multiple caches that make
+    "more caching" the wrong answer most of the time (DESIGN §4.4.1).
+
+    Same argument shape as ``backtest run``. The default universe is a
+    small liquid set (10 symbols) so iterative profiling is fast; pass
+    ``--sp500`` for a full-scale run (~40 minutes under cProfile).
+
+    Examples:
+
+      stockscan backtest profile reversal_swing
+      stockscan backtest profile reversal_swing --from 2023-01-01 --top 40
+      stockscan backtest profile reversal_swing --sp500 --out backtest.prof
+    """
+    from datetime import date as _date, timedelta as _timedelta
+    from decimal import Decimal as _Dec
+
+    from stockscan.backtest.profile import (
+        ProfileOptions,
+        build_profile_config,
+        run_profile,
+    )
+
+    discover_strategies()
+    cls = STRATEGY_REGISTRY.get(strategy)
+    end_d = _date.fromisoformat(end) if end else _date.today()
+    start_d = _date.fromisoformat(start) if start else end_d - _timedelta(days=5 * 365)
+    try:
+        cfg = build_profile_config(
+            strategy_cls=cls,
+            start=start_d,
+            end=end_d,
+            symbols=universe,
+            sp500=sp500,
+            capital=_Dec(str(capital)),
+            risk_pct=_Dec(str(risk_pct)),
+            slippage_bps=_Dec(str(slippage_bps)),
+        )
+    except ValueError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1)
+    run_profile(cfg, ProfileOptions(top=top, sort=sort, callers=callers, out_path=out_path))
 
 
 # ----------------------------------------------------------------------

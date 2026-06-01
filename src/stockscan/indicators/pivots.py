@@ -1,4 +1,4 @@
-"""Pivot proximity — at a support/resistance level (spec §4.4).
+"""Pivot proximity primitive — at a support/resistance level (signal-scoring spec §4.4).
 
 A reversal is only worth trading at a level: positive near **support below**
 (bottom location), negative near **resistance above** (top location). Distances
@@ -8,50 +8,43 @@ are in ATR units so "near" auto-scales to each stock's volatility.
 today's close: a reversal confirms by hooking off the extreme, which lifts the
 close away from the level it just tested, so a single-bar proximity check and the
 turn signal peak on different days. Using the window's low/high keeps "at the
-level" true for the 1–2 bars the turn takes to print.
+level" true for the 1-2 bars the turn takes to print.
 
-No look-ahead: a swing pivot is only *confirmed* `k` bars after it prints (it
-needs `k` bars on its right shoulder), so only pivots at index ``i ≤ as_of − k``
-are considered — the load-bearing correctness point for this indicator. The
-proximity window only reads bars ``≤ as_of`` and does not change which pivots are
+No look-ahead: a swing pivot is only *confirmed* ``k`` bars after it prints (it
+needs ``k`` bars on its right shoulder), so only pivots at index ``i <= as_of − k``
+are considered — the load-bearing correctness point for this primitive. The
+proximity window only reads bars ``<= as_of`` and does not change which pivots are
 eligible.
 
-Pure math is in `_pivot_values` (bars-only, no DB).
+Pure function: bars-only, no DB. Strategy-agnostic.
 """
 
 from __future__ import annotations
 
-from datetime import date
-from typing import TYPE_CHECKING
-
 import pandas as pd
-from pydantic import Field
 
-from stockscan.indicators import atr as compute_atr
-from stockscan.technical.indicators.base import (
-    TechnicalIndicator,
-    TechnicalIndicatorParams,
-)
-
-if TYPE_CHECKING:
-    from stockscan.strategies.base import Strategy
+from stockscan.indicators.ta import atr as compute_atr
 
 
 def _clip(x: float, lo: float = -1.0, hi: float = 1.0) -> float:
     return max(lo, min(hi, x))
 
 
-def _pivot_values(
+def pivot_proximity(
     high: pd.Series,
     low: pd.Series,
     close: pd.Series,
     *,
-    k: int,
-    lookback: int,
-    prox_atr: float,
+    k: int = 3,
+    lookback: int = 60,
+    prox_atr: float = 1.5,
     atr_period: int = 14,
     prox_window: int = 3,
 ) -> dict[str, float] | None:
+    """Signed proximity-to-level read in ``raw`` (+ near support / − near resistance).
+
+    Returns None if there is insufficient history or ATR is unavailable.
+    """
     n = len(close)
     if n < lookback + k + 1:
         return None
@@ -64,7 +57,7 @@ def _pivot_values(
 
     lows = low.to_numpy(dtype=float)
     highs = high.to_numpy(dtype=float)
-    # Confirmed pivots: index i needs k bars on each side (i ≤ n-1-k = no
+    # Confirmed pivots: index i needs k bars on each side (i <= n-1-k = no
     # look-ahead) and must fall within the trailing lookback window.
     start = max(k, n - 1 - lookback)
     end = n - 1 - k
@@ -85,8 +78,8 @@ def _pivot_values(
     # off the extreme (reversal_trigger needs the up/down bar), which mechanically
     # lifts the close away from the level it just tested; without a window the
     # turn and the level peak on different days and neither alone clears the entry
-    # bar. Using the window's low/high keeps "at the level" true for the 1–2 bars
-    # it takes the turn to print. No look-ahead: these are all bars ≤ as_of, and
+    # bar. Using the window's low/high keeps "at the level" true for the 1-2 bars
+    # it takes the turn to print. No look-ahead: these are all bars <= as_of, and
     # which pivots are *eligible* is unchanged (still confirmed-only).
     w = max(1, prox_window)
     approach_low = float(low.iloc[-w:].min())
@@ -115,45 +108,3 @@ def _pivot_values(
         out["resistance"] = round(resistance, 4)
         out["dist_res_atr"] = round((resistance - approach_high) / atr_v, 4)
     return out
-
-
-class PivotProximityParams(TechnicalIndicatorParams):
-    k: int = Field(3, ge=1, le=10, description="Bars each side of a swing pivot.")
-    lookback: int = Field(60, ge=10, le=252, description="Search window for nearest level.")
-    prox_atr: float = Field(1.5, gt=0, description="ATR distance that saturates 'near' to 1.")
-    atr_period: int = Field(14, ge=5, le=50)
-    prox_window: int = Field(
-        3, ge=1, le=10,
-        description="Bars to look back for the closest approach to a level (lets the "
-        "turn's up/down hook still count as 'at the level').",
-    )
-
-
-class TechnicalPivotProximity(TechnicalIndicator):
-    name = "pivot_proximity"
-    description = (
-        "Distance (in ATR) to the nearest confirmed swing support below (+) or "
-        "resistance above (−). The reversal's 'at a level' requirement."
-    )
-    params_model = PivotProximityParams
-    kind = "directional"
-    weight = 0.30
-
-    def values(self, bars: pd.DataFrame, as_of: date) -> dict[str, float] | None:
-        for col in ("high", "low", "close"):
-            if col not in bars.columns:
-                return None
-        p: PivotProximityParams = self.params  # type: ignore[assignment]
-        return _pivot_values(
-            bars["high"],
-            bars["low"],
-            bars["close"],
-            k=p.k,
-            lookback=p.lookback,
-            prox_atr=p.prox_atr,
-            atr_period=p.atr_period,
-            prox_window=p.prox_window,
-        )
-
-    def score(self, values: dict[str, float], strategy: type[Strategy] | None) -> float:
-        return self.clamp(values["raw"])
