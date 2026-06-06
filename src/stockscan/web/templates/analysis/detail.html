@@ -36,6 +36,22 @@
     </div>
   </div>
 
+  {% if macro_events %}
+    <!-- Macro this week — high-importance US releases. Affects vol regime
+         around entry timing; surfaced ABOVE the chart so it's seen first. -->
+    <div class="bg-warn-100/40 border border-warn-600/30 rounded-lg px-4 py-2 text-xs flex items-center gap-2 flex-wrap"
+         title="High-importance US economic releases in the next 7 days. Open Macro this week on the dashboard for the full list.">
+      <span class="uppercase tracking-wide text-warn-600 font-semibold">Macro this week:</span>
+      {% for ev in macro_events %}
+        <span class="inline-flex items-center gap-1">
+          <span class="font-medium">{{ ev.event_type }}</span>
+          <span class="text-ink-500 font-mono">{{ ev.event_ts.strftime('%a %H:%M UTC') }}</span>
+        </span>
+        {% if not loop.last %}<span class="text-ink-400">·</span>{% endif %}
+      {% endfor %}
+    </div>
+  {% endif %}
+
   <!-- Big chart -->
   {% if chart_payload and chart_payload.bars %}
     {% call card(
@@ -725,6 +741,189 @@
       </div>
     {% endcall %}
   {% endif %}
+
+  <!-- Earnings + estimate revisions -->
+  {% if upcoming_earnings or earnings_trends %}
+    {% call card(
+        title="Earnings & analyst revisions",
+        subtitle="Next report date, consensus walk over the last 90 days, and revision counts. Estimate-revision drift is one of the most-studied single-factor signals in the literature."
+    ) %}
+      {% if upcoming_earnings %}
+        <div class="bg-warn-100/40 border border-warn-600/30 rounded px-3 py-2 text-sm mb-3">
+          <span class="uppercase tracking-wide text-xs text-warn-600 font-semibold">Next earnings:</span>
+          <span class="font-mono ml-1">{{ upcoming_earnings.report_date }}</span>
+          <span class="text-ink-700 ml-1">{{ upcoming_earnings.display_when }}</span>
+          {% if upcoming_earnings.estimate is not none %}
+            · consensus EPS <span class="font-mono">{{ "%g"|format(upcoming_earnings.estimate|float) }}</span>
+          {% endif %}
+        </div>
+      {% endif %}
+
+      {% if earnings_trends %}
+        <div class="overflow-x-auto -mx-4">
+          <table class="w-full text-sm min-w-[700px]">
+            <thead class="text-xs uppercase text-ink-500 border-b border-ink-300/40">
+              <tr>
+                <th class="text-left px-4 py-2">Period</th>
+                <th class="text-right px-4 py-2" title="Quarter / year end date the estimate refers to">Ends</th>
+                <th class="text-right px-4 py-2" title="Consensus EPS — current value">EPS est</th>
+                <th class="text-right px-4 py-2" title="Number of sell-side analysts contributing">Analysts</th>
+                <th class="text-right px-4 py-2" title="Percent change in consensus EPS over the last 30 days (current vs. 30 days ago) — captures the magnitude of the revision walk, not just direction. Pairs with the Up 30d / Down 30d counts.">30d EPS Δ</th>
+                <th class="text-right px-4 py-2" title="Upward EPS revisions in the last 30 days">Up 30d</th>
+                <th class="text-right px-4 py-2" title="Downward EPS revisions in the last 30 days">Down 30d</th>
+                <th class="text-right px-4 py-2" title="Net = up − down. Positive = consensus walking higher.">Net 30d</th>
+              </tr>
+            </thead>
+            <tbody class="divide-y divide-ink-300/40">
+              {% for t in earnings_trends %}
+                <tr>
+                  <td class="px-4 py-2">
+                    <span class="text-[10px] uppercase tracking-wide px-1.5 py-0.5 rounded bg-ink-100 text-ink-700 border border-ink-300/60 font-mono">
+                      {{ t.period }}
+                    </span>
+                  </td>
+                  <td class="px-4 py-2 text-right text-xs text-ink-500 font-mono">{{ t.period_end }}</td>
+                  <td class="px-4 py-2 text-right font-mono">
+                    {% if t.eps_estimate_avg is not none %}{{ "%g"|format(t.eps_estimate_avg) }}{% else %}—{% endif %}
+                  </td>
+                  <td class="px-4 py-2 text-right font-mono text-xs">
+                    {% if t.eps_analyst_count is not none %}{{ t.eps_analyst_count }}{% else %}—{% endif %}
+                  </td>
+                  <td class="px-4 py-2 text-right font-mono text-xs
+                             {% if t.trend_30d_change_pct is not none and t.trend_30d_change_pct > 0 %}text-ok-600
+                             {% elif t.trend_30d_change_pct is not none and t.trend_30d_change_pct < 0 %}text-bad-600
+                             {% endif %}">
+                    {% if t.trend_30d_change_pct is not none %}{{ "%+.2f%%"|format(t.trend_30d_change_pct) }}{% else %}—{% endif %}
+                  </td>
+                  <td class="px-4 py-2 text-right font-mono text-xs text-ok-600">
+                    {% if t.eps_revisions_up_30d is not none %}+{{ t.eps_revisions_up_30d }}{% else %}—{% endif %}
+                  </td>
+                  <td class="px-4 py-2 text-right font-mono text-xs text-bad-600">
+                    {% if t.eps_revisions_down_30d is not none %}−{{ t.eps_revisions_down_30d }}{% else %}—{% endif %}
+                  </td>
+                  <td class="px-4 py-2 text-right font-mono font-semibold
+                             {% if t.net_revisions_30d is not none and t.net_revisions_30d > 0 %}text-ok-600
+                             {% elif t.net_revisions_30d is not none and t.net_revisions_30d < 0 %}text-bad-600
+                             {% endif %}">
+                    {% if t.net_revisions_30d is not none %}{% if t.net_revisions_30d > 0 %}+{% endif %}{{ t.net_revisions_30d }}{% else %}—{% endif %}
+                  </td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      {% else %}
+        <p class="text-sm text-ink-500 italic">
+          No estimate-trend data on file. Click Refresh bars on the Watchlist to pull the latest from EODHD.
+        </p>
+      {% endif %}
+    {% endcall %}
+  {% endif %}
+
+  <!-- Recent insider activity (SEC Form 4) — ALWAYS renders so the
+       Refresh button is reachable even when the local store is empty
+       OR the per-page lookup raised an exception. The empty state has
+       its own clearly-labelled branch below the summary band. -->
+  {% call card(
+      title="Recent insider activity",
+      subtitle="Last 90 days of SEC Form 4 filings. Clusters of open-market BUYS (P) are the moderately-strong signal; sales (S) are noisier because of 10b5-1 plans + tax-loss harvesting + grant-driven liquidation."
+  ) %}
+    <!-- Summary band: net count + dollar value, plus on-demand refresh -->
+    <div class="flex items-center justify-between gap-3 flex-wrap mb-3 pb-3 border-b border-ink-300/40">
+      <div class="flex items-center gap-4 flex-wrap text-sm">
+        <div>
+          <span class="text-xs uppercase tracking-wide text-ink-500">Buys</span>
+          <span class="ml-1 font-mono font-semibold text-ok-600">
+            {{ insider_summary.buy_count if insider_summary is not none else 0 }}
+            <span class="text-xs text-ink-500">
+              (${{ "{:,.0f}".format(insider_summary.buy_value if insider_summary is not none else 0) }})
+            </span>
+          </span>
+        </div>
+        <div>
+          <span class="text-xs uppercase tracking-wide text-ink-500">Sales</span>
+          <span class="ml-1 font-mono font-semibold text-bad-600">
+            {{ insider_summary.sell_count if insider_summary is not none else 0 }}
+            <span class="text-xs text-ink-500">
+              (${{ "{:,.0f}".format(insider_summary.sell_value if insider_summary is not none else 0) }})
+            </span>
+          </span>
+        </div>
+        <div>
+          <span class="text-xs uppercase tracking-wide text-ink-500">Net (count)</span>
+          {%- set net_ct = insider_summary.net_count if insider_summary is not none else 0 -%}
+          <span class="ml-1 font-mono font-semibold
+                       {% if net_ct > 0 %}text-ok-600{% elif net_ct < 0 %}text-bad-600{% endif %}">
+            {%- if net_ct > 0 %}+{% endif -%}{{ net_ct }}
+          </span>
+        </div>
+      </div>
+      <form action="/analysis/{{ a.symbol }}/refresh-insider" method="post">
+        <button type="submit"
+                class="text-xs px-3 py-1.5 rounded border border-ink-300 hover:bg-ink-100 transition-colors"
+                title="Pull fresh insider data for this symbol. Costs 10 API credits; subject to a 23-hour cooldown.">
+          ↻ Refresh insider
+        </button>
+      </form>
+    </div>
+
+    {% if insider_txns %}
+      <div class="overflow-x-auto -mx-4">
+        <table class="w-full text-sm min-w-[700px]">
+          <thead class="text-xs uppercase text-ink-500 border-b border-ink-300/40">
+            <tr>
+              <th class="text-left px-4 py-2">Date</th>
+              <th class="text-left px-4 py-2">Insider</th>
+              <th class="text-left px-4 py-2">Role</th>
+              <th class="text-center px-4 py-2">Action</th>
+              <th class="text-right px-4 py-2">Shares</th>
+              <th class="text-right px-4 py-2">Price</th>
+              <th class="text-right px-4 py-2">Value</th>
+            </tr>
+          </thead>
+          <tbody class="divide-y divide-ink-300/40">
+            {% for t in insider_txns %}
+              <tr>
+                <td class="px-4 py-2 text-xs font-mono">{{ t.transaction_date }}</td>
+                <td class="px-4 py-2 text-sm">{{ t.insider_name or "—" }}</td>
+                <td class="px-4 py-2 text-xs text-ink-700">{{ t.insider_title or "—" }}</td>
+                <td class="px-4 py-2 text-center">
+                  {%- if t.is_buy -%}
+                    <span class="inline-block text-[10px] uppercase tracking-wide px-1.5 py-0.5 rounded bg-ok-100 text-ok-600 border border-ok-600/40 font-mono">
+                      Buy
+                    </span>
+                  {%- else -%}
+                    <span class="inline-block text-[10px] uppercase tracking-wide px-1.5 py-0.5 rounded bg-bad-100 text-bad-600 border border-bad-600/40 font-mono">
+                      Sell
+                    </span>
+                  {%- endif -%}
+                </td>
+                <td class="px-4 py-2 text-right font-mono text-xs">
+                  {% if t.shares is not none %}{{ "{:,.0f}".format(t.shares) }}{% else %}—{% endif %}
+                </td>
+                <td class="px-4 py-2 text-right font-mono text-xs">
+                  {% if t.price is not none %}${{ "%.2f"|format(t.price) }}{% else %}—{% endif %}
+                </td>
+                <td class="px-4 py-2 text-right font-mono text-xs font-semibold
+                           {% if t.is_buy %}text-ok-600{% else %}text-bad-600{% endif %}">
+                  {% if t.value is not none %}${{ "{:,.0f}".format(t.value) }}{% else %}—{% endif %}
+                </td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    {% else %}
+      <p class="text-sm text-ink-500 italic">
+        {% if insider_summary is none %}
+          Insider data couldn't be loaded for this symbol (see server logs). Try Refresh insider.
+        {% else %}
+          No insider transactions in the local store for this symbol over the last 90 days.
+          Click Refresh insider to pull from EODHD (10 API credits; 23h per-symbol cooldown).
+        {% endif %}
+      </p>
+    {% endif %}
+  {% endcall %}
 
   <!-- Options context -->
   {% if o.available %}

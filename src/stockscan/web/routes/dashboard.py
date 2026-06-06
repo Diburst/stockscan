@@ -10,6 +10,8 @@ from sqlalchemy.orm import Session
 
 from stockscan.cycles import compute_calendar_state
 from stockscan.db import healthcheck
+from stockscan.earnings import earnings_in_window
+from stockscan.econ_events import upcoming_events
 from stockscan.news import last_fetched_at as news_last_fetched_at
 from stockscan.news import recent_general as recent_news
 from stockscan.positions import list_open_trades
@@ -114,6 +116,40 @@ async def dashboard(request: Request, s: Session = Depends(get_session)):
         _log.warning("dashboard: compute_index_structure() failed: %s", exc, exc_info=True)
         structure_state = None
 
+    # ---- Macro this week card data (econ_events) ----
+    # Default to "medium" importance min so the dashboard shows real
+    # macro risk without burying it under low-amplitude prints. The
+    # rolling window is now → 7 days; that's the canonical "what's
+    # coming this week" surface for swing-trade entry timing.
+    from datetime import datetime as _datetime, timedelta as _timedelta, timezone as _tz
+    try:
+        now_utc = _datetime.now(_tz.utc)
+        macro_events = upcoming_events(
+            start=now_utc,
+            end=now_utc + _timedelta(days=7),
+            country="US",
+            importance_min="medium",
+            session=s,
+        )
+    except Exception as exc:
+        _log.warning("dashboard: upcoming_events() failed: %s", exc, exc_info=True)
+        macro_events = []
+
+    # ---- Earnings this week (watchlist symbols reporting in next 5 days) ----
+    try:
+        from datetime import date as _date_dash
+        today_d = _date_dash.today()
+        watch_set = list(watching) if watching else []
+        watch_earnings = earnings_in_window(
+            watch_set,
+            start=today_d,
+            end=today_d + _timedelta(days=7),
+            session=s,
+        )
+    except Exception as exc:
+        _log.warning("dashboard: earnings_in_window() failed: %s", exc, exc_info=True)
+        watch_earnings = []
+
     return render(
         request,
         "dashboard.html",
@@ -133,4 +169,6 @@ async def dashboard(request: Request, s: Session = Depends(get_session)):
         news_refresh_summary=None,
         calendar_state=calendar_state,
         structure_state=structure_state,
+        macro_events=macro_events,
+        watch_earnings=watch_earnings,
     )

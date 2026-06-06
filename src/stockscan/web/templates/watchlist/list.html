@@ -93,6 +93,9 @@
           {"label": "Δ", "align": "right", "help": "Today's percentage change vs. prior close"},
           {"label": "Volume", "align": "right", "help": "Today's traded share volume"},
           {"label": "Tech", "align": "center", "help": "reversal_swing composite score (RSI(2) + MACD + ATR + pivots + sector RS + volume confirm). Click for the full per-symbol Analysis."},
+          {"label": "Earnings", "align": "center", "help": "Next earnings date with timing (BMO = before market open, AMC = after market close). Refreshes when you click Refresh bars."},
+          {"label": "Est revs 30d", "align": "center", "help": "Net analyst EPS estimate revisions over the last 30 days for next quarter — up minus down. Positive = consensus walking higher."},
+          {"label": "Insider 90d", "align": "center", "help": "Net SEC Form 4 transactions over the last 90 days: open-market purchases (P) minus sales (S). Clusters of buys are the moderately-strong signal; sales are noisier. Refreshes once daily."},
           {"label": "Target", "align": "left", "help": "Optional price target — triggers an alert when crossed"},
           {"label": "Alert", "align": "center", "help": "Whether the price-target alert is currently armed"},
           {"label": "", "align": "right"},
@@ -121,6 +124,50 @@
                    title="Open the per-symbol Analysis (chart + trend / volatility / momentum breakdown)">
                   {{ tech_score(tech_scores.get(w.symbol)) }}
                 </a>
+              </td>
+              {# --- Earnings: timing + days-out -------------------------- #}
+              {%- set earn = next_earnings_by_sym.get(w.symbol) -%}
+              {%- set dte = days_to_earn_by_sym.get(w.symbol) -%}
+              <td class="px-4 py-2 text-center align-middle text-xs font-mono whitespace-nowrap">
+                {% if earn is not none and dte is not none %}
+                  {%- set urgent = dte is not none and dte >= 0 and dte <= 7 -%}
+                  <span class="{% if urgent %}text-bad-600 font-semibold{% else %}text-ink-700{% endif %}"
+                        title="{{ earn.report_date }} · {{ earn.display_when }}">
+                    {{ earn.display_when }} {{ earn.report_date.strftime('%a') }}
+                    {% if dte == 0 %}(today)
+                    {% elif dte > 0 %}({{ dte }}d)
+                    {% else %}({{ -dte }}d ago)
+                    {% endif %}
+                  </span>
+                {% else %}
+                  <span class="text-ink-500">—</span>
+                {% endif %}
+              </td>
+              {# --- Estimate revisions: net 30d ------------------------- #}
+              {%- set rev = revisions_by_sym.get(w.symbol) -%}
+              <td class="px-4 py-2 text-center align-middle text-xs font-mono whitespace-nowrap">
+                {% if rev is not none and rev.net_revisions_30d is not none %}
+                  {%- set net = rev.net_revisions_30d -%}
+                  <span class="{% if net > 0 %}text-ok-600 font-semibold{% elif net < 0 %}text-bad-600 font-semibold{% else %}text-ink-500{% endif %}"
+                        title="Up: {{ rev.eps_revisions_up_30d or 0 }} · Down: {{ rev.eps_revisions_down_30d or 0 }} ({{ rev.period }})">
+                    {%- if net > 0 -%}+{%- endif -%}{{ net }}
+                  </span>
+                {% else %}
+                  <span class="text-ink-500">—</span>
+                {% endif %}
+              </td>
+              {# --- Insider net buys 90d ------------------------- #}
+              {%- set ins = insider_by_sym.get(w.symbol) -%}
+              <td class="px-4 py-2 text-center align-middle text-xs font-mono whitespace-nowrap">
+                {% if ins is not none and ins.has_activity %}
+                  {%- set net_ins = ins.net_count -%}
+                  <span class="{% if net_ins > 0 %}text-ok-600 font-semibold{% elif net_ins < 0 %}text-bad-600 font-semibold{% else %}text-ink-500{% endif %}"
+                        title="Buys: {{ ins.buy_count }} (${{ '{:,.0f}'.format(ins.buy_value) }}) · Sales: {{ ins.sell_count }} (${{ '{:,.0f}'.format(ins.sell_value) }})">
+                    {%- if net_ins > 0 -%}+{%- endif -%}{{ net_ins }}
+                  </span>
+                {% else %}
+                  <span class="text-ink-500" title="No insider activity in the last 90 days, or data not yet refreshed">—</span>
+                {% endif %}
               </td>
               <!-- Target editor -->
               <td class="px-4 py-2 align-middle">
@@ -205,6 +252,27 @@
             <span class="text-ink-500">tech</span>
             {{ tech_score(tech_scores.get(w.symbol)) }}
           </a>
+          {%- set earn = next_earnings_by_sym.get(w.symbol) -%}
+          {%- set dte = days_to_earn_by_sym.get(w.symbol) -%}
+          {%- set rev = revisions_by_sym.get(w.symbol) -%}
+          {% if (earn is not none and dte is not none) or (rev is not none and rev.net_revisions_30d is not none) %}
+            <div class="mt-2 flex items-center gap-3 text-xs flex-wrap">
+              {% if earn is not none and dte is not none %}
+                {%- set urgent = dte is not none and dte >= 0 and dte <= 7 -%}
+                <span class="font-mono {% if urgent %}text-bad-600 font-semibold{% else %}text-ink-700{% endif %}"
+                      title="Next earnings — {{ earn.report_date }} {{ earn.display_when }}">
+                  {{ earn.display_when }} {{ earn.report_date.strftime('%a') }}{% if dte > 0 %} ({{ dte }}d){% elif dte == 0 %} (today){% endif %}
+                </span>
+              {% endif %}
+              {% if rev is not none and rev.net_revisions_30d is not none %}
+                {%- set net = rev.net_revisions_30d -%}
+                <span class="font-mono {% if net > 0 %}text-ok-600 font-semibold{% elif net < 0 %}text-bad-600 font-semibold{% else %}text-ink-500{% endif %}"
+                      title="Net EPS revisions 30d ({{ rev.period }})">
+                  revs {%- if net > 0 %} +{% else %} {% endif -%}{{ net }}
+                </span>
+              {% endif %}
+            </div>
+          {% endif %}
 
           <form action="/watchlist/{{ w.watchlist_id }}/target" method="post"
                 class="mt-3 flex items-center gap-1">

@@ -43,8 +43,11 @@ def _run(session: Session, as_of: _date) -> list[SymbolAnalysis]:
     except Exception as exc:
         log.warning("analyze_watchlist: watchlist lookup failed: %s", exc)
         return []
+    # Alphabetical A→Z. watchlist_symbols returns a set (unordered);
+    # sort so the analysis hub renders in a stable, predictable order
+    # that matches the watchlist page.
     out: list[SymbolAnalysis] = []
-    for sym in symbols:
+    for sym in sorted(symbols):
         try:
             out.append(analyze_symbol(sym, as_of=as_of, session=session))
         except Exception as exc:

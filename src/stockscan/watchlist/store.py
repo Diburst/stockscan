@@ -226,7 +226,7 @@ _LIST_SQL = text(
     FROM watchlist_items w
     LEFT JOIN latest l ON l.symbol = w.symbol AND l.rn = 1
     LEFT JOIN prev   p ON p.symbol = w.symbol AND p.rn = 2
-    ORDER BY w.created_at;
+    ORDER BY w.symbol;
     """
 )
 

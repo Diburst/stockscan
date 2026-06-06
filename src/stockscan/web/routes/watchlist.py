@@ -16,6 +16,9 @@ from stockscan.config import settings
 from stockscan.data.backfill import backfill_symbol
 from stockscan.data.providers.eodhd import EODHDError, EODHDProvider
 from stockscan.data.store import get_bars
+from stockscan.earnings import days_until, next_earnings, refresh_earnings, revision_summary
+from stockscan.econ_events import refresh_economic_events
+from stockscan.insider import net_buys_90d, refresh_insider_for_watchlist
 from stockscan.scan import refresh_signals
 from stockscan.strategies.reversal_swing import ReversalSwing
 from stockscan.watchlist.store import (
@@ -98,6 +101,12 @@ async def watchlist_list(
     one_year_ago = today.replace(year=today.year - 1)
     revsw = ReversalSwing()
     tech_scores: dict[str, float | None] = {}
+    # Per-symbol earnings + revisions + insider enrichment. All safe() —
+    # never blocks the page; missing data renders as "—".
+    next_earnings_by_sym: dict[str, object] = {}
+    days_to_earn_by_sym: dict[str, int | None] = {}
+    revisions_by_sym: dict[str, object] = {}
+    insider_by_sym: dict[str, object] = {}
     for item in items:
         bars = safe(
             lambda sym=item.symbol: get_bars(sym, one_year_ago, today, session=s),
@@ -105,17 +114,45 @@ async def watchlist_list(
         )
         if bars is None or getattr(bars, "empty", True):
             tech_scores[item.symbol] = None
-            continue
-        result = safe(
-            lambda b=bars: revsw.reversal_score(b, today),
-            label=f"watchlist.reversal_score[{item.symbol}]",
+        else:
+            result = safe(
+                lambda b=bars: revsw.reversal_score(b, today),
+                label=f"watchlist.reversal_score[{item.symbol}]",
+            )
+            tech_scores[item.symbol] = result.score if result is not None else None
+
+        earn = safe(
+            lambda sym=item.symbol: next_earnings(sym, as_of=today, session=s),
+            label=f"watchlist.next_earnings[{item.symbol}]",
         )
-        tech_scores[item.symbol] = result.score if result is not None else None
+        next_earnings_by_sym[item.symbol] = earn
+        days_to_earn_by_sym[item.symbol] = (
+            days_until(earn.report_date, today) if earn is not None else None
+        )
+        # Filter to periods ending within the last 12 months so the
+        # column reflects the current forward-looking quarter, not a
+        # stale snapshot for a quarter that ran years ago.
+        revisions_by_sym[item.symbol] = safe(
+            lambda sym=item.symbol: revision_summary(
+                sym,
+                since=today - _timedelta(days=365),
+                session=s,
+            ),
+            label=f"watchlist.revision_summary[{item.symbol}]",
+        )
+        insider_by_sym[item.symbol] = safe(
+            lambda sym=item.symbol: net_buys_90d(sym, session=s),
+            label=f"watchlist.net_buys_90d[{item.symbol}]",
+        )
     return render(
         request,
         "watchlist/list.html",
         items=items,
         tech_scores=tech_scores,
+        next_earnings_by_sym=next_earnings_by_sym,
+        days_to_earn_by_sym=days_to_earn_by_sym,
+        revisions_by_sym=revisions_by_sym,
+        insider_by_sym=insider_by_sym,
         bars_as_of=_bars_as_of(items),
         err=err,
     )
@@ -176,6 +213,12 @@ async def watchlist_refresh_bars(
 
     watchlist_backfilled = 0
     per_symbol_failures: list[str] = []
+    econ_upserted = 0
+    earnings_calendar_upserted = 0
+    earnings_trends_upserted = 0
+    insider_skipped_cooldown_h: float | None = None
+    insider_symbols_refreshed = 0
+    insider_transactions_upserted = 0
     try:
         with EODHDProvider(api_key=api_key) as provider:
             # ---- Phase 1: bulk S&P 500 + watchlist via the universe filter ----
@@ -199,6 +242,50 @@ async def watchlist_refresh_bars(
                         sym, exc,
                     )
                     per_symbol_failures.append(sym)
+
+            # ---- Phase 3: economic events (1 API call, US-only) ----
+            try:
+                econ_result = refresh_economic_events(provider, session=s)
+                econ_upserted = econ_result.upserted
+                if econ_result.error:
+                    log.warning("watchlist refresh: econ_events: %s", econ_result.error)
+            except Exception as exc:  # safety
+                log.warning("watchlist refresh: econ_events fan-out: %s", exc)
+
+            # ---- Phase 4: earnings calendar + trends for watchlist names ----
+            watched_sorted = sorted(watched)
+            if watched_sorted:
+                try:
+                    earn_result = refresh_earnings(
+                        provider, watched_sorted, session=s,
+                    )
+                    earnings_calendar_upserted = earn_result.calendar_upserted
+                    earnings_trends_upserted = earn_result.trends_upserted
+                    if earn_result.error:
+                        log.warning(
+                            "watchlist refresh: earnings: %s", earn_result.error,
+                        )
+                except Exception as exc:
+                    log.warning("watchlist refresh: earnings fan-out: %s", exc)
+
+            # ---- Phase 5: insider transactions (10 API calls per symbol!) ----
+            # Gated by 23h cooldown via insider_refresh_log so this only
+            # actually pulls once per day regardless of refresh frequency.
+            try:
+                ins_result = refresh_insider_for_watchlist(
+                    provider, watched_sorted, session=s,
+                )
+                if ins_result.skipped:
+                    insider_skipped_cooldown_h = (
+                        (ins_result.cooldown_remaining_secs or 0) / 3600.0
+                    )
+                else:
+                    insider_symbols_refreshed = ins_result.symbols_refreshed
+                    insider_transactions_upserted = ins_result.transactions_upserted
+                    if ins_result.error:
+                        log.warning("watchlist refresh: insider: %s", ins_result.error)
+            except Exception as exc:
+                log.warning("watchlist refresh: insider fan-out: %s", exc)
     except EODHDError as exc:
         log.warning("watchlist refresh: provider error: %s", exc)
         try:
@@ -223,12 +310,28 @@ async def watchlist_refresh_bars(
         f"{result.signals_emitted} signal(s) across "
         f"{result.strategies_run} strategy(ies)"
     )
+    if econ_upserted:
+        msg_parts.append(f"{econ_upserted} econ event(s)")
+    if earnings_calendar_upserted or earnings_trends_upserted:
+        msg_parts.append(
+            f"{earnings_calendar_upserted} earnings + "
+            f"{earnings_trends_upserted} trend point(s)"
+        )
+    if insider_symbols_refreshed:
+        msg_parts.append(
+            f"insider: {insider_transactions_upserted} txn(s) across "
+            f"{insider_symbols_refreshed} sym"
+        )
+    elif insider_skipped_cooldown_h is not None:
+        msg_parts.append(
+            f"insider: skipped (cooldown {insider_skipped_cooldown_h:.1f}h remaining)"
+        )
     if per_symbol_failures:
         msg_parts.append(
             f"{len(per_symbol_failures)} watchlist fetch(es) failed "
             f"({', '.join(per_symbol_failures[:3])}{'…' if len(per_symbol_failures) > 3 else ''})"
         )
-    msg = "Bars refreshed — " + "; ".join(msg_parts)
+    msg = "Refresh complete — " + "; ".join(msg_parts)
     kind = "warn" if (result.failures or per_symbol_failures) else "success"
     return flash_redirect("/analysis", kind, msg)
 

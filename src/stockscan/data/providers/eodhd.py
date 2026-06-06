@@ -254,6 +254,105 @@ class EODHDProvider(DataProvider):
         return data
 
     # ------------------------------------------------------------------
+    # Economic events calendar (CPI, NFP, FOMC, ISM, etc.)
+    # ------------------------------------------------------------------
+    def get_economic_events(
+        self,
+        *,
+        country: str | None = "US",
+        start: date | None = None,
+        end: date | None = None,
+        limit: int = 1000,
+    ) -> list[dict[str, Any]]:
+        """Pull macro events from /api/economic-events.
+
+        Returns the raw provider records (one dict per event) — the
+        store layer assigns importance buckets and persists. Cheap:
+        1 API call per page; default ``limit=1000`` covers a wide
+        window in a single call.
+        """
+        params: dict[str, Any] = {"limit": limit}
+        if country:
+            params["country"] = country
+        if start is not None:
+            params["from_"] = start.isoformat()
+        if end is not None:
+            params["to"] = end.isoformat()
+        data = self._get("/economic-events", **params)
+        if not isinstance(data, list):
+            return []
+        return data
+
+    # ------------------------------------------------------------------
+    # Earnings trends (forward EPS/revenue estimates + revision counts)
+    # ------------------------------------------------------------------
+    def get_calendar_trends(self, symbols: list[str]) -> dict[str, list[dict[str, Any]]]:
+        """Pull /api/calendar/trends for a batch of symbols.
+
+        Returns ``{symbol: [trend_record, ...]}``. The endpoint accepts a
+        comma-separated symbols list and returns a parallel array per
+        symbol; we re-shape into a per-symbol dict so the store layer
+        can upsert independently. Symbols without coverage are simply
+        absent from the result.
+        """
+        out: dict[str, list[dict[str, Any]]] = {}
+        for batch_start in range(0, len(symbols), 100):
+            batch = symbols[batch_start : batch_start + 100]
+            data = self._get(
+                "/calendar/trends",
+                symbols=",".join(f"{s}.US" for s in batch),
+            )
+            if not isinstance(data, dict):
+                continue
+            trends = data.get("trends") or []
+            requested = (data.get("symbols") or "").split(",")
+            # ``trends`` is a parallel array (i-th sublist = i-th symbol
+            # in `symbols`); when a symbol has no coverage the provider
+            # may omit it from the response shape, so we tolerate length
+            # mismatches by re-keying off each record's ``code`` field.
+            for i, sublist in enumerate(trends):
+                if not sublist:
+                    continue
+                sym = (sublist[0].get("code") or "").split(".")[0]
+                if not sym:
+                    # Fall back to the requested symbols list position
+                    # if the inner record didn't carry a code.
+                    if i < len(requested):
+                        sym = (requested[i] or "").split(".")[0]
+                if sym:
+                    out[sym] = sublist
+        return out
+
+    # ------------------------------------------------------------------
+    # Insider transactions (SEC Form 4) — 10 API calls per request
+    # ------------------------------------------------------------------
+    def get_insider_transactions(
+        self,
+        *,
+        symbol: str | None = None,
+        start: date | None = None,
+        end: date | None = None,
+        limit: int = 1000,
+    ) -> list[dict[str, Any]]:
+        """Pull /api/insider-transactions. **Each call costs 10 API
+        credits** — caller must gate this with a cooldown check.
+
+        Returns the raw provider records; the store layer normalises.
+        US-only feed (Form 4).
+        """
+        params: dict[str, Any] = {"limit": limit}
+        if symbol:
+            params["code"] = f"{symbol}.US"
+        if start is not None:
+            params["from_"] = start.isoformat()
+        if end is not None:
+            params["to"] = end.isoformat()
+        data = self._get("/insider-transactions", **params)
+        if not isinstance(data, list):
+            return []
+        return data
+
+    # ------------------------------------------------------------------
     # News (DESIGN §news / TODO §news)
     # ------------------------------------------------------------------
     def get_news(

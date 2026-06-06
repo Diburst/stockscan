@@ -386,6 +386,95 @@
   {% endcall %}
   {% endif %}
 
+  <!-- Macro this week — economic events calendar (high + medium importance,
+       US-only, next 7 days). Refreshed on the watchlist's "Refresh bars"
+       button so users always see the current week's catalysts. -->
+  {% call card(
+      title="Macro this week",
+      subtitle="High / medium-importance US economic releases — next 7 days. Refreshes when you click Refresh bars on the Watchlist."
+  ) %}
+    {% if not macro_events %}
+      {{ empty("No upcoming events in the next 7 days, or data not yet refreshed.", "📅") }}
+    {% else %}
+      <ul class="divide-y divide-ink-300/40 -mx-4">
+        {% for ev in macro_events %}
+          <li class="px-4 py-2.5 flex items-center justify-between gap-3">
+            <div class="min-w-0 flex-1">
+              <div class="flex items-center gap-2 flex-wrap">
+                {%- if ev.importance == 'high' -%}
+                  {{ badge("high", "bad") }}
+                {%- else -%}
+                  {{ badge("medium", "warn") }}
+                {%- endif -%}
+                <span class="text-sm font-medium">{{ ev.event_type }}</span>
+                {% if ev.period %}
+                  <span class="text-xs text-ink-500">({{ ev.period }}{% if ev.comparison %} {{ ev.comparison }}{% endif %})</span>
+                {% endif %}
+              </div>
+              <div class="text-xs text-ink-500 mt-0.5">
+                <span class="font-mono">{{ ev.event_ts.strftime('%a %b %d, %H:%M UTC') }}</span>
+                {% if ev.estimate is not none %}
+                  · est <span class="font-mono">{{ "%g"|format(ev.estimate) }}</span>
+                {% endif %}
+                {% if ev.previous is not none %}
+                  · prev <span class="font-mono">{{ "%g"|format(ev.previous) }}</span>
+                {% endif %}
+              </div>
+            </div>
+            {% if ev.is_released and ev.actual is not none %}
+              <div class="text-right">
+                <div class="text-xs uppercase tracking-wide text-ink-500">Actual</div>
+                <div class="font-mono font-semibold
+                            {% if ev.estimate is not none and ev.actual > ev.estimate %}text-ok-600
+                            {% elif ev.estimate is not none and ev.actual < ev.estimate %}text-bad-600
+                            {% endif %}">
+                  {{ "%g"|format(ev.actual) }}
+                </div>
+              </div>
+            {% endif %}
+          </li>
+        {% endfor %}
+      </ul>
+    {% endif %}
+  {% endcall %}
+
+  <!-- Earnings this week — watchlist symbols reporting in the next 7 days. -->
+  {% if watch_earnings %}
+    {% call card(
+        title="Earnings this week",
+        subtitle="Watched symbols reporting in the next 7 days. BMO = before market open, AMC = after market close."
+    ) %}
+      <ul class="divide-y divide-ink-300/40 -mx-4">
+        {% for e in watch_earnings %}
+          <li class="px-4 py-2.5 flex items-center justify-between gap-3">
+            <div class="flex items-center gap-3">
+              <a href="/analysis/{{ e.symbol }}"
+                 class="font-mono font-semibold hover:underline">{{ e.symbol }}</a>
+              <span class="text-xs uppercase tracking-wide px-1.5 py-0.5 rounded
+                           bg-ink-100 text-ink-700 border border-ink-300/60">
+                {{ e.display_when }}
+              </span>
+              <span class="text-xs text-ink-500 font-mono">
+                {{ e.report_date.strftime('%a %b %d') }}
+              </span>
+            </div>
+            <div class="text-xs text-ink-500">
+              {% if e.estimate is not none %}
+                est <span class="font-mono">{{ "%g"|format(e.estimate|float) }}</span>
+              {% endif %}
+              {% if e.actual is not none %}
+                · actual <span class="font-mono font-semibold
+                                       {% if e.estimate is not none and e.actual > e.estimate %}text-ok-600
+                                       {% elif e.estimate is not none and e.actual < e.estimate %}text-bad-600
+                                       {% endif %}">{{ "%g"|format(e.actual|float) }}</span>
+              {% endif %}
+            </div>
+          </li>
+        {% endfor %}
+      </ul>
+    {% endcall %}
+  {% endif %}
+
   <!-- Market News card (rendered as a partial so the same template is used
        both on initial page load and as the HTMX target of POST /news/refresh) -->
   {% include "_news_card.html" %}
