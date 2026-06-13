@@ -58,11 +58,23 @@
         title="Price & projection",
         subtitle="Interactive — toggle studies in the side panel. Defaults: SMA(50), SMA(200), forward ±1σ bands (7d / 30d), pivot S/R levels, volume. Pivot S/R shows top-3 per side; weekly-confirmed levels render solid + thicker. Fibonacci retracements available as a separate toggle."
     ) %}
-      <div class="grid grid-cols-1 lg:grid-cols-[1fr_220px] gap-4 -mx-2 sm:mx-0">
+      <!-- Time-window range buttons — set the visible range on the chart. -->
+      <div id="analysis-window-toolbar" class="flex items-center gap-1 mb-3"
+           role="group" aria-label="Chart time window">
+        <span class="text-xs text-ink-500 mr-1">Window</span>
+        {% for w in ['7d', '30d', '90d', '1y', '3y'] %}
+          <button type="button" data-window="{{ w }}"
+                  class="analysis-window-btn text-xs px-2.5 py-1 rounded border border-ink-300
+                         bg-white hover:bg-ink-100 transition-colors"
+                  title="Show the last {{ w }} of price action">{{ w }}</button>
+        {% endfor %}
+      </div>
+
+      <div id="analysis-chart-root" class="grid grid-cols-1 lg:grid-cols-[1fr_220px] gap-4 -mx-2 sm:mx-0">
         <!-- Chart pane -->
         <div id="analysis-chart-wrap" class="relative">
-          <div id="analysis-chart" style="width:100%; height: 480px;"></div>
-          <div id="analysis-chart-tooltip"
+          <div id="analysis-chart" data-chart style="width:100%; height: 480px;"></div>
+          <div id="analysis-chart-tooltip" data-tooltip
                style="position: absolute; display: none; pointer-events: none;
                       top: 8px; left: 12px; z-index: 5;
                       background: rgba(255,255,255,0.96); border: 1px solid #cbd5e1;
@@ -73,7 +85,7 @@
         </div>
 
         <!-- Studies sidebar -->
-        <div id="analysis-studies"
+        <div id="analysis-studies" data-studies
              class="text-xs space-y-3 lg:border-l lg:border-ink-300/40 lg:pl-4 pt-2">
           <div>
             <div class="uppercase tracking-wide text-ink-500 font-semibold mb-1.5">
@@ -94,7 +106,7 @@
             <div class="space-y-1" data-group="level"></div>
           </div>
           <div class="pt-2 border-t border-ink-300/40">
-            <button type="button" id="analysis-studies-reset"
+            <button type="button" id="analysis-studies-reset" data-reset
                     class="text-ink-500 hover:text-ink-900 underline text-[11px]"
                     title="Restore the default study set (SMA(50), SMA(200), volume, S/R, implied move)">
               Reset to defaults
@@ -104,462 +116,32 @@
       </div>
 
       <script type="application/json" id="analysis-chart-data">{{ chart_payload | tojson }}</script>
+      {% include "analysis/_chart_engine.html" %}
       <script>
-        (function() {
+        (function () {
+          const root = document.getElementById('analysis-chart-root');
           const payload = JSON.parse(document.getElementById('analysis-chart-data').textContent);
-          const el = document.getElementById('analysis-chart');
-          const tooltip = document.getElementById('analysis-chart-tooltip');
-          const studiesEl = document.getElementById('analysis-studies');
-          const STORAGE_KEY = 'analysis.studies.' + payload.symbol;
-
-          // ----- Restore previously-selected studies, else fall back to defaults -----
-          let enabled;
-          try {
-            const raw = localStorage.getItem(STORAGE_KEY);
-            enabled = raw ? new Set(JSON.parse(raw)) : new Set(payload.default_on);
-          } catch (e) {
-            enabled = new Set(payload.default_on);
-          }
-          function persist() {
-            try { localStorage.setItem(STORAGE_KEY, JSON.stringify([...enabled])); }
-            catch (e) { /* localStorage quota / private mode — silently ignore */ }
-          }
-
-          // ----- Build the chart -----
-          const chart = LightweightCharts.createChart(el, {
-            layout: { background: { color: '#ffffff' }, textColor: '#334155' },
-            grid: { vertLines: { color: '#f1f5f9' }, horzLines: { color: '#f1f5f9' } },
-            rightPriceScale: { borderColor: '#cbd5e1' },
-            timeScale: { borderColor: '#cbd5e1', timeVisible: false },
-            handleScroll: true, handleScale: true,
-            crosshair: { mode: 1 },
+          const WINDOW_KEY = 'analysis.window.detail';
+          let win = '90d';
+          try { const s = localStorage.getItem(WINDOW_KEY); if (s) win = s; } catch (e) {}
+          const inst = StockscanChart.create(root, payload, {
+            storageKey: 'analysis.studies.' + payload.symbol,
+            defaultWindow: win,
           });
-          const candles = chart.addCandlestickSeries({
-            upColor: '#059669', downColor: '#dc2626',
-            wickUpColor: '#059669', wickDownColor: '#dc2626',
-            borderUpColor: '#059669', borderDownColor: '#dc2626',
-          });
-          candles.setData(payload.bars);
-
-          // ----- All study series get created up-front and toggled via .applyOptions({visible}). -----
-          // This keeps the data hot-loaded; toggling is just visibility flips.
-          const seriesByKey = {};
-          const priceLinesByKey = {};
-          // studyMeta drives both the tooltip readout (per-study value at the
-          // crosshair) and the sidebar's color swatches. Each entry:
-          //   { label, kind, color, series: [Series, ...] }
-          // The kind tells the tooltip how to format the values:
-          //   line  : single value
-          //   band  : upper / middle / lower (BB, Donchian, ATR bands)
-          //   volume: formatted volume number
-          //   macd  : line / signal / histogram (colored by sign)
-          const studyMeta = {};
-
-          // Overlay line studies (SMAs / EMAs).
-          ['sma_20', 'sma_50', 'sma_200', 'ema_20', 'ema_50', 'ema_200'].forEach(key => {
-            const st = payload.studies[key];
-            if (!st || !st.data || !st.data.length) return;
-            const series = chart.addLineSeries({
-              color: st.color, lineWidth: 2,
-              priceLineVisible: false, lastValueVisible: false,
-              crosshairMarkerVisible: false,
-              visible: enabled.has(key),
-            });
-            series.setData(st.data);
-            seriesByKey[key] = [series];
-            studyMeta[key] = { label: st.label, kind: 'line', color: st.color, series: [series] };
-          });
-
-          // Band overlays (BB, Donchian, ATR): three line series each.
-          ['bb', 'donchian', 'atr_bands'].forEach(key => {
-            const st = payload.studies[key];
-            if (!st || !st.upper || !st.upper.length) return;
-            const lines = ['upper', 'middle', 'lower'].map(part => {
-              const s = chart.addLineSeries({
-                color: st.color,
-                lineWidth: part === 'middle' ? 1 : 1,
-                lineStyle: part === 'middle' ? 0 : 2,  // 0=solid, 2=dashed
-                priceLineVisible: false, lastValueVisible: false,
-                crosshairMarkerVisible: false,
-                visible: enabled.has(key),
-              });
-              s.setData(st[part]);
-              return s;
-            });
-            seriesByKey[key] = lines;
-            studyMeta[key] = { label: st.label, kind: 'band', color: st.color, series: lines };
-          });
-
-          // ----- Subpanel layout helper -----
-          // Subpanels stack from bottom up. Each takes 15% of chart height.
-          // Candles take everything above.
-          function layoutSubpanels() {
-            const order = ['macd', 'rsi_14', 'volume'];  // top-down stack order from bottom
-            const slot = 0.15;
-            const visible = order.filter(k => enabled.has(k) && payload.studies[k]);
-            const totalSub = visible.length * slot;
-            // Candles occupy [0.05, 1 - totalSub - 0.02]
-            const candleBottom = totalSub + (visible.length ? 0.02 : 0);
-            candles.priceScale().applyOptions({
-              scaleMargins: { top: 0.05, bottom: candleBottom },
-            });
-            // Each subpanel: from bottom up, slot-by-slot.
-            visible.forEach((key, idx) => {
-              // idx 0 = bottommost. Bottom slot occupies [1 - slot, 1] of chart, so scaleMargins = { top: 1 - slot, bottom: 0 }
-              const top = 1 - (idx + 1) * slot;
-              const bottom = idx * slot;
-              if (seriesByKey[key]) {
-                seriesByKey[key].forEach(s => s.priceScale().applyOptions({
-                  scaleMargins: { top, bottom },
-                }));
-              }
+          function setWin(label) {
+            inst.setWindow(label);
+            try { localStorage.setItem(WINDOW_KEY, label); } catch (e) {}
+            document.querySelectorAll('.analysis-window-btn').forEach(b => {
+              const on = b.dataset.window === label;
+              b.classList.toggle('bg-ink-900', on);
+              b.classList.toggle('text-white', on);
+              b.classList.toggle('bg-white', !on);
             });
           }
-
-          // Volume — histogram on its own overlay scale.
-          (function () {
-            const st = payload.studies.volume;
-            if (!st || !st.data || !st.data.length) return;
-            const volumeSeries = chart.addHistogramSeries({
-              priceFormat: { type: 'volume' },
-              priceScaleId: 'volume',
-              visible: enabled.has('volume'),
-            });
-            volumeSeries.setData(st.data);
-            seriesByKey.volume = [volumeSeries];
-            studyMeta.volume = { label: 'Vol', kind: 'volume', color: st.color, series: [volumeSeries] };
-          })();
-
-          // RSI — line series on its own overlay scale with 70 / 30 reference lines.
-          (function () {
-            const st = payload.studies.rsi_14;
-            if (!st || !st.data || !st.data.length) return;
-            const rsiSeries = chart.addLineSeries({
-              color: st.color, lineWidth: 2,
-              priceLineVisible: false, lastValueVisible: false,
-              crosshairMarkerVisible: false,
-              priceScaleId: 'rsi',
-              visible: enabled.has('rsi_14'),
-            });
-            rsiSeries.setData(st.data);
-            // Reference levels — only created when the series is visible so we
-            // don't clutter the chart's main pane on disable.
-            const refLines = [];
-            (st.ref_lines || []).forEach(rl => {
-              refLines.push(rsiSeries.createPriceLine({
-                price: rl.price, color: rl.color, lineWidth: 1,
-                lineStyle: 2, axisLabelVisible: false, title: rl.label,
-              }));
-            });
-            seriesByKey.rsi_14 = [rsiSeries];
-            studyMeta.rsi_14 = { label: st.label, kind: 'line', color: st.color, series: [rsiSeries] };
-          })();
-
-          // MACD — line + signal + histogram on its own overlay scale.
-          (function () {
-            const st = payload.studies.macd;
-            if (!st || !st.line || !st.line.length) return;
-            const macdLine = chart.addLineSeries({
-              color: st.color, lineWidth: 2,
-              priceLineVisible: false, lastValueVisible: false,
-              crosshairMarkerVisible: false,
-              priceScaleId: 'macd',
-              visible: enabled.has('macd'),
-            });
-            macdLine.setData(st.line);
-            const macdSignal = chart.addLineSeries({
-              color: '#f97316',  // orange-500
-              lineWidth: 1, lineStyle: 2,
-              priceLineVisible: false, lastValueVisible: false,
-              crosshairMarkerVisible: false,
-              priceScaleId: 'macd',
-              visible: enabled.has('macd'),
-            });
-            macdSignal.setData(st.signal);
-            const macdHist = chart.addHistogramSeries({
-              priceScaleId: 'macd',
-              visible: enabled.has('macd'),
-            });
-            macdHist.setData(st.histogram.map(d => ({
-              time: d.time, value: d.value,
-              color: d.value >= 0 ? 'rgba(5,150,105,0.6)' : 'rgba(220,38,38,0.6)',
-            })));
-            seriesByKey.macd = [macdLine, macdSignal, macdHist];
-            studyMeta.macd = {
-              label: st.label, kind: 'macd', color: st.color,
-              series: [macdLine, macdSignal, macdHist],
-              signalColor: '#f97316',
-            };
-          })();
-
-          // ----- Price-pane horizontal lines: S/R levels + expected-move bands + Fib -----
-          // Visual hierarchy across the three sources (see project DESIGN
-          // discussion):
-          //   Pivot S/R       — bold green/red. Daily-only = dashed; weekly-
-          //                     confirmed = solid + thicker. The eye sees
-          //                     these first.
-          //   Implied move    — thin sky / amber dashed. Scenario, not S/R.
-          //   Fibonacci       — thin gray dashed with ratio label. Reference.
-          function applyLevels(on) {
-            (priceLinesByKey.levels || []).forEach(pl => candles.removePriceLine(pl));
-            priceLinesByKey.levels = [];
-            if (!on) return;
-            (payload.levels || []).forEach(lv => {
-              const confirmed = lv.confirmed_by_weekly;
-              // Weekly-confirmed levels render solid + thicker so the
-              // multi-timeframe tiebreak is visually obvious without a
-              // separate filter UI.
-              const baseWidth = Math.max(1, Math.round(lv.strength * 2 + 1));
-              const width = confirmed ? baseWidth + 1 : baseWidth;
-              const style = confirmed
-                ? 0  // solid
-                : (lv.is_flipped ? 1 : 2);  // dotted if flipped, dashed otherwise
-              priceLinesByKey.levels.push(candles.createPriceLine({
-                price: lv.price,
-                color: lv.kind === 'support' ? '#059669' : '#dc2626',
-                lineWidth: width,
-                lineStyle: style,
-                axisLabelVisible: true,
-                title: lv.label,
-              }));
-            });
-          }
-          function applyExpectedMove(on) {
-            (priceLinesByKey.expected_move || []).forEach(pl => candles.removePriceLine(pl));
-            priceLinesByKey.expected_move = [];
-            if (!on) return;
-            const em = payload.expected_move || {};
-            ['7d', '30d'].forEach(h => {
-              const er = em[h];
-              if (!er) return;
-              const color = h === '7d' ? '#0ea5e9' : '#f59e0b';
-              priceLinesByKey.expected_move.push(candles.createPriceLine({
-                price: er.high, color, lineWidth: 1, lineStyle: 2,
-                axisLabelVisible: true, title: h + ' +1σ',
-              }));
-              priceLinesByKey.expected_move.push(candles.createPriceLine({
-                price: er.low, color, lineWidth: 1, lineStyle: 2,
-                axisLabelVisible: true, title: h + ' −1σ',
-              }));
-            });
-          }
-          function applyFib(on) {
-            (priceLinesByKey.fib || []).forEach(pl => candles.removePriceLine(pl));
-            priceLinesByKey.fib = [];
-            if (!on) return;
-            const fib = payload.fib_retracement;
-            if (!fib || !fib.levels || !fib.levels.length) return;
-            // Gray dashed — secondary to pivot S/R. The label carries the
-            // ratio so the user can tell at a glance which fib it is
-            // (38.2 / 50 / 61.8 are the most actionable).
-            fib.levels.forEach(lv => {
-              priceLinesByKey.fib.push(candles.createPriceLine({
-                price: lv.price,
-                color: '#64748b',  // slate-500
-                lineWidth: 1, lineStyle: 2,
-                axisLabelVisible: true,
-                title: 'Fib ' + lv.label,
-              }));
-            });
-          }
-
-          // ----- Sidebar UI -----
-          // Each entry: [key, label, group]. Order = render order in the sidebar.
-          const STUDY_DEFS = [
-            ['sma_20',        'SMA(20)',         'overlay'],
-            ['sma_50',        'SMA(50)',         'overlay'],
-            ['sma_200',       'SMA(200)',        'overlay'],
-            ['ema_20',        'EMA(20)',         'overlay'],
-            ['ema_50',        'EMA(50)',         'overlay'],
-            ['ema_200',       'EMA(200)',        'overlay'],
-            ['bb',            'Bollinger(20,2σ)', 'overlay'],
-            ['donchian',      'Donchian(20)',    'overlay'],
-            ['atr_bands',     'ATR(14) ±2× bands','overlay'],
-            ['volume',        'Volume',          'subpanel'],
-            ['rsi_14',        'RSI(14)',         'subpanel'],
-            ['macd',          'MACD(12,26,9)',   'subpanel'],
-            ['levels',         'Support / resistance', 'level'],
-            ['expected_move',  'Implied move (±1σ)',   'level'],
-            ['fib_retracement', 'Fibonacci retracement', 'level'],
-          ];
-
-          function setVisible(key, on) {
-            if (on) enabled.add(key); else enabled.delete(key);
-            if (key === 'levels') {
-              applyLevels(on);
-            } else if (key === 'expected_move') {
-              applyExpectedMove(on);
-            } else if (key === 'fib_retracement') {
-              applyFib(on);
-            } else if (seriesByKey[key]) {
-              seriesByKey[key].forEach(s => s.applyOptions({ visible: on }));
-              if (key === 'volume' || key === 'rsi_14' || key === 'macd') {
-                layoutSubpanels();
-              }
-            }
-            persist();
-          }
-
-          STUDY_DEFS.forEach(([key, label, group]) => {
-            // Skip studies whose data wasn't computed (e.g. not enough bars
-            // for a 200-period MA, or fib retracement on a flat / short series).
-            if (group === 'level') {
-              // Levels / expected-move always render the toggle. Fib only
-              // renders when the payload has actual fib data.
-              if (key === 'fib_retracement' && !payload.fib_retracement) return;
-            } else if (!payload.studies[key]) {
-              return;
-            }
-            const groupEl = studiesEl.querySelector('[data-group="' + group + '"]');
-            if (!groupEl) return;
-            const label_el = document.createElement('label');
-            label_el.className = 'flex items-center gap-2 cursor-pointer hover:bg-ink-100 rounded px-1 py-0.5';
-            const cb = document.createElement('input');
-            cb.type = 'checkbox';
-            cb.className = 'h-3.5 w-3.5';
-            cb.checked = enabled.has(key);
-            cb.addEventListener('change', () => setVisible(key, cb.checked));
-            const sw = document.createElement('span');
-            // Tiny color swatch — for line studies we have a color; for level
-            // groups, leave it neutral.
-            const color = (payload.studies[key] && payload.studies[key].color) || '#94a3b8';
-            sw.style.cssText = 'display:inline-block; width:10px; height:2px; background:' + color + ';';
-            const text = document.createElement('span');
-            text.textContent = label;
-            label_el.appendChild(cb);
-            label_el.appendChild(sw);
-            label_el.appendChild(text);
-            groupEl.appendChild(label_el);
+          document.querySelectorAll('.analysis-window-btn').forEach(btn => {
+            btn.addEventListener('click', () => setWin(btn.dataset.window));
           });
-
-          document.getElementById('analysis-studies-reset').addEventListener('click', () => {
-            try { localStorage.removeItem(STORAGE_KEY); } catch (e) {}
-            // Force a reload so the chart and the sidebar checkboxes both
-            // reset cleanly without a hand-rolled state-restore path.
-            window.location.reload();
-          });
-
-          // ----- Initial render -----
-          applyLevels(enabled.has('levels'));
-          applyExpectedMove(enabled.has('expected_move'));
-          applyFib(enabled.has('fib_retracement'));
-          layoutSubpanels();
-          chart.timeScale().fitContent();
-
-          // ----- OHLCV crosshair tooltip + per-study readout -----
-          // Top block always shows OHLC. Below the divider, every CURRENTLY-
-          // VISIBLE study contributes one row with its value at the crosshair.
-          // The order mirrors the sidebar so the readout reads top-to-bottom
-          // the same way the user enabled them.
-          const fmt2 = v => v == null ? '—' : v.toFixed(2);
-          const fmt3 = v => v == null ? '—' : v.toFixed(3);
-          const fmtVol = v => {
-            if (v == null) return '—';
-            if (v >= 1e9) return (v / 1e9).toFixed(2) + 'B';
-            if (v >= 1e6) return (v / 1e6).toFixed(2) + 'M';
-            if (v >= 1e3) return (v / 1e3).toFixed(1) + 'K';
-            return v.toLocaleString();
-          };
-          // Tooltip row order — same shape as STUDY_DEFS so the readout
-          // groups overlays then subpanels, which matches the user's mental
-          // model from the sidebar.
-          const TOOLTIP_ROW_ORDER = [
-            'sma_20', 'sma_50', 'sma_200',
-            'ema_20', 'ema_50', 'ema_200',
-            'bb', 'donchian', 'atr_bands',
-            'volume', 'rsi_14', 'macd',
-          ];
-
-          function studyRowHtml(key, param) {
-            const meta = studyMeta[key];
-            if (!meta) return '';
-            const sw =
-              '<span style="display:inline-block; width:8px; height:2px;' +
-              ' background:' + meta.color + '; vertical-align:middle; margin-right:6px;"></span>';
-            if (meta.kind === 'line') {
-              const d = param.seriesData.get(meta.series[0]);
-              if (!d) return '';
-              return '<div>' + sw +
-                '<span style="color:#64748b">' + meta.label + '</span> ' +
-                '<span style="font-weight:600">' + fmt2(d.value) + '</span></div>';
-            }
-            if (meta.kind === 'band') {
-              const u = param.seriesData.get(meta.series[0]);
-              const m = param.seriesData.get(meta.series[1]);
-              const l = param.seriesData.get(meta.series[2]);
-              if (!u && !m && !l) return '';
-              return '<div>' + sw +
-                '<span style="color:#64748b">' + meta.label + '</span><br>' +
-                '<span style="margin-left:14px; color:#64748b">U</span> ' + fmt2(u && u.value) +
-                ' <span style="color:#64748b">M</span> ' + fmt2(m && m.value) +
-                ' <span style="color:#64748b">L</span> ' + fmt2(l && l.value) +
-                '</div>';
-            }
-            if (meta.kind === 'volume') {
-              const d = param.seriesData.get(meta.series[0]);
-              if (!d) return '';
-              return '<div>' + sw +
-                '<span style="color:#64748b">' + meta.label + '</span> ' +
-                '<span style="font-weight:600">' + fmtVol(d.value) + '</span></div>';
-            }
-            if (meta.kind === 'macd') {
-              const line = param.seriesData.get(meta.series[0]);
-              const signal = param.seriesData.get(meta.series[1]);
-              const hist = param.seriesData.get(meta.series[2]);
-              if (!line && !signal && !hist) return '';
-              const histColor = (hist && hist.value >= 0) ? '#059669' : '#dc2626';
-              return '<div>' + sw +
-                '<span style="color:#64748b">' + meta.label + '</span><br>' +
-                '<span style="margin-left:14px; color:#64748b">L</span> ' +
-                  '<span style="color:' + meta.color + '">' + fmt3(line && line.value) + '</span>' +
-                ' <span style="color:#64748b">S</span> ' +
-                  '<span style="color:' + meta.signalColor + '">' + fmt3(signal && signal.value) + '</span>' +
-                ' <span style="color:#64748b">H</span> ' +
-                  '<span style="color:' + histColor + '; font-weight:600">' + fmt3(hist && hist.value) + '</span>' +
-                '</div>';
-            }
-            return '';
-          }
-
-          chart.subscribeCrosshairMove(param => {
-            if (!param.time || !param.point
-                || param.point.x < 0 || param.point.x > el.clientWidth
-                || param.point.y < 0 || param.point.y > el.clientHeight) {
-              tooltip.style.display = 'none';
-              return;
-            }
-            const c = param.seriesData.get(candles);
-            if (!c) { tooltip.style.display = 'none'; return; }
-            const dirColor = c.close >= c.open ? '#059669' : '#dc2626';
-            const dirArrow = c.close >= c.open ? '▲' : '▼';
-
-            const ohlcHtml =
-              '<div style="font-weight:600; margin-bottom:4px;">' + param.time + '</div>' +
-              '<div><span style="color:#64748b">O</span> ' + fmt2(c.open) + '</div>' +
-              '<div><span style="color:#64748b">H</span> ' + fmt2(c.high) + '</div>' +
-              '<div><span style="color:#64748b">L</span> ' + fmt2(c.low)  + '</div>' +
-              '<div><span style="color:#64748b">C</span> ' +
-                '<span style="color:' + dirColor + '; font-weight:600;">' +
-                  fmt2(c.close) + ' ' + dirArrow +
-                '</span></div>';
-
-            const studyRows = TOOLTIP_ROW_ORDER
-              .filter(k => enabled.has(k))
-              .map(k => studyRowHtml(k, param))
-              .filter(row => row);
-
-            const studyHtml = studyRows.length
-              ? '<div style="margin-top:4px; padding-top:4px; border-top:1px solid #e2e8f0;">' +
-                  studyRows.join('') +
-                '</div>'
-              : '';
-
-            tooltip.innerHTML = ohlcHtml + studyHtml;
-            tooltip.style.display = 'block';
-          });
-
-          new ResizeObserver(() => chart.applyOptions({ width: el.clientWidth }))
-              .observe(el);
+          setWin(win);
         })();
       </script>
     {% endcall %}

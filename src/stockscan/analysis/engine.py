@@ -30,12 +30,16 @@ log = logging.getLogger(__name__)
 
 
 # How many years of bars to pull. Need ≥1 year for HV percentile +
-# ADX warmup; 2 years gives margin for the rolling-vol baseline.
-_LOOKBACK_YEARS = 2
+# ADX warmup; the rolling-vol baselines all use trailing windows, so extra
+# history never changes the computed indicators — it only feeds the chart.
+# 3 years covers the longest selectable chart window (3y) on the Analysis
+# hub and detail page.
+_LOOKBACK_YEARS = 3
 
-# Cap chart history sent to the SVG renderer at 1 year (252 trading
-# days) so the chart isn't crowded.
-_CHART_HISTORY_DAYS = 252
+# Cap chart history at ~3 years (756 trading days) so the interactive
+# candlestick mini-charts and the detail chart can offer a 3y window. The
+# SVG renderer slices its own (shorter) window from this on top.
+_CHART_HISTORY_DAYS = 756
 
 
 def analyze_symbol(
@@ -144,16 +148,30 @@ def _analyze(
     # ---- Build chart-history slices (chronological, capped). ----
     closes_history: list[tuple[_date, float]] = []
     volumes_history: list[tuple[_date, float]] = []
+    ohlc_history: list[dict[str, float | str]] = []
     if "close" in bars.columns:
         # Keep the last _CHART_HISTORY_DAYS bars.
         history = bars.iloc[-_CHART_HISTORY_DAYS:]
+        has_ohlc = all(c in history.columns for c in ("open", "high", "low"))
         for ts, row in history.iterrows():
             try:
                 d = ts.date() if hasattr(ts, "date") else ts
-                closes_history.append((d, float(row["close"])))
+                close_v = float(row["close"])
+                closes_history.append((d, close_v))
                 if "volume" in row:
-                    volumes_history.append(
-                        (d, float(row["volume"]) * float(row["close"]))
+                    volumes_history.append((d, float(row["volume"]) * close_v))
+                if has_ohlc:
+                    ohlc_history.append(
+                        {
+                            "time": d.isoformat(),
+                            "open": float(row["open"]),
+                            "high": float(row["high"]),
+                            "low": float(row["low"]),
+                            "close": close_v,
+                            "volume": (
+                                float(row["volume"]) if "volume" in row else 0.0
+                            ),
+                        }
                     )
             except (TypeError, ValueError):
                 continue
@@ -172,6 +190,7 @@ def _analyze(
         options_context=options_ctx,
         closes_history=closes_history,
         volumes_history=volumes_history,
+        ohlc_history=ohlc_history,
         failures=failures,
     )
 

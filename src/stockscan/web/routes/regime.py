@@ -20,14 +20,19 @@ it is NOT refreshed here — the nightly ``refresh macro`` job handles it.
 from __future__ import annotations
 
 import logging
-from datetime import date
+from datetime import date, timedelta
 
 from fastapi import APIRouter, Depends, Request
 from sqlalchemy.orm import Session
 
 from stockscan.config import settings
-from stockscan.data.backfill import refresh_recent_days_bulk, trading_days_since
+from stockscan.data.backfill import (
+    latest_completed_session,
+    refresh_recent_days_bulk,
+    trading_days_since,
+)
 from stockscan.data.providers.eodhd import EODHDError, EODHDProvider
+from stockscan.data.store import latest_bar_date
 from stockscan.regime import (
     build_strategy_factors,
     detect_regime,
@@ -111,30 +116,37 @@ async def refresh_endpoint(
         error = "EODHD_API_KEY is not set. Add it to your .env to refresh bars."
     else:
         # ---- Phase 1: refresh recent SPY/RSP/VIX bars. ----
-        # If the bars already cover today, the bulk endpoint upserts a
-        # zero-or-near-zero number of new rows and detect_regime sees
-        # the same data — that's fine. When the user has just resumed
-        # the laptop after a weekend, this is where the regime catches up.
-        try:
-            with EODHDProvider(api_key=api_key) as provider:
-                # trading_days_since takes (last_date, until); pass
-                # today - N as last_date to get the trailing N-day window.
-                from datetime import timedelta as _td
+        # Gap-fill per exchange group only up to the latest completed session:
+        # when the regime symbols already cover it, BOTH bulk calls are skipped
+        # and the refresh is a zero-cost no-op (detect_regime still re-runs on
+        # the existing bars below). Each exchange group is gated independently
+        # because INDX (VIX) can post later than US equities.
+        target = latest_completed_session()
+        floor = today - timedelta(days=_REFRESH_DAYS_BACK)
 
-                window = trading_days_since(today - _td(days=_REFRESH_DAYS_BACK), today)
-                if window:
-                    bars_upserted += refresh_recent_days_bulk(
-                        provider,
-                        window,
-                        exchange="US",
-                        filter_to=_REGIME_US_SYMBOLS,
-                    )
-                    bars_upserted += refresh_recent_days_bulk(
-                        provider,
-                        window,
-                        exchange="INDX",
-                        filter_to=_REGIME_INDX_SYMBOLS,
-                    )
+        def _group_window(symbols: set[str]) -> list[date]:
+            # Oldest latest-bar across the group (a symbol with no bars → floor,
+            # forcing a full-window backfill). Clamp the look-back to floor.
+            latest = min(
+                (latest_bar_date(sym, session=s) or floor) for sym in symbols
+            )
+            return trading_days_since(max(latest, floor), target)
+
+        us_window = _group_window(_REGIME_US_SYMBOLS)
+        indx_window = _group_window(_REGIME_INDX_SYMBOLS)
+        try:
+            if us_window or indx_window:
+                with EODHDProvider(api_key=api_key) as provider:
+                    if us_window:
+                        bars_upserted += refresh_recent_days_bulk(
+                            provider, us_window, exchange="US",
+                            filter_to=_REGIME_US_SYMBOLS,
+                        )
+                    if indx_window:
+                        bars_upserted += refresh_recent_days_bulk(
+                            provider, indx_window, exchange="INDX",
+                            filter_to=_REGIME_INDX_SYMBOLS,
+                        )
         except EODHDError as exc:
             log.warning("regime refresh: provider error: %s", exc)
             error = f"Provider error: {exc}"

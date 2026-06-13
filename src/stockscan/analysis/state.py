@@ -231,6 +231,12 @@ class SymbolAnalysis:
     closes_history: list[tuple[_date, float]] = field(default_factory=list)
     # Same for volumes (dollar volume) - used for chart sizing hints.
     volumes_history: list[tuple[_date, float]] = field(default_factory=list)
+    # OHLCV candle records in Lightweight-Charts shape
+    # ({time, open, high, low, close, volume}), chronological, capped at the
+    # chart-history window. Powers the interactive candlestick mini-charts on
+    # the /analysis hub (client-side time-window switching reuses this rather
+    # than a second per-symbol bars fetch).
+    ohlc_history: list[dict[str, float | str]] = field(default_factory=list)
     # Diagnostic - sub-modules that raised during compute.
     failures: list[str] = field(default_factory=list)
 

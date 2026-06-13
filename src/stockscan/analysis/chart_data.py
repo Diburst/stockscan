@@ -42,10 +42,11 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 
-# Cap chart history at 252 trading days (~1 year). Longer windows are
-# unhelpful at the candle resolution Lightweight Charts gives us; the
-# user can scroll out for less detail anyway.
-_CHART_HISTORY_DAYS = 252
+# Cap chart history at ~756 trading days (~3 years) so the detail chart's
+# range buttons can offer a 3y window. The default visible range stays short
+# (the client fits to a recent window on load); the user widens via the
+# 7d/30d/90d/1y/3y buttons or by scrolling out.
+_CHART_HISTORY_DAYS = 756
 
 # Studies on by default when the user first lands on /analysis/{symbol}.
 # Per Thomas's selection: 50 SMA, 200 SMA, expected-move bands, S/R levels.
@@ -132,9 +133,9 @@ def build_chart_payload(
 
         as_of = analysis.as_of or _date.today()
         try:
-            start = as_of.replace(year=as_of.year - 2)
-        except ValueError:  # Feb 29 → Feb 28 two years back
-            start = as_of.replace(year=as_of.year - 2, month=2, day=28)
+            start = as_of.replace(year=as_of.year - 3)
+        except ValueError:  # Feb 29 → Feb 28 three years back
+            start = as_of.replace(year=as_of.year - 3, month=2, day=28)
         try:
             bars = get_bars(symbol, start, as_of, session=session)
         except Exception as exc:

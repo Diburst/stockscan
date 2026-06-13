@@ -19,12 +19,14 @@ from decimal import Decimal
 from typing import Any
 from zoneinfo import ZoneInfo
 
+import re
+
 import httpx
 from tenacity import (
     retry,
-    retry_if_exception_type,
+    retry_if_exception,
     stop_after_attempt,
-    wait_exponential,
+    wait_random_exponential,
 )
 
 from stockscan.config import settings
@@ -36,6 +38,28 @@ from stockscan.data.providers.base import (
 )
 
 log = logging.getLogger(__name__)
+
+# Mask the api_token query param wherever it might end up in an exception or
+# log line. httpx's HTTPStatusError embeds the full request URL — including
+# ``api_token=...`` — in its message, so without this the key leaks into logs.
+_TOKEN_RE = re.compile(r"(api_token=)[^&\s'\"]+", re.IGNORECASE)
+
+
+def _redact(text: str) -> str:
+    return _TOKEN_RE.sub(r"\1***", text)
+
+
+def _should_retry(exc: BaseException) -> bool:
+    """Retry transient server/connection errors, but NOT read-timeouts.
+
+    A read-timeout on a large response (e.g. the full-market bulk EOD payload)
+    means the server is slow; immediately re-issuing the same heavy request
+    rarely succeeds and just doubles the load. Connection errors and 5xx are
+    worth a bounded retry.
+    """
+    if isinstance(exc, httpx.TimeoutException):
+        return False
+    return isinstance(exc, (httpx.TransportError, httpx.HTTPStatusError))
 
 NY_TZ = ZoneInfo("America/New_York")
 DAILY_CLOSE_HOUR = 16  # 16:00 ET
@@ -61,9 +85,12 @@ class EODHDProvider(DataProvider):
             raise EODHDError("EODHD_API_KEY is not set; cannot initialize EODHDProvider")
         # `transport` is an injection point for tests (httpx.MockTransport).
         # In production it is None and httpx selects its default transport.
+        # Split timeout: a short connect budget, but a generous read budget so
+        # large payloads (the full-market bulk EOD response is several MB and
+        # tens of thousands of rows) don't trip a premature ReadTimeout.
         self._client = httpx.Client(
             base_url=self.base_url,
-            timeout=30.0,
+            timeout=httpx.Timeout(connect=10.0, read=120.0, write=30.0, pool=30.0),
             headers={"User-Agent": "stockscan/0.1"},
             transport=transport,
         )
@@ -72,20 +99,35 @@ class EODHDProvider(DataProvider):
     # Internals
     # ------------------------------------------------------------------
     @retry(
-        retry=retry_if_exception_type((httpx.TransportError, httpx.HTTPStatusError)),
-        wait=wait_exponential(multiplier=1, min=1, max=15),
-        stop=stop_after_attempt(4),
+        retry=retry_if_exception(_should_retry),
+        # Jittered backoff so concurrent retries don't synchronize into a
+        # thundering herd against an already-stressed endpoint.
+        wait=wait_random_exponential(multiplier=1, max=15),
+        stop=stop_after_attempt(2),  # one retry; read-timeouts aren't retried
         reraise=True,
     )
-    def _get(self, path: str, **params: Any) -> Any:
+    def _get_raw(self, path: str, **params: Any) -> Any:
         params.setdefault("api_token", self.api_key)
         params.setdefault("fmt", "json")
         resp = self._client.get(path, params=params)
         if resp.status_code >= 500:
             resp.raise_for_status()
         if resp.status_code >= 400:
-            raise EODHDError(f"EODHD {resp.status_code}: {resp.text[:200]}")
+            raise EODHDError(f"EODHD {resp.status_code}: {_redact(resp.text[:200])}")
         return resp.json()
+
+    def _get(self, path: str, **params: Any) -> Any:
+        """Retry wrapper that guarantees the api_token never escapes in an
+        exception message (httpx embeds the request URL — token and all — in
+        HTTPStatusError)."""
+        try:
+            return self._get_raw(path, **params)
+        except EODHDError:
+            raise
+        except (httpx.HTTPStatusError, httpx.TransportError) as exc:
+            # `from None` drops the token-bearing original from the chain so it
+            # can't resurface via __cause__ when the error is logged.
+            raise EODHDError(_redact(str(exc))) from None
 
     @staticmethod
     def _to_decimal(value: Any) -> Decimal:

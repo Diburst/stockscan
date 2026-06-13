@@ -1,0 +1,464 @@
+{# =====================================================================
+   Shared interactive analysis chart engine.
+
+   Defines window.StockscanChart. Include this partial ONCE per page, AFTER
+   the Lightweight Charts library is loaded, then call
+   StockscanChart.create(rootEl, payload, opts) for each chart.
+
+   rootEl must contain:
+     [data-chart]    chart container div (required)
+   optionally:
+     [data-tooltip]  positioned div for the crosshair OHLC / study readout
+     [data-studies]  sidebar with [data-group="overlay|subpanel|level"] slots
+     [data-reset]    button that clears the saved study set + reloads
+
+   opts:
+     storageKey      localStorage key for the enabled-study set (when persist)
+     persist         bool — save study toggles (default: !!storageKey)
+     defaultWindow   '7d'|'30d'|'90d'|'1y'|'3y' (default '90d')
+     initialEnabled  array of study keys to start enabled (overrides storage)
+
+   Returned instance:
+     chart, totalBars, getEnabled(), setStudy(key,on), setWindow(label),
+     hasStudy(key)
+
+   This is the single home for the chart's client logic — both the
+   per-symbol detail page and the multi-chart Analysis hub drive it. Keep
+   indicator math out of here; the payload is built server-side in
+   stockscan.analysis.chart_data.
+   ===================================================================== #}
+<script>
+(function () {
+  const WINDOWS = { '7d': 7, '30d': 30, '90d': 90, '1y': 252, '3y': 756 };
+  const DEFAULT_WINDOW = '90d';
+  const SUBPANEL_KEYS = ['volume', 'rsi_14', 'macd'];
+
+  // Sidebar render order + grouping. Same shape the detail sidebar expects.
+  const STUDY_DEFS = [
+    ['sma_20',          'SMA(20)',               'overlay'],
+    ['sma_50',          'SMA(50)',               'overlay'],
+    ['sma_200',         'SMA(200)',              'overlay'],
+    ['ema_20',          'EMA(20)',               'overlay'],
+    ['ema_50',          'EMA(50)',               'overlay'],
+    ['ema_200',         'EMA(200)',              'overlay'],
+    ['bb',              'Bollinger(20,2σ)',      'overlay'],
+    ['donchian',        'Donchian(20)',          'overlay'],
+    ['atr_bands',       'ATR(14) ±2× bands',     'overlay'],
+    ['volume',          'Volume',                'subpanel'],
+    ['rsi_14',          'RSI(14)',               'subpanel'],
+    ['macd',            'MACD(12,26,9)',         'subpanel'],
+    ['levels',          'Support / resistance',  'level'],
+    ['expected_move',   'Implied move (±1σ)',    'level'],
+    ['fib_retracement', 'Fibonacci retracement', 'level'],
+  ];
+
+  const fmt2 = v => v == null ? '—' : v.toFixed(2);
+  const fmt3 = v => v == null ? '—' : v.toFixed(3);
+  const fmtVol = v => {
+    if (v == null) return '—';
+    if (v >= 1e9) return (v / 1e9).toFixed(2) + 'B';
+    if (v >= 1e6) return (v / 1e6).toFixed(2) + 'M';
+    if (v >= 1e3) return (v / 1e3).toFixed(1) + 'K';
+    return v.toLocaleString();
+  };
+
+  function create(root, payload, opts) {
+    opts = opts || {};
+    const el = root.querySelector('[data-chart]');
+    const tooltip = root.querySelector('[data-tooltip]');
+    const studiesEl = root.querySelector('[data-studies]');
+    const resetEl = root.querySelector('[data-reset]');
+    const STORAGE_KEY = opts.storageKey;
+    const persist = (opts.persist !== undefined) ? opts.persist : !!STORAGE_KEY;
+
+    // ----- Restore previously-selected studies, else fall back to defaults -----
+    let enabled;
+    if (opts.initialEnabled) {
+      enabled = new Set(opts.initialEnabled);
+    } else {
+      try {
+        const raw = STORAGE_KEY && localStorage.getItem(STORAGE_KEY);
+        enabled = raw ? new Set(JSON.parse(raw)) : new Set(payload.default_on);
+      } catch (e) {
+        enabled = new Set(payload.default_on);
+      }
+    }
+    function persistStudies() {
+      if (!persist || !STORAGE_KEY) return;
+      try { localStorage.setItem(STORAGE_KEY, JSON.stringify([...enabled])); }
+      catch (e) { /* quota / private mode — ignore */ }
+    }
+
+    // ----- Build the chart -----
+    const chart = LightweightCharts.createChart(el, {
+      layout: { background: { color: '#ffffff' }, textColor: '#334155' },
+      grid: { vertLines: { color: '#f1f5f9' }, horzLines: { color: '#f1f5f9' } },
+      rightPriceScale: { borderColor: '#cbd5e1' },
+      timeScale: { borderColor: '#cbd5e1', timeVisible: false },
+      handleScroll: true, handleScale: true,
+      crosshair: { mode: 1 },
+    });
+    const candles = chart.addCandlestickSeries({
+      upColor: '#059669', downColor: '#dc2626',
+      wickUpColor: '#059669', wickDownColor: '#dc2626',
+      borderUpColor: '#059669', borderDownColor: '#dc2626',
+    });
+    candles.setData(payload.bars);
+
+    // All study series are created up-front and toggled via visibility flips.
+    const seriesByKey = {};
+    const priceLinesByKey = {};
+    const studyMeta = {};
+
+    // Overlay line studies (SMAs / EMAs).
+    ['sma_20', 'sma_50', 'sma_200', 'ema_20', 'ema_50', 'ema_200'].forEach(key => {
+      const st = payload.studies[key];
+      if (!st || !st.data || !st.data.length) return;
+      const series = chart.addLineSeries({
+        color: st.color, lineWidth: 2,
+        priceLineVisible: false, lastValueVisible: false,
+        crosshairMarkerVisible: false,
+        visible: enabled.has(key),
+      });
+      series.setData(st.data);
+      seriesByKey[key] = [series];
+      studyMeta[key] = { label: st.label, kind: 'line', color: st.color, series: [series] };
+    });
+
+    // Band overlays (BB, Donchian, ATR): three line series each.
+    ['bb', 'donchian', 'atr_bands'].forEach(key => {
+      const st = payload.studies[key];
+      if (!st || !st.upper || !st.upper.length) return;
+      const lines = ['upper', 'middle', 'lower'].map(part => {
+        const s = chart.addLineSeries({
+          color: st.color,
+          lineWidth: 1,
+          lineStyle: part === 'middle' ? 0 : 2,  // 0=solid, 2=dashed
+          priceLineVisible: false, lastValueVisible: false,
+          crosshairMarkerVisible: false,
+          visible: enabled.has(key),
+        });
+        s.setData(st[part]);
+        return s;
+      });
+      seriesByKey[key] = lines;
+      studyMeta[key] = { label: st.label, kind: 'band', color: st.color, series: lines };
+    });
+
+    // ----- Subpanel layout helper -----
+    function layoutSubpanels() {
+      const order = ['macd', 'rsi_14', 'volume'];
+      const slot = 0.15;
+      const visible = order.filter(k => enabled.has(k) && payload.studies[k]);
+      const totalSub = visible.length * slot;
+      const candleBottom = totalSub + (visible.length ? 0.02 : 0);
+      candles.priceScale().applyOptions({
+        scaleMargins: { top: 0.05, bottom: candleBottom },
+      });
+      visible.forEach((key, idx) => {
+        const top = 1 - (idx + 1) * slot;
+        const bottom = idx * slot;
+        if (seriesByKey[key]) {
+          seriesByKey[key].forEach(s => s.priceScale().applyOptions({
+            scaleMargins: { top, bottom },
+          }));
+        }
+      });
+    }
+
+    // Volume — histogram on its own overlay scale.
+    (function () {
+      const st = payload.studies.volume;
+      if (!st || !st.data || !st.data.length) return;
+      const volumeSeries = chart.addHistogramSeries({
+        priceFormat: { type: 'volume' },
+        priceScaleId: 'volume',
+        visible: enabled.has('volume'),
+      });
+      volumeSeries.setData(st.data);
+      seriesByKey.volume = [volumeSeries];
+      studyMeta.volume = { label: 'Vol', kind: 'volume', color: st.color, series: [volumeSeries] };
+    })();
+
+    // RSI — line series with 70 / 30 reference lines.
+    (function () {
+      const st = payload.studies.rsi_14;
+      if (!st || !st.data || !st.data.length) return;
+      const rsiSeries = chart.addLineSeries({
+        color: st.color, lineWidth: 2,
+        priceLineVisible: false, lastValueVisible: false,
+        crosshairMarkerVisible: false,
+        priceScaleId: 'rsi',
+        visible: enabled.has('rsi_14'),
+      });
+      rsiSeries.setData(st.data);
+      (st.ref_lines || []).forEach(rl => {
+        rsiSeries.createPriceLine({
+          price: rl.price, color: rl.color, lineWidth: 1,
+          lineStyle: 2, axisLabelVisible: false, title: rl.label,
+        });
+      });
+      seriesByKey.rsi_14 = [rsiSeries];
+      studyMeta.rsi_14 = { label: st.label, kind: 'line', color: st.color, series: [rsiSeries] };
+    })();
+
+    // MACD — line + signal + histogram.
+    (function () {
+      const st = payload.studies.macd;
+      if (!st || !st.line || !st.line.length) return;
+      const macdLine = chart.addLineSeries({
+        color: st.color, lineWidth: 2,
+        priceLineVisible: false, lastValueVisible: false,
+        crosshairMarkerVisible: false,
+        priceScaleId: 'macd',
+        visible: enabled.has('macd'),
+      });
+      macdLine.setData(st.line);
+      const macdSignal = chart.addLineSeries({
+        color: '#f97316',
+        lineWidth: 1, lineStyle: 2,
+        priceLineVisible: false, lastValueVisible: false,
+        crosshairMarkerVisible: false,
+        priceScaleId: 'macd',
+        visible: enabled.has('macd'),
+      });
+      macdSignal.setData(st.signal);
+      const macdHist = chart.addHistogramSeries({
+        priceScaleId: 'macd',
+        visible: enabled.has('macd'),
+      });
+      macdHist.setData(st.histogram.map(d => ({
+        time: d.time, value: d.value,
+        color: d.value >= 0 ? 'rgba(5,150,105,0.6)' : 'rgba(220,38,38,0.6)',
+      })));
+      seriesByKey.macd = [macdLine, macdSignal, macdHist];
+      studyMeta.macd = {
+        label: st.label, kind: 'macd', color: st.color,
+        series: [macdLine, macdSignal, macdHist],
+        signalColor: '#f97316',
+      };
+    })();
+
+    // ----- Price-pane horizontal lines: S/R levels + expected-move + Fib -----
+    function applyLevels(on) {
+      (priceLinesByKey.levels || []).forEach(pl => candles.removePriceLine(pl));
+      priceLinesByKey.levels = [];
+      if (!on) return;
+      (payload.levels || []).forEach(lv => {
+        const confirmed = lv.confirmed_by_weekly;
+        const baseWidth = Math.max(1, Math.round(lv.strength * 2 + 1));
+        const width = confirmed ? baseWidth + 1 : baseWidth;
+        const style = confirmed ? 0 : (lv.is_flipped ? 1 : 2);
+        priceLinesByKey.levels.push(candles.createPriceLine({
+          price: lv.price,
+          color: lv.kind === 'support' ? '#059669' : '#dc2626',
+          lineWidth: width, lineStyle: style,
+          axisLabelVisible: true, title: lv.label,
+        }));
+      });
+    }
+    function applyExpectedMove(on) {
+      (priceLinesByKey.expected_move || []).forEach(pl => candles.removePriceLine(pl));
+      priceLinesByKey.expected_move = [];
+      if (!on) return;
+      const em = payload.expected_move || {};
+      ['7d', '30d'].forEach(h => {
+        const er = em[h];
+        if (!er) return;
+        const color = h === '7d' ? '#0ea5e9' : '#f59e0b';
+        priceLinesByKey.expected_move.push(candles.createPriceLine({
+          price: er.high, color, lineWidth: 1, lineStyle: 2,
+          axisLabelVisible: true, title: h + ' +1σ',
+        }));
+        priceLinesByKey.expected_move.push(candles.createPriceLine({
+          price: er.low, color, lineWidth: 1, lineStyle: 2,
+          axisLabelVisible: true, title: h + ' −1σ',
+        }));
+      });
+    }
+    function applyFib(on) {
+      (priceLinesByKey.fib || []).forEach(pl => candles.removePriceLine(pl));
+      priceLinesByKey.fib = [];
+      if (!on) return;
+      const fib = payload.fib_retracement;
+      if (!fib || !fib.levels || !fib.levels.length) return;
+      fib.levels.forEach(lv => {
+        priceLinesByKey.fib.push(candles.createPriceLine({
+          price: lv.price, color: '#64748b',
+          lineWidth: 1, lineStyle: 2,
+          axisLabelVisible: true, title: 'Fib ' + lv.label,
+        }));
+      });
+    }
+
+    function hasStudy(key) {
+      if (key === 'fib_retracement') return !!payload.fib_retracement;
+      if (key === 'levels' || key === 'expected_move') return true;
+      return !!payload.studies[key];
+    }
+
+    function setStudy(key, on) {
+      if (on) enabled.add(key); else enabled.delete(key);
+      if (key === 'levels') {
+        applyLevels(on);
+      } else if (key === 'expected_move') {
+        applyExpectedMove(on);
+      } else if (key === 'fib_retracement') {
+        applyFib(on);
+      } else if (seriesByKey[key]) {
+        seriesByKey[key].forEach(s => s.applyOptions({ visible: on }));
+        if (SUBPANEL_KEYS.includes(key)) layoutSubpanels();
+      }
+      persistStudies();
+    }
+
+    // ----- Optional per-chart sidebar (detail page) -----
+    if (studiesEl) {
+      STUDY_DEFS.forEach(([key, label, group]) => {
+        if (!hasStudy(key)) return;
+        const groupEl = studiesEl.querySelector('[data-group="' + group + '"]');
+        if (!groupEl) return;
+        const label_el = document.createElement('label');
+        label_el.className = 'flex items-center gap-2 cursor-pointer hover:bg-ink-100 rounded px-1 py-0.5';
+        const cb = document.createElement('input');
+        cb.type = 'checkbox';
+        cb.className = 'h-3.5 w-3.5';
+        cb.checked = enabled.has(key);
+        cb.addEventListener('change', () => setStudy(key, cb.checked));
+        const sw = document.createElement('span');
+        const color = (payload.studies[key] && payload.studies[key].color) || '#94a3b8';
+        sw.style.cssText = 'display:inline-block; width:10px; height:2px; background:' + color + ';';
+        const text = document.createElement('span');
+        text.textContent = label;
+        label_el.appendChild(cb);
+        label_el.appendChild(sw);
+        label_el.appendChild(text);
+        groupEl.appendChild(label_el);
+      });
+    }
+    if (resetEl && STORAGE_KEY) {
+      resetEl.addEventListener('click', () => {
+        try { localStorage.removeItem(STORAGE_KEY); } catch (e) {}
+        window.location.reload();
+      });
+    }
+
+    // ----- Time window (logical range; gap-proof across weekends/holidays) -----
+    const totalBars = payload.bars.length;
+    function setWindow(label) {
+      const n = WINDOWS[label] || WINDOWS[DEFAULT_WINDOW];
+      const to = totalBars - 0.5;
+      const from = Math.max(0, totalBars - n) - 0.5;
+      chart.timeScale().setVisibleLogicalRange({ from, to });
+    }
+
+    // ----- Initial render -----
+    applyLevels(enabled.has('levels'));
+    applyExpectedMove(enabled.has('expected_move'));
+    applyFib(enabled.has('fib_retracement'));
+    layoutSubpanels();
+    setWindow(opts.defaultWindow || DEFAULT_WINDOW);
+
+    // ----- Crosshair tooltip (optional) -----
+    if (tooltip) {
+      const TOOLTIP_ROW_ORDER = [
+        'sma_20', 'sma_50', 'sma_200',
+        'ema_20', 'ema_50', 'ema_200',
+        'bb', 'donchian', 'atr_bands',
+        'volume', 'rsi_14', 'macd',
+      ];
+      function studyRowHtml(key, param) {
+        const meta = studyMeta[key];
+        if (!meta) return '';
+        const sw =
+          '<span style="display:inline-block; width:8px; height:2px;' +
+          ' background:' + meta.color + '; vertical-align:middle; margin-right:6px;"></span>';
+        if (meta.kind === 'line') {
+          const d = param.seriesData.get(meta.series[0]);
+          if (!d) return '';
+          return '<div>' + sw +
+            '<span style="color:#64748b">' + meta.label + '</span> ' +
+            '<span style="font-weight:600">' + fmt2(d.value) + '</span></div>';
+        }
+        if (meta.kind === 'band') {
+          const u = param.seriesData.get(meta.series[0]);
+          const m = param.seriesData.get(meta.series[1]);
+          const l = param.seriesData.get(meta.series[2]);
+          if (!u && !m && !l) return '';
+          return '<div>' + sw +
+            '<span style="color:#64748b">' + meta.label + '</span><br>' +
+            '<span style="margin-left:14px; color:#64748b">U</span> ' + fmt2(u && u.value) +
+            ' <span style="color:#64748b">M</span> ' + fmt2(m && m.value) +
+            ' <span style="color:#64748b">L</span> ' + fmt2(l && l.value) +
+            '</div>';
+        }
+        if (meta.kind === 'volume') {
+          const d = param.seriesData.get(meta.series[0]);
+          if (!d) return '';
+          return '<div>' + sw +
+            '<span style="color:#64748b">' + meta.label + '</span> ' +
+            '<span style="font-weight:600">' + fmtVol(d.value) + '</span></div>';
+        }
+        if (meta.kind === 'macd') {
+          const line = param.seriesData.get(meta.series[0]);
+          const signal = param.seriesData.get(meta.series[1]);
+          const hist = param.seriesData.get(meta.series[2]);
+          if (!line && !signal && !hist) return '';
+          const histColor = (hist && hist.value >= 0) ? '#059669' : '#dc2626';
+          return '<div>' + sw +
+            '<span style="color:#64748b">' + meta.label + '</span><br>' +
+            '<span style="margin-left:14px; color:#64748b">L</span> ' +
+              '<span style="color:' + meta.color + '">' + fmt3(line && line.value) + '</span>' +
+            ' <span style="color:#64748b">S</span> ' +
+              '<span style="color:' + meta.signalColor + '">' + fmt3(signal && signal.value) + '</span>' +
+            ' <span style="color:#64748b">H</span> ' +
+              '<span style="color:' + histColor + '; font-weight:600">' + fmt3(hist && hist.value) + '</span>' +
+            '</div>';
+        }
+        return '';
+      }
+      chart.subscribeCrosshairMove(param => {
+        if (!param.time || !param.point
+            || param.point.x < 0 || param.point.x > el.clientWidth
+            || param.point.y < 0 || param.point.y > el.clientHeight) {
+          tooltip.style.display = 'none';
+          return;
+        }
+        const c = param.seriesData.get(candles);
+        if (!c) { tooltip.style.display = 'none'; return; }
+        const dirColor = c.close >= c.open ? '#059669' : '#dc2626';
+        const dirArrow = c.close >= c.open ? '▲' : '▼';
+        const ohlcHtml =
+          '<div style="font-weight:600; margin-bottom:4px;">' + param.time + '</div>' +
+          '<div><span style="color:#64748b">O</span> ' + fmt2(c.open) + '</div>' +
+          '<div><span style="color:#64748b">H</span> ' + fmt2(c.high) + '</div>' +
+          '<div><span style="color:#64748b">L</span> ' + fmt2(c.low)  + '</div>' +
+          '<div><span style="color:#64748b">C</span> ' +
+            '<span style="color:' + dirColor + '; font-weight:600;">' +
+              fmt2(c.close) + ' ' + dirArrow +
+            '</span></div>';
+        const studyRows = TOOLTIP_ROW_ORDER
+          .filter(k => enabled.has(k))
+          .map(k => studyRowHtml(k, param))
+          .filter(row => row);
+        const studyHtml = studyRows.length
+          ? '<div style="margin-top:4px; padding-top:4px; border-top:1px solid #e2e8f0;">' +
+              studyRows.join('') + '</div>'
+          : '';
+        tooltip.innerHTML = ohlcHtml + studyHtml;
+        tooltip.style.display = 'block';
+      });
+    }
+
+    new ResizeObserver(() => chart.applyOptions({ width: el.clientWidth })).observe(el);
+
+    return {
+      chart, totalBars,
+      getEnabled: () => [...enabled],
+      setStudy, setWindow, hasStudy,
+    };
+  }
+
+  window.StockscanChart = { create, STUDY_DEFS, WINDOWS };
+})();
+</script>

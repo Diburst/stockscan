@@ -272,6 +272,7 @@ async def refresh_endpoint(
             trades_auto_closed = check_auto_close(session=s)
 
             refresh_summary = {
+                "up_to_date": result.up_to_date,
                 "bars_upserted": result.bars_upserted,
                 "bars_days_covered": result.bars_days_covered,
                 "strategies_run": result.strategies_run,
@@ -318,6 +319,15 @@ async def refresh_endpoint(
     )
     if error:
         return attach_hx_toast(response, "error", "Signal refresh failed")
+    if refresh_summary and refresh_summary.get("up_to_date"):
+        n_marked = refresh_summary.get("trades_marked", 0)
+        n_closed = refresh_summary.get("trades_auto_closed", 0)
+        extra = ""
+        if n_marked or n_closed:
+            extra = f" ({n_marked} marked, {n_closed} auto-closed)"
+        return attach_hx_toast(
+            response, "info", f"Already up to date — no API calls used{extra}"
+        )
     if refresh_summary:
         n_new = refresh_summary.get("signals_emitted", 0)
         parts = [f"{n_new} new signal{'s' if n_new != 1 else ''}"]

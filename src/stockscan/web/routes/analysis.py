@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import logging
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from markupsafe import Markup
 from sqlalchemy.orm import Session
 
@@ -19,7 +19,7 @@ from datetime import timezone as _tz
 
 from stockscan.analysis import (
     analyze_symbol,
-    analyze_watchlist,
+    analyze_watchlist_cards,
     build_chart_payload,
     render_chart_svg,
 )
@@ -32,6 +32,7 @@ from stockscan.insider import (
     recent_transactions,
     refresh_insider_for_symbol,
 )
+from stockscan.watchlist.store import list_watchlists, resolve_selection
 from stockscan.web.deps import flash_redirect, get_session, render
 
 router = APIRouter(prefix="/analysis")
@@ -40,23 +41,39 @@ log = logging.getLogger(__name__)
 
 @router.get("")
 @router.get("/")
-async def analysis_list(request: Request, s: Session = Depends(get_session)):
-    """Render the analysis hub: every watched symbol's analysis."""
-    analyses = analyze_watchlist(session=s)
-    # Pre-render mini-charts so the template doesn't need the chart
-    # module imported.
+async def analysis_list(
+    request: Request,
+    list: str | None = Query(None),
+    s: Session = Depends(get_session),
+):
+    """Render the analysis hub: every watched symbol's analysis.
+
+    ``?list=<id|all>`` selects which list to analyse (defaults to the primary
+    "Watchlist" list). Each card carries its ``ohlc_history`` so the template
+    can render an interactive candlestick chart with client-side time-window
+    switching; the static SVG is kept as a no-bars fallback.
+    """
+    selected_id, selected_label = resolve_selection(list, session=s)
+    lists = list_watchlists(session=s)
+    raw_cards = analyze_watchlist_cards(list_id=selected_id, session=s)
+    # Each card carries the full interactive-chart payload (every study, S/R
+    # levels, expected-move bands, fib) so the hub charts have parity with the
+    # detail page. The static SVG is kept as a no-bars fallback.
     cards = []
-    for a in analyses:
+    for c in raw_cards:
+        a = c["analysis"]
         cards.append({
             "analysis": a,
             "chart_svg": Markup(render_chart_svg(a, height=180)),
+            "payload": c["payload"],
         })
     # Bars-as-of: the most recent close timestamp across every analysis. Each
     # SymbolAnalysis's closes_history is chronological, so its last tuple is
     # the latest local bar. Taking the max across the bundle is the right
     # "data freshness" signal — if any name lags, the user sees the lag.
     bars_as_of = None
-    for a in analyses:
+    for c in cards:
+        a = c["analysis"]
         if a.closes_history:
             d = a.closes_history[-1][0]
             if bars_as_of is None or d > bars_as_of:
@@ -65,6 +82,9 @@ async def analysis_list(request: Request, s: Session = Depends(get_session)):
         request,
         "analysis/list.html",
         cards=cards,
+        lists=lists,
+        selected_id=selected_id,
+        selected_label=selected_label,
         bars_as_of=bars_as_of,
     )
 

@@ -137,7 +137,32 @@ def test_watchlist_list_renders(client):
     r = client.get("/watchlist")
     assert r.status_code == 200
     assert "Watchlist" in r.text
-    assert "Add a symbol" in r.text
+    # Unified add box (handles one or many symbols) + list management.
+    assert "Add symbols" in r.text
+    # The list selector is present (All pill + the window-independent selector).
+    assert "?list=all" in r.text
+    assert "Manage lists" in r.text
+
+
+def test_watchlist_export_renders(client):
+    r = client.get("/watchlist/export?list=all")
+    assert r.status_code == 200
+    assert "text/plain" in r.headers["content-type"]
+
+
+def test_analysis_list_renders(client):
+    # analyze_watchlist_cards hits the (mocked) DB and returns []; the page
+    # still renders with the list selector. The shared window/studies toolbar
+    # only appears when there are charts to control, so it's absent here.
+    r = client.get("/analysis")
+    assert r.status_code == 200
+    assert "Analysis" in r.text
+    assert "?list=all" in r.text
+
+
+def test_analysis_list_with_list_param(client):
+    r = client.get("/analysis?list=all")
+    assert r.status_code == 200
 
 
 def test_dashboard_has_add_to_watchlist_buttons(client):

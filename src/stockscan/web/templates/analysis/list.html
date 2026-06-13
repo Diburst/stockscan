@@ -1,7 +1,11 @@
 {% extends "base.html" %}
-{% from "_macros.html" import card, badge, empty %}
+{% from "_macros.html" import card, badge, empty, pill_link %}
 
 {% block title %}Analysis{% endblock %}
+
+{% block head_extra %}
+  <script src="https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
+{% endblock %}
 
 {% macro _trend_chip(trend) %}
   {%- if trend.bucket == 'strong_up' -%}{{ badge(trend.label, "ok") }}
@@ -27,13 +31,13 @@
     <div>
       <h1 class="text-2xl font-semibold">Analysis</h1>
       <p class="text-sm text-ink-500 mt-1">
-        Per-symbol technical analysis for every watched name.
-        Click any card for the full breakdown with a larger chart.
+        Per-symbol technical analysis. Toggle studies and set the window once —
+        it applies to every chart. Click a ticker for the full breakdown.
       </p>
     </div>
     <div class="flex items-center gap-3 flex-wrap">
       <div class="text-xs text-ink-500"
-           title="Date of the most recent end-of-day bar across all watched symbols. Click Refresh to pull the latest from the data provider.">
+           title="Date of the most recent end-of-day bar across all charts.">
         {% if bars_as_of %}
           Bars as of <span class="font-mono">{{ bars_as_of }}</span>
         {% else %}
@@ -44,32 +48,82 @@
         <button type="submit"
                 class="inline-flex items-center gap-1.5 text-sm px-3 py-2 rounded
                        border border-ink-300 bg-white hover:bg-ink-100 transition-colors"
-                title="Pull the latest end-of-day bars for the S&P 500 universe + every watched symbol, re-run all strategies, then refresh this view. Equivalent to `stockscan refresh daily`.">
+                title="Pull the latest end-of-day bars + re-run all strategies, then refresh this view.">
           ↻ Refresh bars
         </button>
       </form>
-      <div class="text-xs text-ink-500">
-        {{ cards|length }} watched
-      </div>
+      <div class="text-xs text-ink-500">{{ cards|length }} shown</div>
     </div>
   </div>
 
+  <!-- List selector -->
+  <div class="flex items-center gap-1.5 flex-wrap border-t border-ink-300/40 pt-2"
+       aria-label="Select watchlist">
+    {{ pill_link("/analysis?list=all", "All", active=(selected_id is none)) }}
+    {% for wl in lists %}
+      {{ pill_link("/analysis?list=" ~ wl.list_id, wl.name ~ " (" ~ wl.count ~ ")",
+                   active=(selected_id == wl.list_id)) }}
+    {% endfor %}
+  </div>
+
+  {% if cards %}
+  <!-- Shared chart controls: window toolbar + studies panel (apply to all) -->
+  <div class="border-y border-ink-300/40 py-2 space-y-2">
+    <div class="flex items-center justify-between flex-wrap gap-3">
+      <div id="hub-window-toolbar" class="flex items-center gap-1" role="group"
+           aria-label="Chart time window">
+        <span class="text-xs text-ink-500 mr-1">Window</span>
+        {% for w in ['7d', '30d', '90d', '1y', '3y'] %}
+          <button type="button" data-window="{{ w }}"
+                  class="hub-window-btn text-xs px-2.5 py-1 rounded border border-ink-300
+                         bg-white hover:bg-ink-100 transition-colors"
+                  title="Show the last {{ w }} on every chart">{{ w }}</button>
+        {% endfor %}
+      </div>
+      <button type="button" id="hub-studies-toggle"
+              class="text-xs px-2.5 py-1 rounded border border-ink-300 bg-white
+                     hover:bg-ink-100 transition-colors"
+              title="Show / hide studies that apply to every chart">
+        Studies ▾
+      </button>
+    </div>
+    <div id="hub-studies-panel" class="hidden text-xs grid grid-cols-2 sm:grid-cols-3 gap-x-6 gap-y-1 pt-1">
+      <div>
+        <div class="uppercase tracking-wide text-ink-500 font-semibold mb-1">Overlays</div>
+        <div class="space-y-1" data-group="overlay"></div>
+      </div>
+      <div>
+        <div class="uppercase tracking-wide text-ink-500 font-semibold mb-1">Subpanels</div>
+        <div class="space-y-1" data-group="subpanel"></div>
+      </div>
+      <div>
+        <div class="uppercase tracking-wide text-ink-500 font-semibold mb-1">Levels &amp; bands</div>
+        <div class="space-y-1" data-group="level"></div>
+        <button type="button" id="hub-studies-reset"
+                class="mt-1 text-ink-500 hover:text-ink-900 underline text-[11px]">
+          Reset to defaults
+        </button>
+      </div>
+    </div>
+  </div>
+  {% endif %}
+
   {% if not cards %}
     {{ empty(
-       "Nothing on the watchlist yet — add symbols on the Watchlist page first.",
+       "Nothing on this list yet — add symbols on the Watchlist page first.",
        "📈",
     ) }}
   {% else %}
     <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
       {% for c in cards %}
         {%- set a = c.analysis -%}
-        <a href="/analysis/{{ a.symbol }}"
-           class="bg-white rounded-xl shadow-sm border border-ink-300/40 p-4 hover:shadow-md transition-shadow block">
+        <div class="bg-white rounded-xl shadow-sm border border-ink-300/40 p-4 block">
 
-          {# Header row: ticker + trend chip + vol chip + last close #}
           <div class="flex items-baseline justify-between gap-2 mb-2 flex-wrap">
             <div class="flex items-baseline gap-3">
-              <h2 class="font-mono font-semibold text-xl">{{ a.symbol }}</h2>
+              <a href="/analysis/{{ a.symbol }}"
+                 class="font-mono font-semibold text-xl hover:underline"
+                 title="Open the full breakdown for {{ a.symbol }}">{{ a.symbol }}</a>
               {% if a.last_close %}
                 <span class="font-mono text-lg">${{ "%.2f"|format(a.last_close) }}</span>
               {% endif %}
@@ -83,12 +137,25 @@
             </div>
           </div>
 
-          {# Mini chart #}
+          {# Chart: interactive (full studies) when we have a payload, else SVG #}
           <div class="mb-3 -mx-1">
-            {{ c.chart_svg }}
+            {% if c.payload and c.payload.bars %}
+              <div class="analysis-hub-card relative" data-chart-card>
+                <div data-chart style="width:100%; height:220px;"></div>
+                <div data-tooltip
+                     style="position:absolute; display:none; pointer-events:none;
+                            top:6px; left:8px; z-index:5;
+                            background:rgba(255,255,255,0.96); border:1px solid #cbd5e1;
+                            border-radius:6px; padding:6px 8px;
+                            font:11px/1.35 ui-monospace, SFMono-Regular, monospace;
+                            color:#1e293b; box-shadow:0 2px 6px rgba(0,0,0,0.08); min-width:150px;"></div>
+                <script type="application/json" data-payload>{{ c.payload|tojson }}</script>
+              </div>
+            {% else %}
+              {{ c.chart_svg }}
+            {% endif %}
           </div>
 
-          {# Key numeric summary: 7d/30d expected ranges + nearest S/R #}
           {% if a.available %}
             <div class="grid grid-cols-2 sm:grid-cols-4 gap-3 text-xs">
               {% if a.volatility.expected_7d %}
@@ -125,7 +192,6 @@
               {% endif %}
             </div>
 
-            {# First curated observation surfaces here as the headline #}
             {% if a.options_context.observations %}
               <p class="text-xs text-ink-700 mt-3 leading-snug border-t border-ink-300/40 pt-2">
                 {{ a.options_context.observations[0] }}
@@ -140,9 +206,107 @@
               {% endif %}
             </div>
           {% endif %}
-        </a>
+        </div>
       {% endfor %}
     </div>
   {% endif %}
 </div>
+
+{% if cards %}
+  {% include "analysis/_chart_engine.html" %}
+  <script>
+    (function () {
+      const STUDIES_KEY = 'analysis.hub.studies';
+      const WINDOW_KEY = 'analysis.hub.window';
+      const DEFAULT_WINDOW = '90d';
+
+      const cardEls = [...document.querySelectorAll('[data-chart-card]')];
+      if (!cardEls.length || !window.StockscanChart) return;
+
+      // ----- Shared initial state -----
+      let sharedWindow = DEFAULT_WINDOW;
+      try { const w = localStorage.getItem(WINDOW_KEY); if (w) sharedWindow = w; } catch (e) {}
+
+      // Default enabled set from the first card's payload (server-provided
+      // default_on), unless the user has a saved hub selection.
+      let sharedEnabled;
+      try {
+        const raw = localStorage.getItem(STUDIES_KEY);
+        if (raw) sharedEnabled = new Set(JSON.parse(raw));
+      } catch (e) {}
+      if (!sharedEnabled) {
+        let def = [];
+        const firstScript = cardEls[0].querySelector('script[data-payload]');
+        try { def = (JSON.parse(firstScript.textContent).default_on) || []; } catch (e) {}
+        sharedEnabled = new Set(def);
+      }
+      function persistStudies() {
+        try { localStorage.setItem(STUDIES_KEY, JSON.stringify([...sharedEnabled])); } catch (e) {}
+      }
+
+      // ----- Build one chart instance per card -----
+      const instances = [];
+      cardEls.forEach(card => {
+        const scriptEl = card.querySelector('script[data-payload]');
+        if (!scriptEl) return;
+        let payload;
+        try { payload = JSON.parse(scriptEl.textContent); } catch (e) { return; }
+        if (!payload.bars || !payload.bars.length) return;
+        instances.push(StockscanChart.create(card, payload, {
+          persist: false,
+          initialEnabled: [...sharedEnabled],
+          defaultWindow: sharedWindow,
+        }));
+      });
+
+      // ----- Shared studies panel -----
+      const panel = document.getElementById('hub-studies-panel');
+      StockscanChart.STUDY_DEFS.forEach(([key, label, group]) => {
+        const groupEl = panel.querySelector('[data-group="' + group + '"]');
+        if (!groupEl) return;
+        const lab = document.createElement('label');
+        lab.className = 'flex items-center gap-2 cursor-pointer hover:bg-ink-100 rounded px-1 py-0.5';
+        const cb = document.createElement('input');
+        cb.type = 'checkbox';
+        cb.className = 'h-3.5 w-3.5';
+        cb.checked = sharedEnabled.has(key);
+        cb.addEventListener('change', () => {
+          if (cb.checked) sharedEnabled.add(key); else sharedEnabled.delete(key);
+          instances.forEach(i => i.setStudy(key, cb.checked));
+          persistStudies();
+        });
+        const text = document.createElement('span');
+        text.textContent = label;
+        lab.appendChild(cb);
+        lab.appendChild(text);
+        groupEl.appendChild(lab);
+      });
+
+      document.getElementById('hub-studies-toggle').addEventListener('click', () => {
+        panel.classList.toggle('hidden');
+      });
+      document.getElementById('hub-studies-reset').addEventListener('click', () => {
+        try { localStorage.removeItem(STUDIES_KEY); } catch (e) {}
+        window.location.reload();
+      });
+
+      // ----- Shared window toolbar -----
+      function setWindow(label) {
+        sharedWindow = label;
+        try { localStorage.setItem(WINDOW_KEY, label); } catch (e) {}
+        instances.forEach(i => i.setWindow(label));
+        document.querySelectorAll('.hub-window-btn').forEach(b => {
+          const on = b.dataset.window === label;
+          b.classList.toggle('bg-ink-900', on);
+          b.classList.toggle('text-white', on);
+          b.classList.toggle('bg-white', !on);
+        });
+      }
+      document.querySelectorAll('.hub-window-btn').forEach(btn => {
+        btn.addEventListener('click', () => setWindow(btn.dataset.window));
+      });
+      setWindow(sharedWindow);
+    })();
+  </script>
+{% endif %}
 {% endblock %}

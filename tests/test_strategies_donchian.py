@@ -96,6 +96,68 @@ def test_signals_idempotent(strategy):
     assert a == b
 
 
+def _bbw_squeeze_strategy() -> DonchianBreakout:
+    """Donchian configured to isolate the v1.3 BBW squeeze filter: everything
+    else off, ADX gate slack, single 20-bar window."""
+    return DonchianBreakout(
+        DonchianParams(
+            adx_min=0.0,
+            require_base_consolidation=False,  # use ADX gate, not Stage-2
+            require_vol_contraction=True,      # the filter under test
+            max_pct_above_sma50=0.0,
+            max_rsi_pre_breakout=100.0,
+            enable_relative_strength=False,
+            enable_turtle_1l=False,
+            require_vol_expansion=False,
+            volume_mult=1.0,
+            entry_periods=[20],
+        )
+    )
+
+
+def test_bbw_squeeze_blocks_when_no_compression():
+    """v1.3: a series with no recent BBW compression must not pass — yesterday's
+    BBW sits in the middle of its 126-bar distribution, not the bottom 30%."""
+    rng = np.random.default_rng(0)
+    n = 250
+    closes = (100 + np.cumsum(rng.normal(0, 1.5, n))).tolist()
+    # Force today to break the 20-day high so only the squeeze filter can fail.
+    closes[-1] = max(closes[-21:-1]) + 1.5
+    bars = _make_bars(closes)
+    bars.iloc[-1, bars.columns.get_loc("high")] = closes[-1] + 0.5
+    bars.iloc[-1, bars.columns.get_loc("low")] = closes[-2] - 0.2
+    bars.iloc[-1, bars.columns.get_loc("volume")] = 2_000_000
+    s = _bbw_squeeze_strategy()
+    sigs = s.signals(bars, as_of=bars.index[-1].date())
+    # No squeeze → no signal.
+    assert sigs == []
+
+
+def test_bbw_squeeze_passes_after_compression():
+    """v1.3: a wide-vol stretch followed by a tight base compresses BBW into the
+    bottom of its 126-bar window, so the breakout passes the squeeze filter and
+    the metadata records the percentile rank."""
+    rng = np.random.default_rng(1)
+    # 210 wide-vol bars (random walk σ=2), then 22 tight bars (σ=0.15), then
+    # one breakout bar above the 20-day high.
+    wide = (100 + np.cumsum(rng.normal(0, 2.0, 210))).tolist()
+    base_level = wide[-1]
+    tight = (base_level + rng.normal(0, 0.15, 22)).tolist()
+    breakout = max(tight) + 1.5
+    closes = wide + tight + [breakout]
+    bars = _make_bars(closes)
+    bars.iloc[-1, bars.columns.get_loc("high")] = breakout + 0.5
+    bars.iloc[-1, bars.columns.get_loc("low")] = closes[-2] - 0.2
+    bars.iloc[-1, bars.columns.get_loc("volume")] = 2_500_000
+    s = _bbw_squeeze_strategy()
+    sigs = s.signals(bars, as_of=bars.index[-1].date())
+    assert len(sigs) == 1
+    pct = sigs[0].metadata.get("bbw_percentile")
+    # Pure-tight BBW at the bottom of a 126-bar window dominated by wide bars
+    # ranks deeply below the 30% cap.
+    assert pct is not None and pct <= 0.30
+
+
 def test_exit_chandelier_stop(strategy):
     """Big rip up, then sharp drop → chandelier trailing stop should fire."""
     rip = np.linspace(100, 200, 80).tolist()

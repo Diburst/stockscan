@@ -128,10 +128,43 @@ def test_bar_record_shape(synthetic_bars, analysis):
     assert len(bar["time"]) == 10 and bar["time"][4] == "-"
 
 
-def test_chart_history_cap(synthetic_bars, analysis):
-    """Bars are capped at 252 trading days for chart legibility."""
-    payload = build_chart_payload("TEST", analysis, bars=synthetic_bars)
-    assert len(payload["bars"]) == 252
+def test_chart_history_cap(analysis):
+    """Bars are capped at ~756 trading days (~3y) so the range buttons can
+    offer a 3y window without sending unbounded history."""
+    from stockscan.analysis.chart_data import _CHART_HISTORY_DAYS
+
+    # Build a series LONGER than the cap so capping is actually exercised.
+    n = _CHART_HISTORY_DAYS + 200
+    idx = pd.date_range("2018-01-01", periods=n, freq="B")
+    rng = np.random.default_rng(7)
+    closes = 100 + np.cumsum(rng.normal(0, 1, n))
+    long_bars = pd.DataFrame(
+        {
+            "open": closes + rng.normal(0, 0.5, n),
+            "high": closes + 1.5,
+            "low": closes - 1.5,
+            "close": closes,
+            "adj_close": closes,
+            "volume": rng.integers(100_000, 1_000_000, n),
+        },
+        index=idx,
+    )
+    # Use an as_of past the end of the synthetic frame so no rows are trimmed.
+    capped_analysis = SymbolAnalysis(
+        symbol="TEST",
+        as_of=long_bars.index[-1].date(),
+        available=True,
+        last_close=float(long_bars["close"].iloc[-1]),
+        last_volume=100_000.0,
+        bars_count=n,
+        levels=[],
+        trend=analysis.trend,
+        volatility=analysis.volatility,
+        momentum=analysis.momentum,
+        options_context=analysis.options_context,
+    )
+    payload = build_chart_payload("TEST", capped_analysis, bars=long_bars)
+    assert len(payload["bars"]) == _CHART_HISTORY_DAYS
 
 
 def test_all_documented_studies_present(synthetic_bars, analysis):

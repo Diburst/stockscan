@@ -27,7 +27,7 @@ per symbol with S/R levels and expected-range bands overlaid.
 
 from __future__ import annotations
 
-from stockscan.analysis.batch import analyze_watchlist
+from stockscan.analysis.batch import analyze_watchlist, analyze_watchlist_cards
 from stockscan.analysis.chart import render_chart_svg
 from stockscan.analysis.chart_data import build_chart_payload
 from stockscan.analysis.engine import analyze_symbol
@@ -51,6 +51,7 @@ __all__ = [
     "VolatilityState",
     "analyze_symbol",
     "analyze_watchlist",
+    "analyze_watchlist_cards",
     "build_chart_payload",
     "render_chart_svg",
 ]

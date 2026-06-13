@@ -220,6 +220,25 @@ def latest_bar_date(symbol: str, *, session: Session | None = None) -> date | No
         return _run(s)
 
 
+def latest_daily_bar_date(*, session: Session | None = None) -> date | None:
+    """Most recent stored daily bar date across ALL symbols, or None.
+
+    Used by the bulk refresh to gap-fill only the trading days it's actually
+    missing instead of re-fetching a fixed trailing window (each full-market
+    bulk call costs 100 EODHD credits, so re-pulling stored days is pure
+    waste)."""
+    sql = text("SELECT MAX(bar_ts)::date FROM bars WHERE interval='1d'")
+
+    def _run(s: Session) -> date | None:
+        row = s.execute(sql).first()
+        return row[0] if row is not None else None
+
+    if session is not None:
+        return _run(session)
+    with session_scope() as s:
+        return _run(s)
+
+
 def upsert_bars_from_df(df: pd.DataFrame, symbol: str, source: str = "manual") -> int:
     """Convenience: upsert bars from a DataFrame (e.g., from yfinance fixtures)."""
     rows: list[BarRow] = []

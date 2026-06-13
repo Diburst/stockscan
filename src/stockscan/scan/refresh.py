@@ -29,7 +29,11 @@ from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 from typing import TYPE_CHECKING
 
-from stockscan.data.backfill import refresh_recent_days_bulk, trading_days_since
+from stockscan.data.backfill import (
+    latest_completed_session,
+    refresh_recent_days_bulk,
+    trading_days_since,
+)
 from stockscan.scan.runner import ScanRunner, ScanSummary
 from stockscan.strategies import STRATEGY_REGISTRY, discover_strategies
 from stockscan.universe import current_constituents
@@ -66,6 +70,9 @@ class SignalsRefreshResult:
     strategies_run: int  # strategies whose scan completed (success or empty)
     signals_emitted: int  # sum of passing across all strategies
     rejected_count: int  # sum of rejected across all strategies
+    # True when the store already had the latest completed session, so the
+    # bulk fetch AND strategy fan-out were skipped — a zero-API-cost no-op.
+    up_to_date: bool = False
     failures: list[StrategyRunFailure] = field(default_factory=list)
     started_at: datetime = field(default_factory=lambda: datetime.now(UTC))
     finished_at: datetime = field(default_factory=lambda: datetime.now(UTC))
@@ -75,17 +82,30 @@ class SignalsRefreshResult:
         return (self.finished_at - self.started_at).total_seconds()
 
 
-def _bulk_dates(days_back: int) -> list[date]:
-    """Trading days (weekdays) within the trailing ``days_back`` window.
+def _bulk_dates(days_back: int, *, session: Session | None = None) -> list[date]:
+    """Trading days the bulk loop should actually fetch — empty when current.
 
-    Uses :func:`trading_days_since` from the data layer so the holiday-
-    handling behaviour stays consistent with the nightly refresh job.
-    The bulk endpoint silently returns empty for non-trading days, so a
-    handful of unnecessary calls (e.g., over a long weekend) is harmless.
+    Gap-fills from the latest stored daily bar up to the latest *completed*
+    session (``latest_completed_session``), with NO overlap. Each full-market
+    bulk call costs 100 EODHD credits, so when the store already has the latest
+    available session this returns ``[]`` and the refresh spends nothing — a
+    true zero-cost no-op. A long outage is still clamped to ``days_back`` so a
+    stale store can't balloon into a huge fetch.
+
+    Falls back to the ``days_back`` window when the store is empty (first run).
     """
     today = date.today()
-    last_date = today - timedelta(days=days_back)
-    return trading_days_since(last_date, today)
+    floor = today - timedelta(days=days_back)
+    target = latest_completed_session()
+
+    from stockscan.data.store import latest_daily_bar_date
+
+    latest = latest_daily_bar_date(session=session)
+    start_after = latest if latest is not None else floor
+    start_after = max(start_after, floor)  # never look back further than days_back
+    # Days strictly after what we already have, up to the latest available
+    # session. If we're current (start_after >= target) this is empty.
+    return trading_days_since(start_after, target)
 
 
 def refresh_signals(
@@ -135,7 +155,25 @@ def refresh_signals(
     # ------------------------------------------------------------------
     universe = set(current_constituents(session=session))
     universe |= watchlist_symbols(session=session)
-    dates = _bulk_dates(days_back)
+    dates = _bulk_dates(days_back, session=session)
+
+    # Zero-cost no-op: the store already has the latest completed session, so
+    # there are no new bars to pull and re-running strategies would reproduce
+    # the same signals. Skip both — no API calls, no wasted compute.
+    if not dates:
+        log.info("scan refresh: already up to date — no fetch, no strategy run")
+        now = datetime.now(UTC)
+        return SignalsRefreshResult(
+            bars_upserted=0,
+            bars_days_covered=0,
+            strategies_run=0,
+            signals_emitted=0,
+            rejected_count=0,
+            up_to_date=True,
+            started_at=started,
+            finished_at=now,
+        )
+
     bars_upserted = 0
     if dates:
         try:

@@ -1,20 +1,93 @@
 {% extends "base.html" %}
 {% from "_macros.html" import card, badge, empty, tech_score, confirm_button,
      table_open, table_close, mobile_list_open, mobile_list_close,
-     field_label, page_header %}
+     field_label, page_header, pill_link %}
 
 {% block title %}Watchlist{% endblock %}
+
+{# Suffix to keep the current list selection across delete posts. #}
+{%- set list_qs = ("?list_id=" ~ selected_id) if selected_id is not none else "?list_id=all" -%}
 
 {% block content %}
 <div class="space-y-6">
 
-  {{ page_header("Watchlist", subtitle="Symbols you're tracking, with live quotes and price-target alerts") }}
+  {{ page_header("Watchlist", subtitle="Symbols you're tracking, organised into lists, with live quotes and price-target alerts") }}
 
   {% if err %}
     <div class="bg-bad-100 border border-bad-600/30 text-bad-600 px-4 py-3 rounded text-sm">
       {{ err.replace('+', ' ') }}
     </div>
   {% endif %}
+
+  <!-- List selector -->
+  <div class="flex items-center justify-between flex-wrap gap-3 border-y border-ink-300/40 py-2">
+    <div class="flex items-center gap-1.5 flex-wrap" aria-label="Select watchlist">
+      {{ pill_link("/watchlist?list=all", "All", active=(selected_id is none)) }}
+      {% for wl in lists %}
+        {{ pill_link("/watchlist?list=" ~ wl.list_id, wl.name ~ " (" ~ wl.count ~ ")",
+                     active=(selected_id == wl.list_id)) }}
+      {% endfor %}
+    </div>
+    <div class="flex items-center gap-3 flex-wrap text-xs">
+      <a href="/watchlist/export{{ ('?list=' ~ selected_id) if selected_id is not none else '?list=all' }}"
+         class="text-ink-500 hover:text-ink-900 underline"
+         title="Open this view's tickers as comma-separated text to copy or save">
+        Export tickers
+      </a>
+      <button type="button" id="manage-lists-toggle"
+              class="text-ink-500 hover:text-ink-900 underline"
+              title="Create, rename, or delete lists">
+        Manage lists ▾
+      </button>
+    </div>
+  </div>
+
+  <!-- Manage lists (collapsible) -->
+  <div id="manage-lists-panel" class="hidden">
+    {% call card(title="Manage lists") %}
+      <div class="flex flex-col sm:flex-row gap-4 flex-wrap">
+        <form action="/watchlist/lists/create" method="post"
+              class="flex items-end gap-2">
+          <div>
+            {{ field_label("new_list", "Create a list",
+                           help="A new, empty list you can add symbols to.") }}
+            <input id="new_list" name="name" required maxlength="60"
+                   placeholder="e.g. Earnings plays"
+                   class="px-3 py-2 rounded border border-ink-300 text-sm">
+          </div>
+          <button class="px-3 py-2 rounded bg-ink-900 text-white text-sm">Create</button>
+        </form>
+
+        {% if selected_id is not none %}
+          <form action="/watchlist/lists/rename" method="post"
+                class="flex items-end gap-2">
+            <input type="hidden" name="list_id" value="{{ selected_id }}">
+            <div>
+              {{ field_label("rename_list", "Rename “" ~ selected_label ~ "”") }}
+              <input id="rename_list" name="name" required maxlength="60"
+                     value="{{ selected_label }}"
+                     class="px-3 py-2 rounded border border-ink-300 text-sm">
+            </div>
+            <button class="px-3 py-2 rounded border border-ink-300 bg-white hover:bg-ink-100 text-sm">
+              Rename
+            </button>
+          </form>
+
+          <form action="/watchlist/lists/delete" method="post"
+                class="flex items-end"
+                data-confirm-label="Delete list?"
+                onsubmit="return ssConfirmSubmit(event, this);"
+                title="Delete this list. Symbols left on no other list are removed.">
+            <input type="hidden" name="list_id" value="{{ selected_id }}">
+            <button type="submit"
+                    class="px-3 py-2 rounded text-bad-600 hover:bg-bad-100 text-sm">
+              Delete “{{ selected_label }}”
+            </button>
+          </form>
+        {% endif %}
+      </div>
+    {% endcall %}
+  </div>
 
   <!-- Quick actions strip: data-freshness indicator + refresh + analysis link -->
   <div class="flex items-center justify-between flex-wrap gap-3">
@@ -35,55 +108,60 @@
           ↻ Refresh bars
         </button>
       </form>
-      <a href="/analysis"
+      <a href="/analysis{{ ('?list=' ~ selected_id) if selected_id is not none else '?list=all' }}"
          class="inline-flex items-center gap-1.5 text-sm px-3 py-2 rounded
                 bg-ink-900 text-white hover:bg-ink-800 transition-colors min-h-[40px]"
-         title="Run a fresh per-symbol technical analysis (with charts) for every watched name">
-        📊 Analyse all watched
+         title="Run a fresh per-symbol technical analysis (with charts) for the symbols in this view">
+        📊 Analyse {{ selected_label }}
       </a>
     </div>
   </div>
 
-  <!-- Add a symbol -->
-  {% call card(title="Add a symbol", subtitle="Type a ticker, optionally set a price target") %}
-    <form action="/watchlist/add" method="post"
+  <!-- Add symbols (one or many) -->
+  {% call card(title="Add symbols",
+               subtitle="Type or paste one or more tickers (separated by commas, spaces, or new lines) and pick a list. Set price targets afterwards from the table below.") %}
+    <form action="/watchlist/add-bulk" method="post"
           class="flex flex-col sm:flex-row sm:items-end gap-2">
+      <input type="hidden" name="redirect_to"
+             value="/watchlist{{ ('?list=' ~ selected_id) if selected_id is not none else '?list=all' }}">
       <div class="flex-1">
-        {{ field_label("symbol", "Symbol", required=True,
-                       help="Stock ticker, e.g., AAPL. Auto-uppercased on submit.") }}
-        <input id="symbol" name="symbol" required maxlength="10"
-               placeholder="AAPL"
-               class="w-full px-3 py-2 rounded border border-ink-300 text-sm font-mono uppercase"
-               style="text-transform: uppercase;">
+        {{ field_label("symbols", "Symbol(s)", required=True,
+                       help="One ticker (AAPL) or many (AAPL, MSFT  GOOG). Auto-uppercased; invalid tickers are skipped.") }}
+        <textarea id="symbols" name="symbols" rows="2" required
+                  placeholder="AAPL    or    AAPL, MSFT, GOOG  TSLA NVDA"
+                  class="w-full px-3 py-2 rounded border border-ink-300 text-sm font-mono uppercase"
+                  style="text-transform: uppercase;"></textarea>
       </div>
-      <div class="flex-1 grid grid-cols-2 gap-2">
-        <div>
-          {{ field_label("target_price", "Target price",
-                         help="Optional. When the symbol crosses this price (in the configured direction) and alerts are enabled, you'll be notified.") }}
-          <input id="target_price" name="target_price" type="number" step="0.01" min="0"
-                 inputmode="decimal" placeholder="—"
-                 class="w-full px-3 py-2 rounded border border-ink-300 text-sm">
-        </div>
-        <div>
-          {{ field_label("target_direction", "Direction",
-                         help="'above' triggers when price rises through the target; 'below' triggers when price falls through.") }}
-          <select id="target_direction" name="target_direction"
-                  class="w-full px-3 py-2 rounded border border-ink-300 text-sm">
-            <option value="">—</option>
-            <option value="above">above</option>
-            <option value="below">below</option>
-          </select>
-        </div>
+      <div class="flex-1">
+        {{ field_label("add_list", "List",
+                       help="Which list to add to. Choose '+ new list…' to create one.") }}
+        <select id="add_list" name="list_id"
+                class="w-full px-3 py-2 rounded border border-ink-300 text-sm"
+                onchange="document.getElementById('new_list_name').classList.toggle('hidden', this.value !== '__new__')">
+          {% for wl in lists %}
+            <option value="{{ wl.list_id }}"
+              {% if selected_id == wl.list_id or (selected_id is none and loop.first) %}selected{% endif %}>
+              {{ wl.name }}
+            </option>
+          {% endfor %}
+          <option value="__new__">+ new list…</option>
+        </select>
+        <input id="new_list_name" name="new_list_name" type="text" maxlength="60"
+               placeholder="New list name"
+               class="hidden w-full mt-1 px-3 py-2 rounded border border-ink-300 text-sm">
       </div>
       <button class="px-4 py-2 rounded bg-ink-900 text-white text-sm h-fit"
-              title="Add this symbol to the watchlist">
+              title="Add the symbol(s) to the selected list">
         Add
       </button>
     </form>
   {% endcall %}
 
   {% if not items %}
-    {{ empty("Your watchlist is empty.", "👀") }}
+    {{ empty(
+        ("No symbols across any list yet." if selected_id is none
+         else "“" ~ selected_label ~ "” is empty — add a symbol above."),
+        "👀") }}
   {% else %}
     <!-- Desktop table -->
     <div class="hidden sm:block bg-white rounded-xl shadow-sm border border-ink-300/40 overflow-hidden">
@@ -208,7 +286,7 @@
               <!-- Remove (two-step inline confirm) -->
               <td class="px-4 py-2 text-right align-middle">
                 {{ confirm_button(
-                    "/watchlist/" ~ w.watchlist_id ~ "/delete",
+                    "/watchlist/" ~ w.watchlist_id ~ "/delete" ~ list_qs,
                     label="×",
                     confirm_label="Confirm",
                     classes="text-ink-500 hover:text-bad-600 text-lg leading-none px-1",
@@ -230,7 +308,7 @@
               {% if w.target_satisfied and w.alert_enabled %}{{ badge("hit", "ok") }}{% endif %}
             </div>
             {{ confirm_button(
-                "/watchlist/" ~ w.watchlist_id ~ "/delete",
+                "/watchlist/" ~ w.watchlist_id ~ "/delete" ~ list_qs,
                 label="×",
                 confirm_label="Confirm",
                 classes="text-ink-500 hover:text-bad-600 text-xl leading-none px-1",
@@ -306,4 +384,14 @@
   {% endif %}
 
 </div>
+
+<script>
+  (function () {
+    const toggle = document.getElementById('manage-lists-toggle');
+    const panel = document.getElementById('manage-lists-panel');
+    if (toggle && panel) {
+      toggle.addEventListener('click', () => panel.classList.toggle('hidden'));
+    }
+  })();
+</script>
 {% endblock %}

@@ -158,20 +158,21 @@ _METADATA_LABELS: dict[str, tuple[str, str]] = {
         "under the v1.1 exit rules. 'winner' triggers the Turtle 1L filter "
         "(skip today's signal); 'loser' or 'none' allows it through.",
     ),
-    # ---- Donchian v1.2: base-breakout filters ----
+    # ---- Donchian v1.2 / v1.3: base-breakout filters ----
     "base_range_pct": (
         "Base width (20-bar)",
         "Range of the 20 bars BEFORE the breakout — (max high - min low) "
-        "as % of midpoint. Donchian v1.2 requires <=12% to qualify as a "
+        "as % of midpoint. Donchian v1.2 requires <=15% to qualify as a "
         "tight consolidation base; wider 'bases' are usually just chop. "
         "Lower is tighter / cleaner.",
     ),
-    "vol_contraction_ratio_actual": (
-        "ATR(20) / ATR(63) pre-breakout",
-        "Recent ATR(20) excluding today divided by longer-term ATR(63). "
-        "Donchian v1.2 requires <=0.85 — i.e., recent vol must have "
-        "compressed at least 15% relative to baseline (Bollinger Squeeze "
-        "framing). Lower = stronger contraction = better base setup.",
+    "bbw_percentile": (
+        "Bollinger Bandwidth percentile",
+        "Yesterday's Bollinger Bandwidth (4σ/middle on BB(20)) ranked "
+        "within its trailing 126-bar (~6-month) distribution. Donchian "
+        "v1.3 requires this to be in the bottom 30% — the canonical "
+        "Bollinger Squeeze (BBW at a multi-month low). Lower = tighter "
+        "pre-breakout squeeze = stronger setup.",
     ),
     "pct_above_sma50": (
         "% above SMA(50)",

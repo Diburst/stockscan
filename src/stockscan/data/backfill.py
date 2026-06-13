@@ -7,13 +7,42 @@ when adding a new symbol or extending history.
 from __future__ import annotations
 
 import logging
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Iterable
+from zoneinfo import ZoneInfo
 
 from stockscan.data.providers.base import DataProvider
 from stockscan.data.store import latest_bar_date, upsert_bars
 
 log = logging.getLogger(__name__)
+
+_NY_TZ = ZoneInfo("America/New_York")
+
+# When a trading day's EOD bars become safe to fetch. EODHD posts NYSE/NASDAQ
+# end-of-day data ~15 min after the 16:00 ET close; we wait until 18:00 ET (a
+# ~2h margin) so a refresh never spends an API credit on a not-yet-posted day.
+# Tunable if you want fresher same-day data (lower) or more safety (higher).
+EOD_AVAILABLE_HOUR_ET = 18
+
+
+def latest_completed_session(now: datetime | None = None) -> date:
+    """The most recent trading session whose EOD bars should be available.
+
+    Today counts only after ``EOD_AVAILABLE_HOUR_ET`` ET on a weekday;
+    otherwise we fall back to the most recent prior weekday. Weekend/After-
+    hours refreshes therefore target the last closed session, so a store that
+    already has it is a true zero-cost no-op (no day to fetch).
+
+    Holidays use the weekday proxy the rest of the data layer uses — on a
+    market holiday the bulk endpoint simply returns empty, same as before.
+    """
+    et = (now or datetime.now(timezone.utc)).astimezone(_NY_TZ)
+    d = et.date()
+    if not (d.weekday() < 5 and et.hour >= EOD_AVAILABLE_HOUR_ET):
+        d = d - timedelta(days=1)
+    while d.weekday() >= 5:  # Sat/Sun → step back to Friday
+        d = d - timedelta(days=1)
+    return d
 
 
 def backfill_symbol(

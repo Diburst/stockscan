@@ -1,4 +1,12 @@
-"""Donchian Channel Breakout (Turtle-style) — v1.2.
+"""Donchian Channel Breakout (Turtle-style) — v1.3.
+
+v1.3 keeps the v1.2 base-breakout thesis but swaps the volatility filter to
+Bollinger 2001's canonical Squeeze (BBW in the bottom 30% of its trailing
+6-month distribution), replacing the v1.2 ATR(20)/ATR(63) hard cap that
+rejected too many legitimate rangy-but-tight bases. The volume multiple
+reverts to 1.5× (canonical O'Neil), down from the brief 1.75× in v1.2.
+Everything else — windows, ADX/Stage-2 gate, base width, distance-from-SMA50,
+pre-breakout RSI, 1L, RS, Chandelier — is unchanged.
 
 v1.2 ("base breakout") narrows the strategy from "any breakout in a
 trending market" to specifically the **base-breakout setup**: a stock
@@ -21,9 +29,12 @@ Four new filters address those (each with its own toggle):
      measured as (max high - min low) / midpoint, must be ≤ 15%. Wide
      bases that resolve upward weren't really consolidations.
 
-  7. **Volatility contraction.** ATR(20) excluding today divided by
-     ATR(63) must be ≤ 0.92. Recent vol must have compressed relative
-     to the longer-term baseline (Bollinger Squeeze framing).
+  7. **Bollinger Squeeze (v1.3).** Yesterday's Bollinger Bandwidth
+     (4σ/middle on BB(20)) must rank in the bottom 30% of its trailing
+     126-bar (~6-month) distribution. This is Bollinger 2001's canonical
+     Squeeze ("BBW at a multi-month low") as a relative-rank test, not
+     v1.2's hard ATR(20)/ATR(63) ratio cap — which rejected rangy-but-
+     tight bases where ATR(short) ≥ ATR(long) for benign reasons.
 
   8. **Max distance above SMA(50).** Today's close <= 1.15x SMA(50)
      by default. Skip stocks that have already soared off their
@@ -93,15 +104,15 @@ ALL v1.1 improvements default ON, and the v1.2 filters default ON as
 well. Each filter has its own toggle so backtests can A/B contributions
 independently.
 
-Recover **v1.1 behavior** by disabling the v1.2 filters:
+Recover **v1.1 behavior** by disabling the v1.2/v1.3 quality filters:
 
     DonchianParams(
         require_base_consolidation=False,
         require_vol_contraction=False,
         max_pct_above_sma50=0.0,       # 0 disables
         max_rsi_pre_breakout=100.0,    # 100 disables
-        adx_min=18.0,                  # was tightened from 18 → 20
-        volume_mult=1.5,               # was tightened from 1.5 → 1.75
+        adx_min=18.0,                  # was tightened from 18 → 20 in v1.2
+        # volume_mult default is already 1.5 in v1.3 (canonical O'Neil)
     )
 
 Recover the original **v1.0 behavior** by additionally disabling all
@@ -204,16 +215,16 @@ class DonchianParams(StrategyParams):
         ),
     )
 
-    # ---- v1.1: Volume confirmation (tightened in v1.2) ----
+    # ---- v1.1: Volume confirmation ----
     volume_mult: float = Field(
-        1.75,
+        1.50,
         ge=0.0,
         le=5.0,
         description=(
             "Min ratio of today's volume to the trailing-N average to "
             "confirm institutional participation. Set to 0 or 1.0 to "
-            "disable the volume gate. v1.2 default raised from 1.5 → 1.75 "
-            "to demand stronger institutional confirmation."
+            "disable the volume gate. 1.5× = canonical O'Neil breakout "
+            "volume rule (v1.2 briefly tightened to 1.75; v1.3 reverted)."
         ),
     )
     volume_window: int = Field(
@@ -280,33 +291,48 @@ class DonchianParams(StrategyParams):
             "midpoint. 15% = a clean tight base in equity TA literature "
             "(Minervini's pivot-point base, O'Neil cup-and-handle). "
             "v1.2.0 launched at 12.0 but produced too few signals in "
-            "combination with the contraction filter; raised in v1.2.1. "
-            "Lower is stricter. Set to 50.0 to effectively disable."
+            "combination with the (then-strict) vol contraction filter; "
+            "raised in v1.2.1 and kept at 15 through v1.3. Lower is "
+            "stricter. Set to 50.0 to effectively disable."
         ),
     )
 
-    # ---- v1.2: Volatility-contraction filter ----
+    # ---- v1.3: Bollinger Squeeze filter (replaces the v1.2 ATR-ratio cap) ----
     require_vol_contraction: bool = Field(
         True,
         description=(
-            "Require recent volatility to be compressed relative to the "
-            "longer-term baseline. ATR(20) excluding today / ATR(63) "
-            "must be <= `vol_contraction_ratio`. Captures the Bollinger "
-            "Squeeze pattern: vol contracts before genuine breakouts."
+            "Require the pre-breakout base to be in a Bollinger Squeeze: "
+            "yesterday's Bollinger Bandwidth (4σ/middle on BB(`bbw_period`)) "
+            "must sit in the bottom `bbw_max_percentile` of its trailing "
+            "`bbw_lookback`-bar distribution. Captures Bollinger 2001's "
+            "Squeeze definition (BBW at a multi-month low) directly, "
+            "instead of v1.2's hard ATR(20)/ATR(63) ratio cap."
         ),
     )
-    vol_contraction_ratio: float = Field(
-        0.92,
-        ge=0.30,
-        le=1.50,
+    bbw_period: int = Field(
+        20,
+        ge=10,
+        le=60,
+        description="Bollinger Bands lookback for the bandwidth (SMA + 2σ).",
+    )
+    bbw_lookback: int = Field(
+        126,
+        ge=20,
+        le=252,
         description=(
-            "Max allowed ratio of recent ATR(short) to longer-term "
-            "ATR(long). 0.92 = recent vol must be at least 8% lower "
-            "than longer-term vol to qualify as a contraction. v1.2.0 "
-            "launched at 0.85 but produced too few signals in "
-            "combination with the base-width filter (real tight bases "
-            "frequently land in the 0.85-0.92 range); raised in v1.2.1. "
-            "Lower is stricter."
+            "History window for the percentile rank, in trading days "
+            "(126 ≈ 6 months — Bollinger's canonical Squeeze window)."
+        ),
+    )
+    bbw_max_percentile: float = Field(
+        0.30,
+        ge=0.01,
+        le=1.00,
+        description=(
+            "Pre-breakout BBW must rank at or below this fraction of the "
+            "trailing `bbw_lookback` window. 0.30 = bottom 30%, a relaxed "
+            "Squeeze. Lower = stricter (Bollinger's original 'multi-month "
+            "low' would be ~0.05). 1.0 effectively disables the filter."
         ),
     )
 
@@ -340,17 +366,17 @@ class DonchianParams(StrategyParams):
 
 class DonchianBreakout(Strategy):
     name = "donchian_trend"
-    version = "1.2.1"
+    version = "1.3.0"
     display_name = "Donchian Channel Breakout"
     description = (
-        "Multi-window Turtle-style breakout, narrowed in v1.2 to the "
-        "base-breakout setup. Buys 20-day or 55-day high breakouts that "
-        "emerge from a tight pre-breakout base (≤12% range) with "
-        "compressed volatility (ATR contraction) — and that are NOT "
-        "already extended (close ≤ 15% above SMA50, RSI < 65 going in). "
-        "Volume expansion, true-range expansion, Turtle 1L, and "
-        "relative-strength filters from v1.1 still apply. Holds via "
-        "Chandelier trailing stop."
+        "Multi-window Turtle-style breakout, narrowed to the base-breakout "
+        "setup. Buys 20-day or 55-day high breakouts that emerge from a tight "
+        "pre-breakout base (≤15% range) sitting in a Bollinger Squeeze (BBW in "
+        "the bottom 30% of its trailing 6-month distribution) — and that are "
+        "NOT already extended (close ≤ 15% above SMA50, RSI < 65 going in). "
+        "Volume expansion (≥1.5×), true-range expansion, Turtle 1L, and "
+        "relative-strength filters still apply. Holds via Chandelier trailing "
+        "stop."
     )
     tags = ("trend_following", "breakout", "long_only", "swing")
     params_model = DonchianParams
@@ -394,16 +420,17 @@ Four new filters, each with its own toggle:
   - **Base consolidation width.** The 20 bars BEFORE the breakout, as a
     range, must be at most 15% of midpoint. Wide "bases" weren't really
     consolidations.
-  - **Volatility contraction.** ATR(20) excluding today / ATR(63) must
-    be ≤ 0.92. Vol must have compressed before the move (Bollinger
-    Squeeze).
+  - **Bollinger Squeeze (v1.3).** Yesterday's BBW (4σ/SMA on BB(20))
+    must rank in the bottom 30% of its trailing 126-bar distribution.
+    Vol must have been low *vs its own history* before the move.
   - **Already-soared cap.** Today's close must be ≤ 15% above SMA(50).
     Stocks already extended off their long-term MA make poor entries.
   - **Pre-breakout RSI cap.** Yesterday's RSI(14) must be < 65. Filters
     stocks that were ALREADY overbought going into the move.
 
-Plus tightened defaults on existing filters: `adx_min` 18 → 20,
-`volume_mult` 1.5 → 1.75.
+Plus tightened ADX gate (`adx_min` 18 → 20, when base mode is off). The
+v1.2 `volume_mult` tightening (1.5 → 1.75) was reverted in v1.3 back to
+canonical O'Neil at 1.5.
 
 ## What's new in v1.1
 
@@ -413,7 +440,7 @@ leaked rules and modern equity-trend literature:
   - **20 + 55 day ensemble.** Both Turtle "System 1" (20-day, sensitive)
     and "System 2" (55-day, more confirmed) windows fire in parallel.
   - **Volume confirmation.** Breakout volume must be at least 1.5x its
-    20-day average. (v1.2 raised to 1.75x.)
+    20-day average (canonical O'Neil).
   - **Volatility expansion.** Today's true range must be at least equal
     to its 14-day average. Filters out wick-touch breakouts.
   - **Turtle 1L filter.** Skip 20-day breakouts when the PREVIOUS 20-day
@@ -447,8 +474,9 @@ the 20-day signal is filtered by the 1L rule.
 
 Real institutional accumulation produces volume. Thin-tape breakouts that
 close at the high on light trading are almost always false. We require
-today's volume to be at least 1.5x its 20-day average; below that, we
-treat the breakout as suspect and skip.
+today's volume to be at least 1.5x its 20-day average — the canonical
+O'Neil breakout volume rule. Below that, we treat the breakout as suspect
+and skip. (v1.2 briefly used 1.75x; v1.3 reverted to canonical 1.5x.)
 
 ### Volatility expansion (Larry Williams)
 
@@ -492,17 +520,21 @@ Market Wizard*, the highest-quality VCP setups always emerge from a
 just chop in disguise. This filter is the single biggest reason v1.2
 generates fewer signals than v1.1.
 
-### Volatility contraction (v1.2)
+### Bollinger Squeeze (v1.3 — replaces v1.2's ATR-ratio contraction)
 
-ATR over the trailing 20 bars (excluding today) divided by ATR over
-the trailing 63 bars must be ≤ 0.92. In plain English: recent vol
-must be at least 8% lower than the longer-term baseline. This is
-the math behind the "Bollinger Squeeze" — bands narrow as volatility
-contracts, and the subsequent breakout has a better historical hit
-rate than breakouts from already-volatile names. v1.2.0 launched
-this at 0.85 (≥15% contraction) but produced too few signals in
-practice, since real tight bases frequently land in the 0.85-0.92
-range; v1.2.1 raised the cap to 0.92.
+Yesterday's Bollinger Bandwidth — (upper band − lower band) / middle
+band on BB(20), i.e. **4σ / SMA(20)** — must rank in the bottom 30%
+of its trailing 126-bar (~6-month) distribution. In plain English:
+right before today's breakout, the bands had to be narrow versus
+their own recent history. That's Bollinger 2001's canonical
+"Squeeze" definition (he calls it bandwidth at a "multi-month low").
+
+v1.2 used a hard cap on ATR(20)/ATR(63), which conceptually points
+in the same direction but is the wrong shape: real tight bases
+routinely have ATR(short) ≈ ATR(long), so the ratio sits right
+around 1.0 and a hard cap excludes them. A percentile rank asks
+the better question — "is vol low *vs itself*" — and is what the
+Squeeze literature actually measures.
 
 ### Already-soared cap (v1.2)
 
@@ -580,12 +612,13 @@ normal pullbacks.
     * (base mode OFF, v1.1 fallback) ADX(14) >= 20.
   - Today's close exceeds the prior N-day max close (N is the longest
     qualifying window from `entry_periods`).
-  - Today's volume >= 1.75x its 20-day average. (v1.2: raised from 1.5x.)
+  - Today's volume >= 1.5x its 20-day average. (v1.3: reverted from 1.75x.)
   - Today's true range >= ATR(14).
   - Stock 60d return > SPY 60d return.
   - **(v1.2) Base width ≤ 15%** — the 20-bar pre-breakout range must
-    fit within 12% of midpoint.
-  - **(v1.2) Vol contraction** — pre-breakout ATR(20) <= 0.92x ATR(63).
+    fit within 15% of midpoint.
+  - **(v1.3) Bollinger Squeeze** — yesterday's BBW (4σ/SMA on BB(20))
+    in the bottom 30% of its trailing 126-bar distribution.
   - **(v1.2) Not extended** — today's close <= 1.15x SMA(50).
   - **(v1.2) Pre-breakout RSI** — yesterday's RSI(14) < 65.
   - The stock isn't reporting earnings within 5 trading days (portfolio
@@ -653,24 +686,32 @@ sustained run of either market type doesn't kill total P&L.
 
     # ------------------------------------------------------------------
     def required_history(self) -> int:
-        # Longest entry window + slack for prior-signal walkback (1L)
-        # plus the longer of (RS window, chandelier, ADX warmup, the v1.2
-        # 50-day MA, and the long ATR(63) for vol contraction).
+        # Filter-aware: only require history for the gates that are actually
+        # enabled. Lets the documented "recover v1.1 behavior" toggle path drop
+        # the floor back to what v1.1 needed, instead of dragging in 200-bar
+        # SMA / 126-bar BBW history even when those filters are off.
         max_entry = max(self.params.entry_periods or [self.params.entry_period])
-        return (
-            max(
-                max_entry + self.params.entry_period,  # 1L walkback room
-                max_entry + 5,
-                self.params.rs_window + 5,
-                self.params.chandelier_period,
-                self.params.atr_period_stop,
-                self.params.adx_period * 2,
-                self.params.base_lookback_bars + 5,    # v1.2 base window
-                63 + 5,                                # v1.2 long ATR for contraction
-                50 + 5,                                # v1.2 SMA(50)
-            )
-            + 10
-        )
+        needs: list[int] = [
+            max_entry + self.params.entry_period,  # 1L walkback room
+            max_entry + 5,
+            self.params.chandelier_period,
+            self.params.atr_period_stop,
+            self.params.adx_period * 2,
+            14 + 5,  # ATR(14) for vol-expansion
+        ]
+        if self.params.enable_relative_strength:
+            needs.append(self.params.rs_window + 5)
+        if self.params.require_base_consolidation:
+            needs.append(self.params.base_lookback_bars + 5)
+            needs.append(50 + 5)    # SMA(50) > SMA(200) sub-test
+            needs.append(200 + 5)   # Stage-2 SMA(200) gate
+        if self.params.max_pct_above_sma50 > 0:
+            needs.append(50 + 5)
+        if self.params.require_vol_contraction:
+            needs.append(self.params.bbw_period + self.params.bbw_lookback + 1)
+        if self.params.max_rsi_pre_breakout < 100.0:
+            needs.append(14 + 5)    # RSI(14) on yesterday
+        return max(needs) + 10
 
     # ------------------------------------------------------------------
     def signals(self, bars: pd.DataFrame, as_of: date) -> list[RawSignal]:
@@ -791,24 +832,40 @@ sustained run of either market type doesn't kill total P&L.
             if base_range_pct > self.params.base_max_range_pct:
                 return []
 
-        # ---- 4c. v1.2: Volatility-contraction filter. ----
-        # Recent ATR(20) excluding today / longer-term ATR(63) must be
-        # below the threshold. Captures the Bollinger Squeeze: real
-        # base breakouts are preceded by contraction, not expansion.
-        contraction_ratio: float | None = None
+        # ---- 4c. v1.3: Bollinger Squeeze filter. ----
+        # Yesterday's Bollinger Bandwidth (4σ / middle on BB(bbw_period)) must
+        # sit at or below `bbw_max_percentile` of its trailing `bbw_lookback`-bar
+        # distribution. This is Bollinger 2001's canonical Squeeze ("BBW at a
+        # multi-month low") as a percentile gate, instead of v1.2's hard
+        # ATR(20)/ATR(63) ratio cap — which rejected rangy-but-tight bases where
+        # ATR(short) ≥ ATR(long) just because the breakout bar adds variance
+        # over the relevant horizon. The percentile gate is the right shape:
+        # what matters is whether vol is LOW vs its own recent distribution,
+        # not whether it crossed an arbitrary fixed ratio.
+        #
+        # Yesterday's value is used (not today's) so the filter reflects the
+        # PRE-breakout regime, not the breakout bar itself, which by construction
+        # spikes BBW.
+        bbw_percentile: float | None = None
         if self.params.require_vol_contraction:
-            short_atr_series = atr(high, low, close, 20)
-            long_atr_series = atr(high, low, close, 63)
-            # Exclude today's bar (the breakout) so the ratio reflects
-            # the PRE-breakout regime, not the breakout itself.
-            if len(short_atr_series) < 2 or len(long_atr_series) < 2:
+            bbw_p = self.params.bbw_period
+            bbw_n = self.params.bbw_lookback
+            if len(close) < bbw_p + bbw_n + 1:
                 return []
-            short_atr = short_atr_series.iloc[-2]
-            long_atr = long_atr_series.iloc[-2]
-            if pd.isna(short_atr) or pd.isna(long_atr) or float(long_atr) <= 0:
+            # BBW = (upper - lower) / middle = (4σ) / SMA. Sample std (ddof=1)
+            # matches Bollinger's original construction.
+            bbw_series = 4.0 * close.rolling(bbw_p).std() / close.rolling(bbw_p).mean()
+            yest_bbw = bbw_series.iloc[-2]
+            if pd.isna(yest_bbw):
                 return []
-            contraction_ratio = float(short_atr) / float(long_atr)
-            if contraction_ratio > self.params.vol_contraction_ratio:
+            yest_f = float(yest_bbw)
+            # Percentile rank of yesterday's BBW within the `bbw_lookback` bars
+            # ending yesterday (today's breakout bar excluded).
+            hist = bbw_series.iloc[-(bbw_n + 1) : -1].dropna()
+            if len(hist) < bbw_n * 0.5:
+                return []
+            bbw_percentile = float((hist <= yest_f).sum()) / float(len(hist))
+            if bbw_percentile > self.params.bbw_max_percentile:
                 return []
 
         # ---- 4d. v1.2: Already-soared filter (distance from SMA50). ----
@@ -890,8 +947,8 @@ sustained run of either market type doesn't kill total P&L.
         # tell "filter disabled" from "filter passed cleanly").
         if base_range_pct is not None:
             metadata["base_range_pct"] = round(base_range_pct, 4)
-        if contraction_ratio is not None:
-            metadata["vol_contraction_ratio_actual"] = round(contraction_ratio, 4)
+        if bbw_percentile is not None:
+            metadata["bbw_percentile"] = round(bbw_percentile, 4)
         if pct_above_sma50 is not None:
             metadata["pct_above_sma50"] = round(pct_above_sma50, 4)
         if rsi_pre is not None:
