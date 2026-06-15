@@ -25,6 +25,7 @@ scanner uses; the only difference is fills are simulated.
 from __future__ import annotations
 
 import logging
+import time as _time
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
@@ -175,12 +176,29 @@ class BacktestEngine:
     # Public API
     # ---------------------------------------------------------------------
     def run(self) -> BacktestResult:
+        """Execute the day-by-day event loop and return the full result.
+
+        Logs a one-line summary at start and finish (strategy, span,
+        duration, trade count, ending equity) so long runs are traceable
+        in the job logs without per-day spam.
+        """
         trading_days = self._trading_days()
         if not trading_days:
             raise ValueError(
                 f"No trading days found in [{self.config.start_date}, "
                 f"{self.config.end_date}]. Are bars loaded for the universe?"
             )
+
+        started = _time.perf_counter()
+        log.info(
+            "backtest start: %s v%s | universe=%s | %s..%s (%d trading days)",
+            self.strategy.name,
+            self.strategy.version,
+            len(self.config.universe) if self.config.universe else "S&P500-historical",
+            trading_days[0],
+            trading_days[-1],
+            len(trading_days),
+        )
 
         for i, today in enumerate(trading_days):
             tomorrow = trading_days[i + 1] if i + 1 < len(trading_days) else None
@@ -205,6 +223,14 @@ class BacktestEngine:
         equity_series = self._equity_series()
         positions_series = self._positions_series()
         report = performance_report(self.closed_trades, equity_series, positions_series)
+        log.info(
+            "backtest done: %s v%s | %d trades | final equity %.0f | %.1fs",
+            self.strategy.name,
+            self.strategy.version,
+            len(self.closed_trades),
+            float(equity_series.iloc[-1]) if len(equity_series) else 0.0,
+            _time.perf_counter() - started,
+        )
         return BacktestResult(
             config=self.config,
             trades=self.closed_trades,

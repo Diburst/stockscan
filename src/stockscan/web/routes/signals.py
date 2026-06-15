@@ -18,12 +18,14 @@ from fastapi import APIRouter, Depends, Query, Request
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from stockscan.config import settings
-from stockscan.data.providers.eodhd import EODHDError, EODHDProvider
-from stockscan.positions.paper_store import check_auto_close, mark_to_market
 from stockscan.regime import get_regime
 from stockscan.regime.store import MarketRegime
-from stockscan.scan import refresh_signals, signals_freshness
+from stockscan.scan import signals_freshness
+from stockscan.scan.refresh_job import (
+    consume_finished as consume_refresh_job,
+    current_job as current_refresh_job,
+    start_refresh,
+)
 from stockscan.strategies import (
     STRATEGY_REGISTRY,
     Strategy,
@@ -166,7 +168,7 @@ def _query_signals_view(
 
 
 @router.get("")
-async def signals_list(
+def signals_list(
     request: Request,
     strategy: str | None = Query(None),
     days: int = Query(7, ge=1, le=90),
@@ -181,6 +183,10 @@ async def signals_list(
     dir: str | None = Query(None),
     s: Session = Depends(get_session),
 ):
+    """Full page render of passing + rejected signals (current strategy
+    versions only), with symbol/side/score-range filters and column sorting
+    via query params. If a background refresh is already in flight, the
+    fresh page-load joins its polling loop rather than starting a new job."""
     ctx = _query_signals_view(
         s,
         strategy=strategy,
@@ -193,17 +199,54 @@ async def signals_list(
         sort=sort,
         sort_dir=dir,
     )
+    # If a background refresh is in flight (started from another tab or a
+    # prior visit), the fresh page-load joins the polling loop too.
+    job = current_refresh_job()
+    job_running = job is not None and job.status == "running"
     return render(
         request,
         "signals/list.html",
         signals_refresh_error=None,
         signals_refresh_summary=None,
+        refresh_job_active=job_running,
+        refresh_qs=_refresh_qs(
+            strategy=strategy, days=days, show_rejected=show_rejected,
+            symbol=symbol, side=side, score_min=score_min, score_max=score_max,
+            sort=sort, dir=dir,
+        ),
+        refresh_elapsed=job.elapsed_seconds if job_running else 0,
         **ctx,
     )
 
 
+def _refresh_qs(
+    *,
+    strategy: str | None,
+    days: int,
+    show_rejected: bool,
+    symbol: str | None,
+    side: str | None,
+    score_min: str | None,
+    score_max: str | None,
+    sort: str | None,
+    dir: str | None,
+) -> str:
+    """Query string carrying the user's filter/sort state through the
+    polling loop, so the post-refresh render matches what they were
+    looking at. Only non-empty params are emitted (empty floats 422)."""
+    parts = [f"days={days}", f"show_rejected={'true' if show_rejected else 'false'}"]
+    for key, value in (
+        ("strategy", strategy), ("symbol", symbol), ("side", side),
+        ("score_min", score_min), ("score_max", score_max),
+        ("sort", sort), ("dir", dir),
+    ):
+        if value:
+            parts.append(f"{key}={value}")
+    return "&".join(parts)
+
+
 @router.post("/refresh")
-async def refresh_endpoint(
+def refresh_endpoint(
     request: Request,
     strategy: str | None = Query(None),
     days: int = Query(7, ge=1, le=90),
@@ -217,27 +260,30 @@ async def refresh_endpoint(
     dir: str | None = Query(None),
     s: Session = Depends(get_session),
 ):
-    """Pull the last 7 days of bars + re-run all strategies, then swap
-    the signals page content in place.
+    """Start the bars + strategies refresh as a BACKGROUND job.
 
-    Returns the ``_signals_content.html`` partial — the same body block
-    that the GET renders via ``signals/list.html``. HTMX targets
-    ``#signals-content`` for ``outerHTML`` replacement so the page
-    refreshes without a full reload.
+    Responds immediately with the page-content partial carrying a polling
+    strip (``signals/_refresh_status.html`` include); the strip polls
+    ``GET /signals/refresh/status`` every 2 s until the job finishes, at
+    which point that endpoint swaps in the refreshed content. The page —
+    and the rest of the app — stays usable while the refresh runs.
 
-    All filters and sort params are forwarded so the post-refresh view
-    matches whatever the user was looking at.
+    Single-flight: a second POST while a job is running joins the
+    in-flight job instead of starting another. The 20 s cooldown applies
+    to job starts.
     """
     _filter_kwargs = dict(
         symbol=symbol, side=side,
         score_min=_to_float(score_min), score_max=_to_float(score_max),
         sort=sort, sort_dir=dir,
     )
+    qs = _refresh_qs(
+        strategy=strategy, days=days, show_rejected=show_rejected,
+        symbol=symbol, side=side, score_min=score_min, score_max=score_max,
+        sort=sort, dir=dir,
+    )
 
-    # Signals refresh is the most expensive endpoint in the app — bars
-    # backfill + every strategy re-runs. Debounce harder than news.
-    cooldown_remaining = rate_limit_check("signals.refresh", cooldown_seconds=20)
-    if cooldown_remaining is not None:
+    def _content(*, job_active: bool, toast: tuple[str, str] | None):
         ctx = _query_signals_view(
             s, strategy=strategy, days=days, show_rejected=show_rejected,
             **_filter_kwargs,
@@ -247,76 +293,105 @@ async def refresh_endpoint(
             "signals/_signals_content.html",
             signals_refresh_error=None,
             signals_refresh_summary=None,
+            refresh_job_active=job_active,
+            refresh_qs=qs,
+            refresh_elapsed=0,
             **ctx,
         )
-        return attach_hx_toast(
-            response,
-            "warn",
-            f"Just refreshed — try again in {int(cooldown_remaining) + 1}s",
+        if toast:
+            return attach_hx_toast(response, *toast)
+        return response
+
+    # If a job is already in flight, join it — no new work, no cooldown hit.
+    existing = current_refresh_job()
+    if existing is not None and existing.status == "running":
+        return _content(
+            job_active=True,
+            toast=("info", "A refresh is already running — joining it"),
         )
 
-    error: str | None = None
-    refresh_summary: dict[str, object] | None = None
+    # Signals refresh is the most expensive operation in the app — bars
+    # backfill + every strategy re-runs. Debounce job STARTS.
+    cooldown_remaining = rate_limit_check("signals.refresh", cooldown_seconds=20)
+    if cooldown_remaining is not None:
+        return _content(
+            job_active=False,
+            toast=("warn", f"Just refreshed — try again in {int(cooldown_remaining) + 1}s"),
+        )
 
-    api_key = settings.eodhd_api_key.get_secret_value()
-    if not api_key:
-        error = "EODHD_API_KEY is not set. Add it to your .env to fetch bars."
-    else:
-        try:
-            with EODHDProvider(api_key=api_key) as provider:
-                result = refresh_signals(provider, days_back=7, session=s)
+    _job, started_new = start_refresh(days_back=7)
+    toast_msg = (
+        "Refresh started — fetching bars and re-running strategies"
+        if started_new
+        else "A refresh is already running — joining it"
+    )
+    return _content(job_active=True, toast=("info", toast_msg))
 
-            # Propagate fresh bar data to paper trades: update P/L then
-            # auto-close any that hit stop/target/time exits.
-            trades_marked = mark_to_market(session=s)
-            trades_auto_closed = check_auto_close(session=s)
 
-            refresh_summary = {
-                "up_to_date": result.up_to_date,
-                "bars_upserted": result.bars_upserted,
-                "bars_days_covered": result.bars_days_covered,
-                "strategies_run": result.strategies_run,
-                "signals_emitted": result.signals_emitted,
-                "rejected_count": result.rejected_count,
-                "failures": [
-                    {"strategy_name": f.strategy_name, "error": f.error}
-                    for f in result.failures
-                ],
-                "duration_seconds": round(result.duration_seconds, 1),
-                "trades_marked": trades_marked,
-                "trades_auto_closed": len(trades_auto_closed),
-            }
-        except EODHDError as exc:
-            log.warning("signals refresh: provider error: %s", exc)
-            error = f"Provider error: {exc}"
-            # Defensive rollback: even though EODHD errors are from the
-            # provider (no DB I/O), refresh_signals may have done partial
-            # writes through `s` before the provider call failed. Rolling
-            # back ensures the post-refresh SELECT below runs cleanly
-            # rather than tripping InFailedSqlTransaction.
-            _safe_rollback(s)
-        except Exception as exc:
-            log.exception("signals refresh: unexpected error")
-            error = f"Refresh failed: {exc}"
-            # Critical: an SQL error inside refresh_signals will have
-            # marked the transaction as aborted. Postgres refuses every
-            # subsequent statement on this connection until ROLLBACK,
-            # so without this the partial-render SELECT below 500s with
-            # InFailedSqlTransaction and the user never sees the real
-            # error message we just captured into `error`.
-            _safe_rollback(s)
+@router.get("/refresh/status")
+def refresh_status(
+    request: Request,
+    strategy: str | None = Query(None),
+    days: int = Query(7, ge=1, le=90),
+    show_rejected: bool = Query(True),
+    symbol: str | None = Query(None),
+    side: str | None = Query(None),
+    score_min: str | None = Query(None),
+    score_max: str | None = Query(None),
+    sort: str | None = Query(None),
+    dir: str | None = Query(None),
+    s: Session = Depends(get_session),
+):
+    """Polling endpoint for the background refresh.
+
+    While the job runs: returns the small self-replacing status strip
+    (it re-polls itself every 2 s — the rest of the page is untouched).
+
+    When the job finishes: returns the FULL refreshed page content with
+    ``HX-Retarget: #signals-content`` so this response replaces the whole
+    content area, banner + tables, in one swap. The finished job is
+    consumed so a stray later poll doesn't re-announce it.
+    """
+    qs = _refresh_qs(
+        strategy=strategy, days=days, show_rejected=show_rejected,
+        symbol=symbol, side=side, score_min=score_min, score_max=score_max,
+        sort=sort, dir=dir,
+    )
+
+    job = current_refresh_job()
+    if job is not None and job.status == "running":
+        return render(
+            request,
+            "signals/_refresh_status.html",
+            refresh_qs=qs,
+            refresh_elapsed=job.elapsed_seconds,
+        )
+
+    finished = consume_refresh_job()
+    error = finished.error if finished else None
+    refresh_summary = finished.summary if finished else None
 
     ctx = _query_signals_view(
         s, strategy=strategy, days=days, show_rejected=show_rejected,
-        **_filter_kwargs,
+        symbol=symbol, side=side,
+        score_min=_to_float(score_min), score_max=_to_float(score_max),
+        sort=sort, sort_dir=dir,
     )
     response = render(
         request,
         "signals/_signals_content.html",
         signals_refresh_error=error,
         signals_refresh_summary=refresh_summary,
+        refresh_job_active=False,
+        refresh_qs=qs,
+        refresh_elapsed=0,
         **ctx,
     )
+    # The poll strip is a small element inside #signals-content; retarget
+    # the final swap at the whole content block.
+    response.headers["HX-Retarget"] = "#signals-content"
+    response.headers["HX-Reswap"] = "outerHTML"
+
     if error:
         return attach_hx_toast(response, "error", "Signal refresh failed")
     if refresh_summary and refresh_summary.get("up_to_date"):
@@ -338,15 +413,14 @@ async def refresh_endpoint(
         if n_closed:
             parts.append(f"{n_closed} auto-closed")
         return attach_hx_toast(
-            response,
-            "success",
-            f"Refreshed — {', '.join(parts)}",
+            response, "success", f"Refreshed — {', '.join(parts)}"
         )
+    # No job found at all (e.g., server restarted mid-poll) — just rerender.
     return response
 
 
 @router.get("/{signal_id}")
-async def signal_detail(
+def signal_detail(
     signal_id: int,
     request: Request,
     s: Session = Depends(get_session),
@@ -419,21 +493,6 @@ async def signal_detail(
         regime=regime,
         sizing_breakdown=sizing_breakdown,
     )
-
-
-def _safe_rollback(session: Session) -> None:
-    """Roll back ``session`` and swallow any rollback-of-rollback error.
-
-    Used in the refresh endpoint's except handlers to clear an aborted
-    transaction state before issuing the partial-render SELECT. We
-    deliberately swallow secondary errors here — if rollback itself
-    fails, the underlying connection is unusable and the partial
-    render will surface a fresh error in the response banner anyway.
-    """
-    try:
-        session.rollback()
-    except Exception as exc:
-        log.warning("rollback failed during error recovery: %s", exc)
 
 
 def _sizing_breakdown(

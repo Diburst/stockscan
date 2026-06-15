@@ -16,11 +16,15 @@ router = APIRouter()
 
 
 @router.get("/signals/{signal_id}/base-rates")
-async def base_rates_for_signal(
+def base_rates_for_signal(
     signal_id: int,
     request: Request,
     s: Session = Depends(get_session),
 ):
+    """Historical base-rates report for the signal's strategy/symbol pair,
+    computed on the fly with the strategy file's default params. An unknown
+    signal renders the empty-state page; a compute failure surfaces as an
+    error message instead of a report."""
     discover_strategies()
     sig = s.execute(
         text(

@@ -1,8 +1,52 @@
 # Personal Stock Trading App — Design Document
 
 **Author:** Thomas
-**Status:** Draft v0.8 — Phases 0–3 implemented, regime detection upgraded to a soft-sizing composite
-**Date:** 2026-04-29
+**Status:** Draft v0.9 — Phases 0–3 implemented + hardening pass (logging, deploy, background refresh)
+**Date:** 2026-06-12 (v0.8 dated 2026-04-29)
+
+> **v0.9 changes** (hardening refactor — see `refactor_plan_hardening.md` for the full plan):
+> - **Two sections of this document are superseded and marked inline:**
+>   §4.11's parameter-management subsection (the `strategy_configs` table was
+>   retired in migration 0016 — knobs live in the strategy file, edit-and-bump)
+>   and §4.14 (the `technical` module + `technical_scores` table were retired in
+>   migration 0015 — each strategy owns its score; breakdown persists in
+>   `signals.metadata`). The sections remain as historical record; `refactor_plan.md`
+>   documents the inside-out scoring refactor that replaced them.
+> - **Centralized logging** (`stockscan.logging_setup`): one `setup_logging()` per
+>   entrypoint; human-readable single-line format; rotating per-component files
+>   under `logs/` (`web` / `cli` / `nightly`); request-timing middleware logs every
+>   request with a configurable slow-request threshold (`STOCKSCAN_SLOW_REQUEST_MS`).
+> - **Sync route handlers everywhere** (`web/routes/__init__.py` documents the rule):
+>   handlers are `def`, not `async def`, so SQLAlchemy/pandas work runs in the
+>   threadpool instead of blocking the event loop. Previously a slow request
+>   (notably Fetch Latest) froze the entire UI for its duration.
+> - **Fetch Latest is a background job** (`scan/refresh_job.py`): POST starts a
+>   single-flight worker thread; the Signals page polls `/signals/refresh/status`
+>   every 2 s and swaps in the refreshed content when done. In-process job state →
+>   the web service runs exactly one uvicorn worker (documented in DEPLOY.md).
+> - **Provider hardening**: 429 rate-limit retries honor Retry-After (capped 30 s);
+>   read-timeouts retried once on light endpoints, never on the heavy bulk payload;
+>   per-retry WARNINGs with the API token redacted. Bulk refresh reports per-day
+>   partial failures (`BulkRefreshResult.failed_days`) instead of failing silently.
+> - **Nightly job accountability**: per-step durations logged; step failures are
+>   collected and appended to the summary notification (subject gains `DEGRADED`),
+>   so an overnight failure reaches Discord/email rather than dying in a log.
+> - **Full Docker Compose deployment** (DEPLOY.md): app `Dockerfile` (multi-stage,
+>   Tailwind assets stage, non-root), `db` + one-shot `migrate` + `web` + `scheduler`
+>   (supercronic, `infra/crontab`, ET times) services; DB is compose-network-only.
+>   launchd remains the macOS bare-metal path. `uv.lock` is now committed.
+> - **Self-hosted UI assets**: built Tailwind stylesheet + vendored htmx replace the
+>   Play CDN (dev-only tooling, broke offline). `make css` / Docker assets stage
+>   rebuild it; config in `tailwind.config.js`.
+> - **HTMX failure UX**: HX-aware error responses (empty body + `HX-Reswap: none` +
+>   friendly message in `X-Error-Message`) + global `htmx:responseError`/`sendError`
+>   listeners → every failed fragment action surfaces as an error toast; the page
+>   DOM is never mangled by an error body. Dashboard watch pill is now a two-way
+>   HTMX toggle (`/watchlist/unwatch`). Watchlist reversal scores memoized per
+>   (symbol, last-bar, day).
+> - **Startup config sanity**: degraded capabilities (missing EODHD/FRED keys, no
+>   notification channel, placeholder DB password) are announced as WARNINGs at
+>   web/scheduler startup (`config.config_warnings`).
 
 > **v0.8 changes** (regime detection v2 — composite + soft sizing; migration 0010):
 > - **Composite regime score** replaces the v1 ADX/SMA-only label as the primary regime output. Four components in [0, 1] (1 = healthy/calm), weighted per the research synthesis: **vol 0.40 / trend 0.25 / breadth 0.20 / credit 0.15**. The discrete `trending_up / trending_down / choppy / transitioning` label is preserved for the dashboard banner and back-compat, but it no longer drives sizing.
@@ -405,6 +449,12 @@ The scanner, backtester, and base-rate analyzer all consume from `STRATEGY_REGIS
 
 #### Parameter management
 
+> **⚠ SUPERSEDED (v0.9 / migration 0016).** The `strategy_configs` table is
+> retired. Knobs live in the strategy FILE — either ClassVar constants or
+> `StrategyParams` Field defaults — and a version bump is the unit of change.
+> There is no DB shadow of parameters and no `params_hash` lookup at scan
+> time. The text below is kept as historical record of the original design.
+
 Each strategy declares its params as a Pydantic model. **Code defines the shape; the database holds the current values**:
 
 - The `strategy_versions` table (§8) records every (strategy_name, version) the framework has seen, with the JSON Schema of its params model. New versions are detected and registered at startup.
@@ -511,6 +561,15 @@ CI runs the contract tests against every registered strategy. A new strategy tha
 **Why auto-disable on fire:** the alternative — re-firing daily as long as the price stays past the target — generates noise and trains the operator to ignore alerts. One firing per crossing event matches retail-watchlist conventions (Robinhood, Fidelity) and is more useful in practice.
 
 ### 4.14 Technical Confirmation Score (`stockscan.technical`)
+
+> **⚠ SUPERSEDED (v0.9 / migration 0015).** The `technical` module and
+> `technical_scores` table are retired. Each strategy now owns its score:
+> the composite math lives in a public method on the strategy class (e.g.
+> `ReversalSwing.reversal_score()`), indicator primitives are pure functions
+> in `stockscan.indicators`, and the per-input breakdown persists in
+> `signals.metadata["score_breakdown"]`. See `refactor_plan.md` for the
+> rationale (double-compute, generic-score mismatch, strategy-intent leaking
+> into indicators). The text below is the original design, kept as record.
 
 **Responsibilities:** Per-signal score in `[-1, +1]` answering "do the technicals confirm what this strategy is trying to do?" Backs USER_STORIES Story 12.
 

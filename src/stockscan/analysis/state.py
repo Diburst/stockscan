@@ -108,6 +108,10 @@ class TrendState:
     pct_above_sma20: float | None
     pct_above_sma50: float | None
     pct_above_sma200: float | None
+    # Exponential moving averages keyed by period (e.g. {9: 151.2, 50: ...}).
+    # Periods are configured in trend.py (_EMA_PERIODS); a missing/NaN value
+    # is stored as None. Used by the options-context strike-confluence check.
+    emas: dict[int, float | None] = field(default_factory=dict)
 
     @classmethod
     def unavailable(cls) -> TrendState:
@@ -118,7 +122,7 @@ class TrendState:
             ma_alignment="mixed",
             sma_20=None, sma_50=None, sma_200=None, adx_14=None,
             pct_above_sma20=None, pct_above_sma50=None,
-            pct_above_sma200=None,
+            pct_above_sma200=None, emas={},
         )
 
 
@@ -136,6 +140,11 @@ class VolatilityState:
     bucket: str  # 'low' | 'normal' | 'elevated' | 'high' | '?'
     label: str
     explanation: str
+    # Forward vol estimate: EWMA-weighted (λ=0.94) Yang-Zhang annualised vol,
+    # in %. More responsive than the trailing-window HV — it drives the
+    # expected-move bands and the Black-Scholes strike solver so the two
+    # always agree. None when bars/OHLC are insufficient.
+    ewma_vol_pct: float | None = None
 
     @classmethod
     def unavailable(cls) -> VolatilityState:
@@ -146,6 +155,7 @@ class VolatilityState:
             hv_percentile=None, expected_7d=None, expected_30d=None,
             bucket="?", label="n/a",
             explanation="Insufficient bars to compute volatility metrics.",
+            ewma_vol_pct=None,
         )
 
 
@@ -173,13 +183,67 @@ class MomentumState:
 
 
 @dataclass(frozen=True, slots=True)
+class OptionStrike:
+    """A Black-Scholes-derived strike suggestion at a target delta + expiry.
+
+    Produced by :mod:`stockscan.analysis.black_scholes` and carried on the
+    :class:`OptionsContext` so the analysis page can show a concrete strike
+    instead of only a vague "sell premium above resistance" hint.
+
+    The vol fed into the model is **realized** HV (21-day), not option-
+    implied vol - we have no chain. ``vol_pct`` and ``rate_pct`` record the
+    assumptions so the UI can be honest about the model inputs. ``delta`` is
+    the realised delta at the solved strike (≈ the target, modulo rounding);
+    ``theta`` is per calendar day and ``vega`` is per 1 vol point.
+    """
+
+    kind: str  # 'call' | 'put'
+    strike: float
+    pct_otm: float  # signed % distance of strike from spot (positive = above)
+    target_delta: float  # signed delta requested (call +, put −)
+    delta: float  # realised BS delta at the solved strike
+    price: float  # BS fair value per share
+    theta: float  # per calendar day
+    vega: float  # per 1 vol point (1%)
+    gamma: float
+    days_to_expiry: int
+    vol_pct: float  # annualised realized vol used (percent)
+    rate_pct: float  # annualised risk-free rate used (percent)
+    # Structural confluence: short prose strings flagging when this strike
+    # sits within 0.5×ATR(14) of a key EMA or S/R level. Empty when the
+    # strike lands in open space. Populated by options_context.
+    confluences: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class StrikeSet:
+    """The Black-Scholes put + call suggestion for one expiry tenor.
+
+    A tenor is a (days-to-expiry, target-delta) pair — e.g. 6-day Δ0.15
+    for "this Friday", 30-day Δ0.20 for "about a month out". The tenors
+    themselves are configured in :mod:`stockscan.analysis.options_context`
+    (``_STRIKE_TENORS``). ``expiry_date`` is ``as_of + days_to_expiry``
+    and ``label`` is the human header shown on the card.
+    """
+
+    days_to_expiry: int
+    target_delta: float  # magnitude (0.15, 0.20); legs carry the signed value
+    expiry_date: _date | None
+    label: str
+    call: OptionStrike | None
+    put: OptionStrike | None
+
+
+@dataclass(frozen=True, slots=True)
 class OptionsContext:
     """Options-trading-flavored framing of the technicals.
 
     NOT a substitute for actual option chain data - this is the
     closest we can get with daily bars + earnings calendar alone.
     When option chain integration ships, the IV percentile + implied
-    move will replace the realized-vol approximations here.
+    move will replace the realized-vol approximations here, and the
+    Black-Scholes strikes below can switch their σ input from realized
+    HV to chain-implied vol with no shape change.
     """
 
     available: bool
@@ -191,6 +255,9 @@ class OptionsContext:
     nearest_resistance: Level | None
     pct_to_support: float | None
     pct_to_resistance: float | None
+    # Suggested Black-Scholes strikes, one StrikeSet per expiry tenor
+    # (empty when vol/price unavailable). Ordered nearest-expiry first.
+    strike_sets: list[StrikeSet] = field(default_factory=list)
     # Curated observations: short bullets the user can read at a glance.
     observations: list[str] = field(default_factory=list)
 
@@ -200,7 +267,7 @@ class OptionsContext:
             available=False, days_to_earnings=None, earnings_date=None,
             earnings_warning=False, nearest_support=None,
             nearest_resistance=None, pct_to_support=None,
-            pct_to_resistance=None, observations=[],
+            pct_to_resistance=None, strike_sets=[], observations=[],
         )
 
 

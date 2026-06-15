@@ -57,7 +57,7 @@ def _safe_rollback(session: Session) -> None:
 
 
 @router.post("/refresh")
-async def refresh_endpoint(
+def refresh_endpoint(
     request: Request,
     s: Session = Depends(get_session),
 ):
@@ -139,7 +139,7 @@ async def refresh_endpoint(
 
 
 @router.get("/{article_id}/content")
-async def article_content(
+def article_content(
     article_id: str,
     request: Request,
     s: Session = Depends(get_session),

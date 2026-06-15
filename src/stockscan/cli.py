@@ -47,7 +47,7 @@ Version semantics:
   the live UI. Use ``stockscan signals delete`` with explicit --version to clean up
   prior-version data when desired.
 
-Watchlist + technical:
+Watchlist:
   stockscan watchlist list               — current watch entries
   stockscan watchlist add SYMBOL         — add with optional --target / --direction
   stockscan watchlist remove ID
@@ -123,6 +123,26 @@ app = typer.Typer(
     no_args_is_help=True,
     add_completion=False,
 )
+
+
+@app.callback()
+def _configure(ctx: typer.Context) -> None:
+    """Wire central logging before any subcommand runs.
+
+    Scheduled-job invocations (``stockscan jobs ...``) log to their own
+    rotating file (``stockscan-nightly.log``) so launchd/cron output is
+    separable from interactive CLI use.
+    """
+    from stockscan.config import config_warnings
+    from stockscan.logging_setup import setup_logging
+
+    component = "nightly" if ctx.invoked_subcommand == "jobs" else "cli"
+    setup_logging(component=component)
+    # Scheduled jobs announce degraded config loudly; interactive commands
+    # stay quiet (the `health` command reports the same facts on demand).
+    if component == "nightly" and not settings.is_test:
+        for warning in config_warnings():
+            log.warning("config: %s", warning)
 db_app = typer.Typer(help="Database operations.", no_args_is_help=True)
 refresh_app = typer.Typer(help="Refresh data from the provider.", no_args_is_help=True)
 strat_app = typer.Typer(help="Inspect registered strategies.", no_args_is_help=True)
@@ -373,8 +393,14 @@ def refresh_daily_cmd(
         f"({target_days[0]} → {target_days[-1]}), filter to {len(filter_to)} symbols"
     )
     with _provider_ctx() as p:
-        n = refresh_recent_days_bulk(p, target_days, filter_to=filter_to)
-    console.print(f"[green]✓[/green] {n:,} bars upserted")
+        result = refresh_recent_days_bulk(p, target_days, filter_to=filter_to)
+    console.print(f"[green]✓[/green] {result.upserted:,} bars upserted")
+    if result.failed_days:
+        console.print(
+            f"[red]✗[/red] {len(result.failed_days)} day(s) failed to fetch: "
+            + ", ".join(str(d) for d in result.failed_days)
+        )
+        raise typer.Exit(1)
 
 
 def typedelta_days(n: int):
@@ -471,7 +497,7 @@ def refresh_bars_cmd(
 def refresh_macro_cmd(
     series: list[str] = typer.Argument(
         None,
-        help="FRED series codes to refresh; default = ['BAMLH0A0HYM2'] (HY OAS)",
+        help="FRED series codes to refresh; default = HY OAS + 1M/3M Treasury yields",
     ),
     start: str = typer.Option(
         "2007-01-01",
@@ -500,7 +526,10 @@ def refresh_macro_cmd(
     from stockscan.data.providers.fred import FredError, FredProvider
 
     if not series:
-        series = ["BAMLH0A0HYM2"]
+        # HY OAS (regime credit component) + 1-month and 3-month constant-
+        # maturity Treasury yields (the risk-free rate for the options
+        # analysis Black-Scholes strikes — see analysis/options_context.py).
+        series = ["BAMLH0A0HYM2", "DGS1MO", "DGS3MO"]
 
     start_d = date.fromisoformat(start)
     end_d = date.fromisoformat(end) if end else date.today()

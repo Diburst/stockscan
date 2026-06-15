@@ -31,6 +31,7 @@ from stockscan.watchlist.store import (
     list_watchlists,
     remove_from_list,
     remove_from_watchlist,
+    remove_symbol,
     rename_watchlist,
     resolve_selection,
     set_target,
@@ -47,6 +48,12 @@ from stockscan.web.deps import (
 )
 
 log = logging.getLogger(__name__)
+
+# Render-time memo for the per-symbol reversal score shown in the "Tech"
+# column. Keyed (symbol, last-bar-timestamp, date): a bars refresh changes
+# the last-bar key, a new day clears the whole memo (see watchlist_list).
+# Process-local — same single-worker deployment assumption as refresh_job.
+_SCORE_MEMO: dict[tuple[str, str, _date], float | None] = {}
 
 # ~1140 calendar days ≈ 3 years of trading bars. EOD history is a single
 # provider call regardless of range, so we pull the full window the charts can
@@ -96,21 +103,28 @@ def _bars_as_of(items: list) -> _date | None:
 
 
 @router.get("")
-async def watchlist_list(
+def watchlist_list(
     request: Request,
     err: str | None = Query(None),
     list: str | None = Query(None),
     s: Session = Depends(get_session),
 ):
+    """The watchlist page for the selected list (``?list=`` id or 'all').
+    Each row carries a memoized reversal_swing technical score plus earnings,
+    estimate-revision, and insider enrichment — all soft-fail per symbol so
+    missing data renders as a dash, never an error."""
     # Resolve which list is selected (defaults to the primary "Watchlist"
     # list; ``?list=all`` shows every symbol across all lists).
     selected_id, selected_label = resolve_selection(list, session=s)
     lists = list_watchlists(session=s)
     items = list_watchlist(list_id=selected_id, session=s)
-    # Show each watched symbol's reversal_swing score on the fly. The watchlist
-    # is small (~20-50 names) and bars are already local, so this is fast
-    # (sub-100ms typical). We go through the strategy class because the strategy
-    # is the only home for its scoring — same code path the scanner uses.
+    # Show each watched symbol's reversal_swing score on the fly. We go
+    # through the strategy class because the strategy is the only home for
+    # its scoring — same code path the scanner uses. Scores are memoized
+    # per (symbol, last-bar-timestamp, date) — bars only change after a
+    # refresh, so repeat page loads skip the composite recompute entirely
+    # (it's the expensive part of this render: RSI/ATR/pivots/volume/RS
+    # over a 1-year tail, per symbol).
     today = _date.today()
     one_year_ago = today.replace(year=today.year - 1)
     revsw = ReversalSwing()
@@ -129,11 +143,20 @@ async def watchlist_list(
         if bars is None or getattr(bars, "empty", True):
             tech_scores[item.symbol] = None
         else:
-            result = safe(
-                lambda b=bars: revsw.reversal_score(b, today),
-                label=f"watchlist.reversal_score[{item.symbol}]",
-            )
-            tech_scores[item.symbol] = result.score if result is not None else None
+            cache_key = (item.symbol, str(bars.index[-1]), today)
+            if cache_key in _SCORE_MEMO:
+                tech_scores[item.symbol] = _SCORE_MEMO[cache_key]
+            else:
+                result = safe(
+                    lambda b=bars: revsw.reversal_score(b, today),
+                    label=f"watchlist.reversal_score[{item.symbol}]",
+                )
+                score = result.score if result is not None else None
+                # New day → old keys are dead weight; reset before insert.
+                if _SCORE_MEMO and next(iter(_SCORE_MEMO))[2] != today:
+                    _SCORE_MEMO.clear()
+                _SCORE_MEMO[cache_key] = score
+                tech_scores[item.symbol] = score
 
         earn = safe(
             lambda sym=item.symbol: next_earnings(sym, as_of=today, session=s),
@@ -188,7 +211,7 @@ _AUX_COOLDOWN_HOURS = 20
 
 
 @router.post("/refresh-bars")
-async def watchlist_refresh_bars(
+def watchlist_refresh_bars(
     request: Request,
     s: Session = Depends(get_session),
 ):
@@ -406,14 +429,50 @@ async def watchlist_refresh_bars(
 
 # Inline replacement returned to HTMX requests after a successful add — the
 # Dashboard's "+ Watch" button is replaced with this in-place (no page reload).
-_WATCHING_SNIPPET = (
-    '<span class="text-xs px-2 py-1 rounded bg-ok-100 text-ok-600 '
-    'border border-ok-600/30 inline-block">✓ watching</span>'
-)
 _WATCH_ERROR_SNIPPET = (
     '<span class="text-xs px-2 py-1 rounded bg-bad-100 text-bad-600 '
     'border border-bad-600/30 inline-block">✗ error</span>'
 )
+
+
+def _watching_snippet(symbol: str, redirect_to: str = "/") -> str:
+    """The '✓ watching' pill — a click-to-unwatch HTMX toggle.
+
+    Returned by POST /watchlist/add (HX path) and rendered statically by
+    the Dashboard's ``watch_button`` macro; the two MUST stay visually
+    identical so the pill looks the same pre- and post-click.
+    """
+    return (
+        '<form action="/watchlist/unwatch" method="post" class="inline"'
+        ' hx-post="/watchlist/unwatch" hx-target="this" hx-swap="outerHTML"'
+        ' hx-disabled-elt="find button">'
+        f'<input type="hidden" name="symbol" value="{symbol}">'
+        f'<input type="hidden" name="redirect_to" value="{redirect_to}">'
+        '<button type="submit" class="text-xs px-2 py-1 rounded bg-ok-100'
+        ' text-ok-600 border border-ok-600/30 hover:bg-bad-100'
+        ' hover:text-bad-600 hover:border-bad-600/30 disabled:opacity-50'
+        ' disabled:cursor-wait"'
+        f' title="Click to remove {symbol} from the watchlist">'
+        "✓ watching</button></form>"
+    )
+
+
+def _watch_form_snippet(symbol: str, redirect_to: str = "/") -> str:
+    """The '+ Watch' quick-add form — what the unwatch toggle swaps back to.
+
+    Mirrors the Dashboard ``watch_button`` macro's else-branch markup.
+    """
+    return (
+        '<form action="/watchlist/add" method="post" class="inline"'
+        ' hx-post="/watchlist/add" hx-target="this" hx-swap="outerHTML"'
+        ' hx-disabled-elt="find button">'
+        f'<input type="hidden" name="symbol" value="{symbol}">'
+        f'<input type="hidden" name="redirect_to" value="{redirect_to}">'
+        '<button type="submit" class="text-xs px-2 py-1 rounded border'
+        ' border-ink-300 hover:bg-ink-100 disabled:opacity-50 disabled:cursor-wait"'
+        f' title="Add {symbol} to watchlist (fetches ~1 year of price history)">'
+        "+ Watch</button></form>"
+    )
 
 
 def _is_htmx(request: Request) -> bool:
@@ -421,7 +480,7 @@ def _is_htmx(request: Request) -> bool:
 
 
 @router.post("/add")
-async def watchlist_add(
+def watchlist_add(
     request: Request,
     symbol: str = Form(..., min_length=1, max_length=10),
     target_price: str = Form(""),
@@ -432,6 +491,10 @@ async def watchlist_add(
     redirect_to: str = Form("/watchlist"),
     s: Session = Depends(get_session),
 ):
+    """Add a symbol to a list (optionally creating the list) with an optional
+    target price/direction and note, then synchronously backfill ~3 years of
+    history best-effort. HTMX requests get the in-place 'watching' pill swap;
+    plain posts redirect with a flash toast."""
     try:
         tp: Decimal | None = None
         td: Literal["above", "below"] | None = None
@@ -483,8 +546,37 @@ async def watchlist_add(
 
     if _is_htmx(request):
         # Replace the form in-place; no page reload, no scroll jump.
-        return hx_toast_response(_WATCHING_SNIPPET, kind, msg)
+        return hx_toast_response(_watching_snippet(sym, redirect_to), kind, msg)
     return flash_redirect(redirect_to, kind, msg)
+
+
+@router.post("/unwatch")
+def watchlist_unwatch(
+    request: Request,
+    symbol: str = Form(..., min_length=1, max_length=10),
+    redirect_to: str = Form("/"),
+    s: Session = Depends(get_session),
+):
+    """Remove ``symbol`` from the watchlist (all lists) — the Dashboard
+    pill's click-to-unwatch toggle.
+
+    HX path swaps the pill back to the '+ Watch' form in place, so the
+    Dashboard state flips without a reload (TODO.md 'pill auto-flip').
+    """
+    sym = symbol.strip().upper()
+    removed = remove_symbol(sym, session=s)
+    msg = (
+        f"Removed {sym} from watchlist"
+        if removed
+        else f"{sym} wasn't on the watchlist"
+    )
+    if _is_htmx(request):
+        return hx_toast_response(
+            _watch_form_snippet(sym, redirect_to),
+            "success" if removed else "info",
+            msg,
+        )
+    return flash_redirect(redirect_to, "success" if removed else "info", msg)
 
 
 def _resolve_lid_form(list_id: str) -> int | None:
@@ -528,7 +620,7 @@ def _backfill_many(symbols: list[str]) -> tuple[int, list[str]]:
 
 
 @router.post("/add-bulk")
-async def watchlist_add_bulk(
+def watchlist_add_bulk(
     request: Request,
     symbols: str = Form(""),
     list_id: str = Form(""),
@@ -578,7 +670,7 @@ async def watchlist_add_bulk(
 
 
 @router.get("/export")
-async def watchlist_export(
+def watchlist_export(
     request: Request,
     list: str | None = Query(None),
     s: Session = Depends(get_session),
@@ -596,11 +688,13 @@ async def watchlist_export(
 
 
 @router.post("/lists/create")
-async def watchlist_create_list(
+def watchlist_create_list(
     request: Request,
     name: str = Form(...),
     s: Session = Depends(get_session),
 ):
+    """Create a new named list and land on its view — a rejected name
+    redirects back with an error toast."""
     try:
         lid = create_watchlist(name, session=s)
     except ValueError as exc:
@@ -609,12 +703,14 @@ async def watchlist_create_list(
 
 
 @router.post("/lists/rename")
-async def watchlist_rename_list(
+def watchlist_rename_list(
     request: Request,
     list_id: str = Form(...),
     name: str = Form(...),
     s: Session = Depends(get_session),
 ):
+    """Rename a list, staying on its view — an invalid id or rejected name
+    surfaces as an error toast."""
     try:
         lid = int(list_id)
     except ValueError:
@@ -627,7 +723,7 @@ async def watchlist_rename_list(
 
 
 @router.post("/{watchlist_id}/delete")
-async def watchlist_delete(
+def watchlist_delete(
     watchlist_id: int,
     request: Request,
     list_id: str = Query(""),
@@ -670,7 +766,7 @@ async def watchlist_delete(
 
 
 @router.post("/lists/delete")
-async def watchlist_delete_list(
+def watchlist_delete_list(
     request: Request,
     list_id: str = Form(...),
     s: Session = Depends(get_session),
@@ -685,13 +781,16 @@ async def watchlist_delete_list(
 
 
 @router.post("/{watchlist_id}/target")
-async def watchlist_set_target(
+def watchlist_set_target(
     watchlist_id: int,
     request: Request,
     target_price: str = Form(""),
     target_direction: str = Form(""),
     s: Session = Depends(get_session),
 ):
+    """Set or clear a row's target price — a blank price clears the target,
+    otherwise the direction must be 'above' or 'below'. Validation errors
+    redirect back with an error toast."""
     try:
         if not target_price.strip():
             set_target(watchlist_id, None, None, session=s)
@@ -710,12 +809,14 @@ async def watchlist_set_target(
 
 
 @router.post("/{watchlist_id}/toggle-alert")
-async def watchlist_toggle_alert(
+def watchlist_toggle_alert(
     watchlist_id: int,
     request: Request,
     enabled: str = Form("off"),
     s: Session = Depends(get_session),
 ):
+    """Arm or disarm a row's target alert from its checkbox form ('on' /
+    'true' / '1' means armed) and redirect back with a toast."""
     is_on = enabled.lower() in {"on", "true", "1"}
     toggle_alert(watchlist_id, is_on, session=s)
     return flash_redirect(

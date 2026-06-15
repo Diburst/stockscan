@@ -15,18 +15,23 @@ router = APIRouter(prefix="/backtests")
 
 
 @router.get("")
-async def backtests_list(request: Request):
+def backtests_list(request: Request):
+    """List the 100 most recent backtest runs."""
     runs = list_runs(limit=100)
     return render(request, "backtests/list.html", runs=runs)
 
 
 @router.get("/{run_id}")
-async def backtest_detail(
+def backtest_detail(
     run_id: int,
     request: Request,
     symbol: str | None = Query(None, description="Selected symbol for the price chart"),
     s: Session = Depends(get_session),
 ):
+    """Single-run view: summary metrics, equity curve, trade table, and a
+    per-symbol price chart with entry/exit markers. ``?symbol=`` picks the
+    charted symbol (defaults to the most-traded one); an unknown run_id
+    renders the empty-state page."""
     run_row = s.execute(
         text(
             """

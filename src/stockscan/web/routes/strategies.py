@@ -24,7 +24,9 @@ def _models_by_strategy() -> dict[str, Any]:
 
 
 @router.get("")
-async def strategies_list(request: Request):
+def strategies_list(request: Request):
+    """Read-only list of every registered strategy, each annotated with its
+    meta-label model status (soft-fails to no models on artifact errors)."""
     discover_strategies()
     return render(
         request,
@@ -35,7 +37,11 @@ async def strategies_list(request: Request):
 
 
 @router.get("/{name}")
-async def strategy_detail(name: str, request: Request):
+def strategy_detail(name: str, request: Request):
+    """Single strategy view: metadata, the params JSON schema or — for
+    strategies that keep their knobs as ClassVar constants — a tuning-knobs
+    table built from the class attributes, plus its meta-label model
+    artifact. Unknown names render the empty-state page."""
     discover_strategies()
     try:
         cls = STRATEGY_REGISTRY.get(name)

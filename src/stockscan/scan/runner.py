@@ -24,6 +24,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import logging
+import time
 from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal
@@ -168,6 +169,7 @@ class ScanRunner:
         # 2. Resolve universe.
         if symbols is None:
             symbols = members_as_of(as_of, session=s) or current_constituents(session=s)
+        scan_started = time.perf_counter()
         log.info(
             "scanning %s v%s on %d symbols as of %s (regime mult=%.3f)",
             strategy_cls.name,
@@ -224,7 +226,18 @@ class ScanRunner:
             # Stamp the symbol so strategy.signals() can extract it.
             bars.attrs["symbol"] = symbol
             bars_cache[symbol] = bars
-            raw_sigs = strategy.signals(bars, as_of)
+            try:
+                raw_sigs = strategy.signals(bars, as_of)
+            except Exception:
+                # One symbol's bad data must not abort the whole scan —
+                # log with full traceback + symbol context, move on.
+                log.exception(
+                    "scan %s: signals() raised on %s as of %s — symbol skipped",
+                    strategy_cls.name,
+                    symbol,
+                    as_of,
+                )
+                continue
             for sig in raw_sigs:
                 # Strategy-emitted pre-rejection. Strategies that need
                 # to surface a contextual rejection reason (e.g., the
@@ -311,6 +324,16 @@ class ScanRunner:
             self._persist_signal(
                 s, run_id, strategy_cls, as_of, sig, qty, "rejected", reason
             )
+
+        log.info(
+            "scan done: %s v%s | %d passing / %d rejected | run_id=%d | %.1fs",
+            strategy_cls.name,
+            strategy_cls.version,
+            len(passing),
+            len(rejected),
+            run_id,
+            time.perf_counter() - scan_started,
+        )
 
         return ScanSummary(
             run_id=run_id,

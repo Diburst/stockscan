@@ -1,5 +1,10 @@
 # Migration Guide
 
+> **Deploying to a new host?** The Docker Compose path in
+> [DEPLOY.md](./DEPLOY.md) is the primary way to run stockscan anywhere —
+> this guide's pg_dump/pg_restore recipes still apply for moving the
+> DATA, and §2 below remains correct for bare-metal Mac-to-Mac moves.
+
 How to move this project to a new location. Two scenarios are covered:
 
 1. **Local relocation** — moving the working tree on the same Mac into your

@@ -170,3 +170,50 @@ def test_no_strategies_with_regime():
     _, body = rec.sent[0]
     assert "trending down" in body
     assert "No strategies" in body
+
+
+# -----------------------------------------------------------------------
+# Step-failure reporting (hardening refactor): failures must reach the
+# notification, not just the log.
+# -----------------------------------------------------------------------
+
+def test_summary_includes_step_failures():
+    rec = _Recorder()
+    _send_summary(
+        as_of=date(2026, 4, 27),
+        bars_upserted=2400,
+        scans=[_summary("rsi2_meanrev", passing=2, rejected=1)],
+        failures=["sector composites: boom", "scan donchian_trend: bad data"],
+        channels=[rec],
+    )
+    subj, body = rec.sent[0]
+    assert "DEGRADED" in subj
+    assert "Step failures" in body
+    assert "sector composites: boom" in body
+    assert "scan donchian_trend: bad data" in body
+
+
+def test_summary_clean_run_has_no_failure_block():
+    rec = _Recorder()
+    _send_summary(
+        as_of=date(2026, 4, 27),
+        bars_upserted=2400,
+        scans=[_summary("rsi2_meanrev", passing=2, rejected=1)],
+        channels=[rec],
+    )
+    subj, body = rec.sent[0]
+    assert "DEGRADED" not in subj
+    assert "Step failures" not in body
+
+
+def test_summary_no_strategies_still_reports_failures():
+    rec = _Recorder()
+    _send_summary(
+        as_of=date(2026, 4, 27),
+        bars_upserted=0,
+        scans=[],
+        failures=["bars refresh: 2 day(s) failed (2026-04-24, 2026-04-25)"],
+        channels=[rec],
+    )
+    _subj, body = rec.sent[0]
+    assert "bars refresh: 2 day(s) failed" in body

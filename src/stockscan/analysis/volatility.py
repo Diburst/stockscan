@@ -29,7 +29,15 @@ from typing import TYPE_CHECKING
 import numpy as np
 
 from stockscan.analysis.state import ExpectedRange, VolatilityState
-from stockscan.indicators import atr, bollinger_bands
+from stockscan.indicators import (
+    atr,
+    bollinger_bands,
+    yang_zhang_volatility,
+    yang_zhang_volatility_ewm,
+)
+
+# EWMA decay for the forward (Yang-Zhang) vol estimate — RiskMetrics λ.
+_EWMA_LAMBDA = 0.94
 
 if TYPE_CHECKING:
     import pandas as pd
@@ -90,14 +98,39 @@ def compute_volatility(bars: pd.DataFrame) -> VolatilityState:
     if last_close <= 0:
         return VolatilityState.unavailable()
 
-    # ---- Realized vol (annualised) ----
-    log_returns = np.log(close).diff().dropna()
-    rv_21 = _annualised_vol(log_returns, 21)
-    rv_63 = _annualised_vol(log_returns, 63)
-
-    # ---- ATR(14) ----
+    # ---- OHLC for the Yang-Zhang range estimator ----
+    open_ = bars.get("open")
     high = bars.get("high")
     low = bars.get("low")
+    have_ohlc = open_ is not None and high is not None and low is not None
+
+    # ---- Realized vol (annualised, %) ----
+    # Yang-Zhang range estimator when OHLC is present (steadier, gap-aware);
+    # close-to-close fallback when only closes exist.
+    yz21_series = None
+    if have_ohlc:
+        yz21_series = yang_zhang_volatility(open_, high, low, close, 21) * 100.0
+        yz63_series = yang_zhang_volatility(open_, high, low, close, 63) * 100.0
+        rv_21 = _last_finite(yz21_series)
+        rv_63 = _last_finite(yz63_series)
+    else:
+        log_returns_cc = np.log(close).diff().dropna()
+        rv_21 = _annualised_vol(log_returns_cc, 21)
+        rv_63 = _annualised_vol(log_returns_cc, 63)
+
+    # ---- Forward vol: EWMA Yang-Zhang (λ=0.94) ----
+    # Responsive, forward-leaning estimate. Drives BOTH the expected-move
+    # bands and the option strike solver so the two never disagree. Falls
+    # back to the trailing 21-day HV when OHLC/EWMA is unavailable.
+    ewma_vol: float | None = None
+    if have_ohlc:
+        ewma_series = yang_zhang_volatility_ewm(
+            open_, high, low, close, lam=_EWMA_LAMBDA
+        ) * 100.0
+        ewma_vol = _last_finite(ewma_series)
+    forward_vol = ewma_vol if ewma_vol is not None else rv_21
+
+    # ---- ATR(14) ----
     atr14: float | None = None
     if high is not None and low is not None and len(close) >= 21:
         atr_series = atr(high, low, close, 14)
@@ -119,25 +152,34 @@ def compute_volatility(bars: pd.DataFrame) -> VolatilityState:
                 bb_width_pct = float((upper - lower) / middle * 100)
 
     # ---- HV percentile ----
+    # Rank today's 21-day Yang-Zhang HV against its own trailing year.
     hv_pct: float | None = None
-    if rv_21 is not None and len(log_returns) >= 252 + 21:
-        # Build a rolling 21-day vol series and rank today against the trailing year.
-        rolling_var = log_returns.rolling(window=21, min_periods=21).var(ddof=1)
-        rolling_vol_pct = (np.sqrt(rolling_var) * np.sqrt(252) * 100).dropna()
-        if len(rolling_vol_pct) >= 252:
-            window = rolling_vol_pct.iloc[-252:]
+    if yz21_series is not None:
+        vol_series = yz21_series.dropna()
+        if len(vol_series) >= 252:
+            window = vol_series.iloc[-252:]
             today_v = float(window.iloc[-1])
             rank = (window <= today_v).sum()
             hv_pct = float(rank) / float(len(window)) * 100
+    elif rv_21 is not None:
+        log_returns_cc = np.log(close).diff().dropna()
+        if len(log_returns_cc) >= 252 + 21:
+            rolling_var = log_returns_cc.rolling(window=21, min_periods=21).var(ddof=1)
+            rolling_vol_pct = (np.sqrt(rolling_var) * np.sqrt(252) * 100).dropna()
+            if len(rolling_vol_pct) >= 252:
+                window = rolling_vol_pct.iloc[-252:]
+                today_v = float(window.iloc[-1])
+                rank = (window <= today_v).sum()
+                hv_pct = float(rank) / float(len(window)) * 100
 
     # ---- Expected range projection ----
-    # Project 21-day realized vol forward over 7 and 30 trading days.
+    # Project the forward (EWMA-YZ) vol over 7 and 30 trading days.
     # sigma(horizon) = sigma(annual) x √(horizon / 252).
     expected_7d: ExpectedRange | None = None
     expected_30d: ExpectedRange | None = None
-    if rv_21 is not None:
+    if forward_vol is not None:
         for horizon, target in ((7, "expected_7d"), (30, "expected_30d")):
-            sigma_pct = rv_21 * math.sqrt(horizon / 252.0)
+            sigma_pct = forward_vol * math.sqrt(horizon / 252.0)
             sigma_dollars = last_close * sigma_pct / 100
             er = ExpectedRange(
                 horizon_days=horizon,
@@ -169,6 +211,7 @@ def compute_volatility(bars: pd.DataFrame) -> VolatilityState:
         bucket=bucket,
         label=label,
         explanation=explanation,
+        ewma_vol_pct=round(ewma_vol, 4) if ewma_vol is not None else None,
     )
 
 
@@ -192,3 +235,14 @@ def _is_finite(v: object) -> bool:
         return bool(np.isfinite(float(v)))  # type: ignore[arg-type]
     except (TypeError, ValueError):
         return False
+
+
+def _last_finite(series) -> float | None:
+    """Last finite value of a Series as a float, or None if none exists."""
+    if series is None or len(series) == 0:
+        return None
+    s = series.dropna()
+    if s.empty:
+        return None
+    last = float(s.iloc[-1])
+    return last if _is_finite(last) and last > 0 else None

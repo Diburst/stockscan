@@ -21,6 +21,8 @@ from stockscan.indicators import (
     rsi,
     sma,
     true_range,
+    yang_zhang_volatility,
+    yang_zhang_volatility_ewm,
 )
 
 
@@ -145,3 +147,69 @@ def test_avg_dollar_volume(random_walk):
     adv = avg_dollar_volume(random_walk["close"], random_walk["volume"], 20)
     valid = adv.dropna()
     assert (valid > 0).all()
+
+
+# --------------- Yang-Zhang realized volatility ---------------
+def _ohlc(n=300, sigma=0.01, gap=0.0, seed=0):
+    """Geometric random walk OHLC with controllable daily vol + overnight gap."""
+    rng = np.random.default_rng(seed)
+    idx = pd.date_range("2024-01-01", periods=n, freq="B")
+    rets = rng.normal(0, sigma, n)
+    close = 100.0 * np.exp(np.cumsum(rets))
+    prev_close = np.concatenate([[100.0], close[:-1]])
+    open_ = prev_close * np.exp(rng.normal(0, gap, n))  # overnight gap
+    intraday = np.abs(rng.normal(0, sigma, n))
+    high = np.maximum(open_, close) * np.exp(intraday)
+    low = np.minimum(open_, close) * np.exp(-intraday)
+    return pd.DataFrame(
+        {"open": open_, "high": high, "low": low, "close": close}, index=idx
+    )
+
+
+def test_yang_zhang_warmup_and_positive():
+    df = _ohlc()
+    yz = yang_zhang_volatility(df["open"], df["high"], df["low"], df["close"], 21)
+    # First 21 rows are NaN warmup (needs window + 1 for the overnight term).
+    assert yz.iloc[:21].isna().all()
+    valid = yz.dropna()
+    assert len(valid) > 0
+    assert (valid > 0).all()
+    assert np.isfinite(valid).all()
+
+
+def test_yang_zhang_monotonic_in_vol():
+    lo = _ohlc(sigma=0.01, seed=1)
+    hi = _ohlc(sigma=0.03, seed=1)
+    yz_lo = yang_zhang_volatility(lo["open"], lo["high"], lo["low"], lo["close"], 21).iloc[-1]
+    yz_hi = yang_zhang_volatility(hi["open"], hi["high"], hi["low"], hi["close"], 21).iloc[-1]
+    assert yz_hi > yz_lo
+
+
+def test_yang_zhang_annualisation_scale():
+    # ~1%/day diffusion → ~16% annualised (0.01*sqrt(252) ≈ 0.159). YZ should
+    # land in a sane band around that for a gentle, low-gap series.
+    df = _ohlc(sigma=0.01, gap=0.001, seed=7)
+    yz = yang_zhang_volatility(df["open"], df["high"], df["low"], df["close"], 63).iloc[-1]
+    assert 0.08 < float(yz) < 0.30
+
+
+def test_yang_zhang_captures_overnight_gap():
+    # Two series, same intraday vol; one gaps overnight, one doesn't. The
+    # gappy one must read higher vol — the whole point of YZ over Garman-Klass.
+    no_gap = _ohlc(sigma=0.01, gap=0.0, seed=5)
+    gappy = _ohlc(sigma=0.01, gap=0.02, seed=5)
+    v_ng = yang_zhang_volatility(no_gap["open"], no_gap["high"], no_gap["low"], no_gap["close"], 63).iloc[-1]
+    v_g = yang_zhang_volatility(gappy["open"], gappy["high"], gappy["low"], gappy["close"], 63).iloc[-1]
+    assert float(v_g) > float(v_ng)
+
+
+def test_ewma_yang_zhang_responds_to_recent_spike():
+    # Calm for 250 days, then a violent last 10. EWMA should sit well above
+    # the trailing 63-day window vol because it weights the recent spike.
+    calm = _ohlc(n=250, sigma=0.008, seed=2)
+    spike = _ohlc(n=10, sigma=0.05, seed=3)
+    spike.index = pd.date_range(calm.index[-1] + pd.offsets.BDay(1), periods=10, freq="B")
+    df = pd.concat([calm, spike])
+    ewma = yang_zhang_volatility_ewm(df["open"], df["high"], df["low"], df["close"], lam=0.94).iloc[-1]
+    win = yang_zhang_volatility(df["open"], df["high"], df["low"], df["close"], 63).iloc[-1]
+    assert float(ewma) > float(win)

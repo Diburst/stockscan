@@ -17,11 +17,13 @@ Personal swing-trading scanner, backtester, and position manager.
 - **Web UI** (mobile-first responsive): Dashboard with regime breakdown + news card + strategy banner, Signals (with Fetch Latest + freshness chip), Signal detail (full attribution: outcome, score derivation, sizing breakdown, regime context, technical confirmation, meta-label probability, params used, raw metadata), Watchlist, Trades, Backtests, Base-Rate Analyzer, Strategies (with model-status panel)
 - **In-app news reader**: Dashboard news card with per-article expand-on-click, on-demand re-fetch from EODHD (not persisted, no content-rights concerns)
 - **Watchlist** with per-symbol price-target alerts (above/below), auto-disable after firing, "+ Watch" quick-add from Dashboard
-- **Technical confirmation score** (per-strategy, signed [-1,+1]) computed from RSI(14) + MACD; displayed alongside strategy score on Signals + Watchlist
+- **Strategy-owned signal scores**: each strategy computes its own composite score with a per-input breakdown persisted in `signals.metadata` (the separate cross-strategy "technical score" layer was retired — see `refactor_plan.md`); the Watchlist's Tech column shows the reversal composite, memoized per (symbol, bars, day)
 - **Fundamentals layer**: 38 typed columns + JSONB raw payload from EODHD, market-cap percentile helper
-- **Notifications**: email (SMTP / Postmark) + Discord webhook, fired by the nightly job
-- **Scheduler**: launchd plist templates for nightly-scan, web KeepAlive, daily DB backup
-- **Migration runner**: 11 SQL migrations, custom runner (replaces Alembic, AUTOCOMMIT-aware)
+- **Notifications**: email (SMTP / Postmark) + Discord webhook, fired by the nightly job; step failures are carried into the summary (subject gains a DEGRADED tag)
+- **Scheduler**: Docker Compose `scheduler` service (supercronic + `infra/crontab`) on any host, or launchd plist templates on macOS — nightly-scan, daily DB backup, weekly fundamentals refresh
+- **Deployment**: full Docker Compose stack (db + migrate + web + scheduler) — see [DEPLOY.md](./DEPLOY.md); self-hosted UI assets (no CDN dependency)
+- **Logging**: central setup with per-component rotating files under `logs/` (web / cli / nightly), request-timing middleware with slow-request warnings
+- **Migration runner**: 21 SQL migrations, custom runner (replaces Alembic, AUTOCOMMIT-aware)
 
 Pending: **Phase 4** (E*TRADE OAuth + broker integration), **Phase 5** (reconciliation drift detection, journaling polish), and the **strategy-optimizer / vol-targeting overlay** items in `TODO.md`.
 
@@ -86,9 +88,26 @@ make db-init         # creates timescaledb extension + applies all SQL migration
 **6. Verify the install**
 
 ```bash
-make test            # ~165 tests should pass
-make db-status       # should show migrations 0001..0005 applied, no pending
+make test            # 600+ tests should pass
+make db-status       # should show migrations 0001..0021 applied, no pending
 ```
+
+---
+
+## Deploying with Docker (any host)
+
+The bare-metal setup above is the macOS dev path. For deployment — to a
+Linux box, a NAS, a VPS, or even the same Mac — the whole stack
+(TimescaleDB + migrations + web UI + scheduled jobs) runs from one command:
+
+```bash
+cp .env.example .env       # set STOCKSCAN_DB_PASSWORD + EODHD_API_KEY
+docker compose up -d --build
+```
+
+See [DEPLOY.md](./DEPLOY.md) for the full walkthrough: seeding data,
+restoring an existing database, day-2 operations, and the scheduler
+(`infra/crontab` replaces launchd on non-Mac hosts).
 
 ---
 
@@ -132,11 +151,11 @@ Available pages:
 | URL | What it shows |
 |---|---|
 | `/` | Dashboard — equity, latest signals (with "+ Watch" quick-add), open positions, **Market Regime** card with full v2 composite breakdown + dropdown explanations per component, **strategy banner** with regime affinity + soft-sizing multipliers, **news card** with per-article expand-on-click reader |
-| `/signals` | Today's passing + rejected signals, filterable by strategy. **Header strip**: "Last scan: Xh ago · N today" + "Bars current through: YYYY-MM-DD [fresh/Nd behind]" + ⟳ Fetch Latest button (HTMX-swapped: backfills 7 days of bars + re-runs every strategy). **Strategy score** and **technical score** columns |
+| `/signals` | Today's passing + rejected signals, filterable by strategy. **Header strip**: "Last scan: Xh ago · N today" + "Bars current through: YYYY-MM-DD [fresh/Nd behind]" + ⟳ Fetch Latest button (HTMX-swapped: backfills 7 days of bars + re-runs every strategy). **Strategy score** column (per-strategy composite with breakdown on the detail page) |
 | `/signals/{id}` | Full signal attribution: Outcome (entry/stop/qty/risk-per-share/notional), Score derivation (humanized strategy metadata with one-line tooltips per indicator), Position sizing (`base × affinity × composite_mult × stress_mult` math), Market regime context (full v2 components + intermediate signals + percentile ranks), Technical confirmation breakdown, Meta-label probability with interpretation guide, Strategy parameters used at scan time, Run context, raw JSONB fallback |
 | `/signals/{id}/base-rates` | Historical-setup outcome stats for that strategy on that symbol |
 | `/news/{article_id}/content` | HTMX fragment endpoint — re-fetches the article body from EODHD on demand (not persisted) |
-| `/watchlist` | Watched symbols with last close, % change, volume, **technical score**, price target editor, alert toggle |
+| `/watchlist` | Watched symbols with last close, % change, volume, **reversal-composite score**, price target editor, alert toggle |
 | `/trades` | Open + closed trades; round-trip stats |
 | `/trades/{id}` | Single-trade detail with notes thread (markdown + FTS) |
 | `/backtests` | Saved backtest runs |
@@ -260,7 +279,6 @@ uv run stockscan health                          # DB + extension + strategies
 uv run stockscan strategies list
 uv run stockscan strategies show rsi2_meanrev
 uv run stockscan strategies show momentum_52w_high
-uv run stockscan technical list                  # registered technical indicators
 
 # Scanning (live signals into DB)
 uv run stockscan scan run rsi2_meanrev           # one strategy, today
@@ -294,10 +312,6 @@ uv run stockscan watchlist add AAPL --target 200 --direction above
 uv run stockscan watchlist remove 3
 uv run stockscan watchlist check-alerts          # fire any pending now
 
-# Technical scores
-uv run stockscan technical backfill              # fill in missing scores for past signals
-uv run stockscan technical recompute --since 2024-01-01  # overwrite existing
-
 # Backtesting
 uv run stockscan backtest run rsi2_meanrev --from 2020-01-01 --capital 1000000
 uv run stockscan backtest run donchian_trend --from 2020-01-01
@@ -308,7 +322,7 @@ uv run stockscan jobs nightly-scan               # refresh + scan + watchlist al
 
 # Web + tests
 make run-web                                     # FastAPI dev server on :8000
-make test                                        # unit tests (~165)
+make test                                        # unit tests (600+)
 make check                                       # lint + typecheck + test
 ```
 
@@ -323,30 +337,29 @@ stock-scan/
 ├── README.md
 ├── pyproject.toml
 ├── Makefile
-├── migrations/              # Plain SQL (custom runner; no Alembic)
+├── Dockerfile               # App image (web + scheduler) — see DEPLOY.md
+├── docker-compose.yml       # Full stack: db + migrate + web + scheduler
+├── tailwind.config.js       # Theme for the built stylesheet (`make css`)
+├── migrations/              # Plain SQL (custom runner; no Alembic) — 21 files
 │   ├── 0001_initial_schema.sql        # bars, accounts, signals, trades, lots, notes ...
 │   ├── 0002_backtest_tables.sql       # backtest_runs / trades / equity_curve
-│   ├── 0003_watchlist.sql             # watchlist_items + price-target alerts
-│   ├── 0004_technical_scores.sql      # per-(symbol,date,strategy) tech scores
-│   ├── 0005_fundamentals.sql          # latest fundamentals snapshot per symbol
-│   ├── 0006_backtest_r_multiple.sql   # R-multiple column on backtest trades
-│   ├── 0007_backtest_trade_context.sql  # context columns for backtest trades
-│   ├── 0008_market_regime.sql         # legacy ADX+SMA regime classifier (v1)
-│   ├── 0009_news.sql                  # news_articles + symbols + tags + alerts + feed_config
-│   ├── 0010_regime_composite.sql      # macro_series + v2 composite regime columns
-│   └── 0011_regime_intermediate_signals.sql  # SMA-200 slope, RSP/SPY ratio, breadth gap
+│   ├── ...                            # watchlist, fundamentals, regime v2, news, ML, ...
+│   ├── 0015_drop_technical_scores.sql # retired: scores live on the signal now
+│   ├── 0016_drop_strategy_configs.sql # retired: knobs live in the strategy file
+│   └── 0021_refresh_log.sql           # latest — `ls migrations/` for the full story
 ├── infra/
 │   ├── docker-compose.yml             # TimescaleDB
 │   ├── setup_db.sh
 │   ├── scripts/
 │   │   └── db_backup.sh               # pg_dump rotation
-│   ├── launchd/                       # plist templates: nightly-scan, web, db-backup
+│   ├── crontab                        # compose scheduler jobs (supercronic, ET times)
+│   ├── launchd/                       # plist templates (macOS path): nightly-scan, web, db-backup
 │   │   └── INSTALL.md
 │   └── docs/
 │       └── mobile-setup.md
 ├── src/stockscan/
 │   ├── cli.py                         # `stockscan ...` (db / refresh / scan / backtest /
-│   │                                    watchlist / technical / jobs / strategies / ml /
+│   │                                    watchlist / jobs / strategies / ml /
 │   │                                    signals)
 │   ├── config.py                      # Pydantic settings
 │   ├── db.py                          # SQLAlchemy engine + healthcheck
@@ -359,7 +372,6 @@ stock-scan/
 │   ├── indicators/                    # RSI, ATR, Donchian, ADX, Bollinger, MACD, ADV
 │   ├── strategies/                    # Plugin system + RSI(2) + Donchian (v1.1) + Largecap Rebound + 52w-high
 │   ├── regime/                        # v2 composite classifier (vol/trend/breadth/credit) + store + detect
-│   ├── technical/                     # Per-signal tech-score (RSI/MACD plugins, scorer, store)
 │   ├── analyzer/                      # Per-signal historical base-rate analysis
 │   ├── scan/                          # ScanRunner + signals_freshness + refresh_signals (Fetch Latest)
 │   ├── risk/                          # Sizer + filter chain (earnings, sector, ADV, drawdown)
@@ -372,9 +384,10 @@ stock-scan/
 │   ├── watchlist/                     # Store + alerts + nightly hook
 │   ├── notify/                        # Email (SMTP) + Discord webhook + router
 │   ├── jobs/                          # Nightly orchestration: refresh → scan → notify
-│   └── web/                           # FastAPI app, routes, Jinja templates (mobile-first)
+│   └── web/                           # FastAPI app, routes, Jinja templates (mobile-first),
+│                                        self-hosted static assets (Tailwind build + htmx)
 ├── models/                            # Pickled XGBoost meta-label artifacts (per strategy)
-└── tests/                             # ~165 tests
+└── tests/                             # 600+ tests
 ```
 
 ---

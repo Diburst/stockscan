@@ -1,0 +1,103 @@
+# Full-stack stockscan deployment — database, migrations, web UI, scheduler.
+#
+#   docker compose up -d        # start everything
+#   docker compose logs -f web  # tail the web server
+#
+# Configuration comes from .env (see .env.example). Required keys:
+#   STOCKSCAN_DB_PASSWORD  — Postgres password (compose path's single source
+#                            of truth; the infra/ DB-only dev path keeps its
+#                            db_password.secret file instead)
+#   EODHD_API_KEY          — data provider key
+#
+# The DB is reachable ONLY on the compose network (no host port). For psql
+# access from the host, copy docker-compose.override.example.yml to
+# docker-compose.override.yml — compose merges it automatically.
+#
+# NOTE: the web service runs a single uvicorn worker BY DESIGN. The
+# background Fetch-Latest job keeps its state in-process; scaling to
+# multiple workers requires moving that state to the database first
+# (see stockscan/scan/refresh_job.py).
+
+services:
+  db:
+    image: timescale/timescaledb:2.17.2-pg16
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: stockscan
+      POSTGRES_USER: stockscan
+      POSTGRES_PASSWORD: ${STOCKSCAN_DB_PASSWORD:?set STOCKSCAN_DB_PASSWORD in .env}
+      TS_TUNE_MEMORY: ${STOCKSCAN_DB_TUNE_MEMORY:-4GB}
+      TS_TUNE_NUM_CPUS: ${STOCKSCAN_DB_TUNE_CPUS:-4}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    shm_size: 1gb
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U stockscan -d stockscan"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # One-shot: applies pending SQL migrations, then exits. web + scheduler
+  # wait for it to complete successfully.
+  migrate:
+    build: .
+    command: ["stockscan", "db", "migrate"]
+    environment:
+      DATABASE_URL: postgresql+psycopg://stockscan:${STOCKSCAN_DB_PASSWORD}@db:5432/stockscan
+      STOCKSCAN_LOG_TO_FILE: "false"
+    env_file: .env
+    depends_on:
+      db:
+        condition: service_healthy
+
+  web:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "${STOCKSCAN_WEB_BIND:-0.0.0.0}:${STOCKSCAN_WEB_PORT:-8000}:8000"
+    environment:
+      DATABASE_URL: postgresql+psycopg://stockscan:${STOCKSCAN_DB_PASSWORD}@db:5432/stockscan
+    env_file: .env
+    volumes:
+      - logs:/app/logs
+      - models:/app/models
+    depends_on:
+      db:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "python -c 'import urllib.request,sys; sys.exit(0 if urllib.request.urlopen(\"http://localhost:8000/health\", timeout=5).status in (200,503) else 1)'"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+
+  # Cron-style jobs: nightly scan, DB backup, weekly fundamentals refresh.
+  # Schedule lives in infra/crontab; supercronic logs each run to stdout
+  # (docker compose logs -f scheduler).
+  scheduler:
+    build: .
+    restart: unless-stopped
+    command: ["supercronic", "/app/infra/crontab"]
+    environment:
+      DATABASE_URL: postgresql+psycopg://stockscan:${STOCKSCAN_DB_PASSWORD}@db:5432/stockscan
+      # pg_dump connection for the backup job (plain libpq URL, no driver tag).
+      PG_DUMP_URL: postgresql://stockscan:${STOCKSCAN_DB_PASSWORD}@db:5432/stockscan
+      TZ: America/New_York
+    env_file: .env
+    volumes:
+      - logs:/app/logs
+      - models:/app/models
+      - backups:/backups
+    depends_on:
+      db:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+
+volumes:
+  pgdata:
+  logs:
+  models:
+  backups:

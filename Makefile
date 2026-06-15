@@ -1,11 +1,12 @@
 .PHONY: help install sync db-up db-down db-init db-migrate db-status db-verify db-reset \
-        test test-int lint fmt typecheck check run-web shell clean
+        test test-int lint fmt typecheck check run-web shell clean \
+        css docker-build docker-up docker-down docker-logs
 
 help:
 	@echo "Stockscan dev targets:"
 	@echo "  install       Install uv (if missing) and sync dependencies"
 	@echo "  sync          uv sync (install/update from pyproject.toml)"
-	@echo "  db-up         Start TimescaleDB container"
+	@echo "  db-up         Start TimescaleDB container (DB-only dev path)"
 	@echo "  db-down       Stop TimescaleDB container"
 	@echo "  db-init       Bootstrap database (extension + apply all migrations)"
 	@echo "  db-migrate    Apply pending SQL migrations"
@@ -19,8 +20,14 @@ help:
 	@echo "  typecheck     Run mypy"
 	@echo "  check         Run lint + typecheck + tests"
 	@echo "  run-web       Run the FastAPI dev server"
+	@echo "  css           Rebuild the Tailwind stylesheet (web/static/app.css)"
 	@echo "  shell         Open a Python shell with app context loaded"
 	@echo "  clean         Remove caches and build artifacts"
+	@echo "Full-stack Docker (see DEPLOY.md):"
+	@echo "  docker-build  Build the app image (web + scheduler)"
+	@echo "  docker-up     Start db + migrate + web + scheduler"
+	@echo "  docker-down   Stop the full stack"
+	@echo "  docker-logs   Tail logs from all services"
 
 install:
 	@command -v uv >/dev/null 2>&1 || (echo "Installing uv..." && curl -LsSf https://astral.sh/uv/install.sh | sh)
@@ -78,6 +85,27 @@ check: lint typecheck test
 
 run-web:
 	uv run uvicorn stockscan.web.app:app --reload --host 0.0.0.0 --port 8000
+
+# Rebuild the self-hosted Tailwind stylesheet after template/theme changes.
+# Uses npx so no permanent node_modules is needed; the Docker build runs the
+# same compile in its assets stage.
+css:
+	npx --yes tailwindcss@3.4.19 -c tailwind.config.js \
+	  -i src/stockscan/web/static/input.css \
+	  -o src/stockscan/web/static/app.css --minify
+
+docker-build:
+	docker compose build
+
+docker-up:
+	docker compose up -d
+	@echo "Web UI: http://localhost:8000 — logs: make docker-logs"
+
+docker-down:
+	docker compose down
+
+docker-logs:
+	docker compose logs -f
 
 shell:
 	uv run python -i -c "from stockscan import config, db; print('stockscan dev shell ready')"

@@ -29,7 +29,11 @@ router = APIRouter()
 
 
 @router.get("/")
-async def dashboard(request: Request, s: Session = Depends(get_session)):
+def dashboard(request: Request, s: Session = Depends(get_session)):
+    """Top-level overview — latest equity, this month's current-version
+    signals, open trades, and the regime banner with per-strategy sizing
+    factors. The news, calendar, index-structure, macro, and earnings cards
+    each soft-fail independently so one failure never blanks the page."""
     discover_strategies()
 
     # Latest equity (or fallback)

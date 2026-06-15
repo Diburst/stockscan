@@ -544,6 +544,64 @@
         {% endif %}
       </div>
 
+      {% if o.strike_sets %}
+        <div class="text-xs uppercase tracking-wide text-ink-500 mb-2">
+          Suggested strikes
+          <span class="normal-case tracking-normal text-ink-400">
+            · Black-Scholes off EWMA Yang-Zhang HV (IV proxy), FRED risk-free rate
+          </span>
+        </div>
+        <div class="space-y-4 mb-4">
+          {% for ss in o.strike_sets %}
+            {% if ss.put or ss.call %}
+              <div>
+                <div class="flex items-baseline justify-between mb-1">
+                  <span class="text-sm font-medium text-ink-700">{{ ss.label }}</span>
+                  <span class="text-xs text-ink-400">
+                    Δ{{ "%.2f"|format(ss.target_delta) }}
+                    {%- if ss.call %} · σ={{ "%.1f%%"|format(ss.call.vol_pct) }} · r={{ "%.1f%%"|format(ss.call.rate_pct) }}{% endif -%}
+                  </span>
+                </div>
+                <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                  {% for leg, accent in [(ss.put, "ok"), (ss.call, "bad")] %}
+                    {% if leg %}
+                      <div class="rounded-md border border-ink-300/50 p-3">
+                        <div class="flex items-baseline justify-between">
+                          <span class="text-xs uppercase tracking-wide text-ink-500">
+                            {{ leg.kind|capitalize }} · {{ "%.0f"|format(leg.target_delta|abs * 100) }}Δ
+                          </span>
+                          <span class="font-mono font-semibold text-{{ accent }}-600">${{ "%.2f"|format(leg.strike) }}</span>
+                        </div>
+                        <div class="text-xs text-ink-500 mb-2">
+                          {{ "%+.1f%%"|format(leg.pct_otm) }} from spot · est. mid ${{ "%.2f"|format(leg.price) }}
+                        </div>
+                        <dl class="text-xs grid grid-cols-2 gap-x-3 gap-y-0.5">
+                          <dt class="text-ink-500">Delta</dt>
+                          <dd class="font-mono text-right">{{ "%.2f"|format(leg.delta) }}</dd>
+                          <dt class="text-ink-500">Theta/day</dt>
+                          <dd class="font-mono text-right">${{ "%.3f"|format(leg.theta) }}</dd>
+                          <dt class="text-ink-500">Vega/1%</dt>
+                          <dd class="font-mono text-right">${{ "%.3f"|format(leg.vega) }}</dd>
+                        </dl>
+                        {% if leg.confluences %}
+                          <div class="mt-2 pt-2 border-t border-ink-300/40 space-y-1">
+                            {% for c in leg.confluences %}
+                              <div class="text-xs text-warn-600 flex gap-1.5">
+                                <span class="text-warn-600">⊚</span><span>{{ c }}</span>
+                              </div>
+                            {% endfor %}
+                          </div>
+                        {% endif %}
+                      </div>
+                    {% endif %}
+                  {% endfor %}
+                </div>
+              </div>
+            {% endif %}
+          {% endfor %}
+        </div>
+      {% endif %}
+
       {% if o.observations %}
         <div class="text-xs uppercase tracking-wide text-ink-500 mb-2">Observations</div>
         <ul class="space-y-2 text-sm text-ink-700 leading-snug">
@@ -557,10 +615,13 @@
       {% endif %}
 
       <p class="text-xs text-ink-500 italic mt-4 border-t border-ink-300/40 pt-2">
-        Note: expected ranges are computed from realized historical
-        volatility, not from option chain implied volatility (we don't
-        have option data wired up yet). Treat as estimates of typical
-        moves rather than the options market's pricing.
+        Note: expected ranges and the Black-Scholes suggested strikes use an
+        EWMA Yang-Zhang estimate of realized volatility (an OHLC range
+        estimator) as a stand-in for option-implied volatility — we don't have
+        option chain data wired up yet. The risk-free rate is the 1-month
+        Treasury (FRED). The strikes are model-implied levels for a given
+        delta, not live chain quotes — treat them as estimates rather than the
+        options market's pricing.
       </p>
     {% endcall %}
   {% endif %}

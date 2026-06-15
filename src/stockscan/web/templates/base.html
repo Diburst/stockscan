@@ -6,37 +6,13 @@
   <meta name="theme-color" content="#0f172a">
   <title>{% block title %}stockscan{% endblock %} · stockscan</title>
 
-  <!-- Tailwind via Play CDN. For prod we'd build a static bundle; fine for personal use. -->
-  <script src="https://cdn.tailwindcss.com"></script>
-  <script>
-    tailwind.config = {
-      theme: {
-        extend: {
-          colors: {
-            ink: { 900: '#0f172a', 800: '#1e293b', 700: '#334155',
-                   500: '#64748b', 300: '#cbd5e1', 100: '#f1f5f9' },
-            ok:  { 600: '#059669', 100: '#d1fae5' },
-            warn:{ 600: '#d97706', 100: '#fef3c7' },
-            bad: { 600: '#dc2626', 100: '#fee2e2' },
-          },
-          fontFamily: {
-            sans: ['system-ui', '-apple-system', 'Segoe UI', 'Roboto', 'sans-serif'],
-            mono: ['ui-monospace', 'SFMono-Regular', 'Menlo', 'monospace'],
-          },
-        },
-      },
-    };
-  </script>
-  <script src="https://unpkg.com/htmx.org@1.9.10"
-          integrity="sha384-D1Kt99CQMDuVetoL1lrYwg5t+9QdHe7NLX/SoJYkXDFfX37iInKRy5xLSi8nO7UC"
-          crossorigin="anonymous"></script>
-
-  <style>
-    /* Tap targets ≥44px on touch devices (Apple HIG). */
-    @media (hover: none) {
-      a, button, [role="button"], summary { min-height: 44px; }
-    }
-  </style>
+  {# Self-hosted assets — no CDN dependency, so the UI works on a
+     LAN-only / offline host. app.css is the Tailwind build (`make css`,
+     config in tailwind.config.js); htmx.min.js is vendored at the pinned
+     version. The old Play-CDN setup was dev-only tooling and broke
+     without internet. #}
+  <link rel="stylesheet" href="/static/app.css">
+  <script src="/static/htmx.min.js"></script>
 
   {% block head_extra %}{% endblock %}
 </head>
@@ -201,6 +177,27 @@
       document.body.addEventListener('toast', function (evt) {
         var d = evt.detail || {};
         pushToast(d.kind, d.message);
+      });
+
+      // ----------------------------------------------------------------
+      // Global HTMX error feedback. Any fragment action that fails — a
+      // 4xx/5xx response, or a network failure before the server even
+      // answered — surfaces as an error toast instead of dying silently.
+      // The server's HTMX-aware error handler (web/app.py) puts a friendly
+      // message in X-Error-Message and HX-Reswap:none so the page DOM is
+      // never mangled by an error body.
+      // ----------------------------------------------------------------
+      document.body.addEventListener('htmx:responseError', function (evt) {
+        var xhr = evt.detail.xhr || {};
+        var msg = '';
+        try { msg = xhr.getResponseHeader('X-Error-Message') || ''; } catch (e) {}
+        pushToast('error', msg || ('Request failed (' + (xhr.status || '?') + ') — the page was not changed'));
+      });
+      document.body.addEventListener('htmx:sendError', function () {
+        pushToast('error', 'Network error — the request never reached the server');
+      });
+      document.body.addEventListener('htmx:timeout', function () {
+        pushToast('error', 'Request timed out — try again');
       });
 
       // Expose a global so route-level scripts can also push toasts.

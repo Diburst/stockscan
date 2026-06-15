@@ -76,7 +76,7 @@ def _safe_rollback(session: Session) -> None:
 
 
 @router.post("/refresh")
-async def refresh_endpoint(
+def refresh_endpoint(
     request: Request,
     s: Session = Depends(get_session),
 ):

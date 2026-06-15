@@ -7,6 +7,7 @@ when adding a new symbol or extending history.
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from typing import Iterable
 from zoneinfo import ZoneInfo
@@ -97,13 +98,36 @@ def backfill_universe(
 # -----------------------------------------------------------------------
 # Bulk daily refresh path (Phase 3)
 # -----------------------------------------------------------------------
+@dataclass(frozen=True, slots=True)
+class BulkRefreshResult:
+    """Outcome of a multi-day bulk refresh, including which days failed.
+
+    Supports ``int(result)`` / ``+`` so callers that only care about the
+    upsert count keep working unchanged; callers that report status (the
+    nightly summary, Fetch Latest) read ``failed_days``.
+    """
+
+    upserted: int
+    failed_days: tuple[date, ...] = ()
+
+    def __int__(self) -> int:
+        return self.upserted
+
+    def __radd__(self, other: int) -> int:
+        return other + self.upserted
+
+    @property
+    def ok(self) -> bool:
+        return not self.failed_days
+
+
 def refresh_recent_days_bulk(
     provider: DataProvider,
     dates: Iterable[date],
     *,
     exchange: str = "US",
     filter_to: set[str] | None = None,
-) -> int:
+) -> BulkRefreshResult:
     """Use the bulk endpoint to fetch one trading day at a time for ALL
     symbols on `exchange`, then upsert.
 
@@ -115,15 +139,21 @@ def refresh_recent_days_bulk(
     `filter_to` restricts the upsert to a known symbol set (e.g., the
     historical S&P 500 universe). Symbols outside the filter are dropped
     rather than persisted.
+
+    One bad day never aborts the rest — it's recorded in
+    ``BulkRefreshResult.failed_days`` so the caller can surface partial
+    success ("refreshed 2 of 3 days") instead of silently under-reporting.
     """
     from stockscan.data.store import upsert_bars
 
     total = 0
+    failed: list[date] = []
     for d in dates:
         try:
             rows = provider.get_eod_bulk(d, exchange=exchange)
         except Exception as exc:  # noqa: BLE001
             log.error("bulk fetch failed for %s: %s", d, exc)
+            failed.append(d)
             continue
         if filter_to is not None:
             rows = [r for r in rows if r.symbol in filter_to]
@@ -133,7 +163,7 @@ def refresh_recent_days_bulk(
         n = upsert_bars(rows)
         log.info("bulk %s: %d bars upserted", d, n)
         total += n
-    return total
+    return BulkRefreshResult(upserted=total, failed_days=tuple(failed))
 
 
 def trading_days_since(last_date: date | None, until: date) -> list[date]:

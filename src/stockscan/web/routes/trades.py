@@ -26,11 +26,13 @@ router = APIRouter(prefix="/trades")
 
 
 @router.get("")
-async def trades_list(
+def trades_list(
     request: Request,
     strategy: str | None = Query(None),
     s: Session = Depends(get_session),
 ):
+    """Open + closed trades, real and paper, on one page. ``?strategy=``
+    filters the closed tables; open positions always show in full."""
     open_trades = list_open_trades(session=s)
     closed_trades = list_closed_trades(strategy=strategy, session=s)
     open_paper = list_open_paper_trades(session=s)
@@ -47,7 +49,7 @@ async def trades_list(
 
 
 @router.get("/search")
-async def trades_search(
+def trades_search(
     request: Request,
     q: str = Query(..., min_length=2),
     s: Session = Depends(get_session),
@@ -63,11 +65,13 @@ async def trades_search(
 
 
 @router.get("/{trade_id}")
-async def trade_detail(
+def trade_detail(
     trade_id: int,
     request: Request,
     s: Session = Depends(get_session),
 ):
+    """Single trade view: the trade itself, its notes thread, and its tax
+    lots. An unknown trade_id renders the empty-state page."""
     trade = get_trade(trade_id, session=s)
     if trade is None:
         return render(request, "trades/detail.html", trade=None, notes=[], lots=[])
@@ -92,13 +96,15 @@ async def trade_detail(
 
 
 @router.post("/{trade_id}/notes")
-async def trade_add_note(
+def trade_add_note(
     trade_id: int,
     request: Request,
     body: str = Form(..., min_length=1),
     note_type: str = Form("free"),
     s: Session = Depends(get_session),
 ):
+    """Append a note to a trade's thread, then redirect back to the detail
+    page — save failures surface as an error toast instead of a 500."""
     try:
         create_note(trade_id, body=body, note_type=note_type, session=s)  # type: ignore[arg-type]
     except Exception as exc:  # noqa: BLE001 - surface DB / validation errors as a toast
@@ -109,13 +115,15 @@ async def trade_add_note(
 
 
 @router.post("/{trade_id}/notes/{note_id}/edit")
-async def trade_edit_note(
+def trade_edit_note(
     trade_id: int,
     note_id: int,
     request: Request,
     body: str = Form(..., min_length=1),
     s: Session = Depends(get_session),
 ):
+    """Update an existing note's body, then redirect back to the trade detail
+    page — failures surface as an error toast instead of a 500."""
     try:
         update_note(note_id, body=body, session=s)
     except Exception as exc:  # noqa: BLE001 - surface as a toast

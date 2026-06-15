@@ -1,0 +1,12 @@
+/* Tailwind entrypoint — built to app.css by `make css` (and by the Docker
+ * build). Hand-written rules that aren't Tailwind utilities live here too,
+ * so base.html needs no inline <style>. */
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Tap targets ≥44px on touch devices (Apple HIG). */
+@media (hover: none) {
+  a, button, [role="button"], summary { min-height: 44px; }
+}

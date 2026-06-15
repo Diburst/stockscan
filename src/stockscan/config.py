@@ -41,6 +41,13 @@ class Settings(BaseSettings):
     log_level: str = Field("INFO", alias="STOCKSCAN_LOG_LEVEL")
     timezone: str = Field("America/New_York", alias="STOCKSCAN_TIMEZONE")
 
+    # ---- Logging (see stockscan.logging_setup) ----
+    # Empty log_dir → <repo_root>/logs (resolved_log_dir property below).
+    log_dir: str = Field("", alias="STOCKSCAN_LOG_DIR")
+    log_to_file: bool = Field(True, alias="STOCKSCAN_LOG_TO_FILE")
+    # Requests slower than this log at WARNING in the web timing middleware.
+    slow_request_ms: int = Field(750, alias="STOCKSCAN_SLOW_REQUEST_MS")
+
     # ---- Database ----
     database_url: str = Field(
         "postgresql+psycopg://stockscan:CHANGE_ME@127.0.0.1:5432/stockscan",
@@ -78,6 +85,19 @@ class Settings(BaseSettings):
         Decimal("0.15"), alias="STOCKSCAN_DRAWDOWN_CIRCUIT_BREAKER"
     )
 
+    # ---- Options analysis ----
+    # Annualised risk-free rate used by the Black-Scholes strike solver on the
+    # analysis page. The effect on a 30-day, 20-delta strike is small; ~4%
+    # tracks short-term Treasury yields closely enough for strike framing.
+    # We have no option chain, so realized HV stands in for implied vol — see
+    # stockscan.analysis.black_scholes.
+    risk_free_rate: float = Field(0.04, alias="STOCKSCAN_RISK_FREE_RATE")
+
+    @property
+    def resolved_log_dir(self) -> Path:
+        """Log directory as a Path — explicit setting or <repo_root>/logs."""
+        return Path(self.log_dir) if self.log_dir else PROJECT_ROOT / "logs"
+
     @property
     def is_dev(self) -> bool:
         return self.env == "dev"
@@ -98,3 +118,33 @@ def _get_settings() -> Settings:
 
 # Convenience singleton — most code should import this.
 settings: Settings = _get_settings()
+
+
+def config_warnings() -> list[str]:
+    """Degraded-capability warnings for startup announcement.
+
+    A misconfigured deploy should say so on boot rather than fail quietly
+    at 8pm when the nightly job runs. Called by the web app factory and the
+    CLI callback; each line is logged at WARNING.
+    """
+    out: list[str] = []
+    if not settings.eodhd_api_key.get_secret_value():
+        out.append(
+            "EODHD_API_KEY not set — data refresh falls back to StubProvider "
+            "(synthetic bars; fine for dev, useless in prod)"
+        )
+    if "CHANGE_ME" in settings.database_url:
+        out.append("DATABASE_URL still contains the placeholder password")
+    if not settings.fred_api_key.get_secret_value():
+        out.append(
+            "FRED_API_KEY not set — regime composite runs without the "
+            "credit-stress component (weights renormalize)"
+        )
+    has_email = bool(settings.notify_email_to and settings.notify_email_from)
+    has_discord = bool(settings.discord_webhook_url.get_secret_value())
+    if not has_email and not has_discord:
+        out.append(
+            "no notification channel configured (email/Discord) — nightly "
+            "summaries and alerts have nowhere to go"
+        )
+    return out

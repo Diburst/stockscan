@@ -23,8 +23,7 @@ import re
 
 import httpx
 from tenacity import (
-    retry,
-    retry_if_exception,
+    Retrying,
     stop_after_attempt,
     wait_random_exponential,
 )
@@ -49,17 +48,71 @@ def _redact(text: str) -> str:
     return _TOKEN_RE.sub(r"\1***", text)
 
 
-def _should_retry(exc: BaseException) -> bool:
-    """Retry transient server/connection errors, but NOT read-timeouts.
+class _RateLimited(Exception):
+    """Internal marker for a 429 response. Carries the server's Retry-After."""
 
-    A read-timeout on a large response (e.g. the full-market bulk EOD payload)
-    means the server is slow; immediately re-issuing the same heavy request
-    rarely succeeds and just doubles the load. Connection errors and 5xx are
-    worth a bounded retry.
+    def __init__(self, retry_after: float) -> None:
+        super().__init__(f"EODHD 429: rate limited (retry after {retry_after:.0f}s)")
+        self.retry_after = retry_after
+
+
+class _RetryPolicy:
+    """Per-exception-class retry bounds, evaluated by tenacity per attempt.
+
+    - 429 rate limits: up to two retries, waiting out the server's
+      Retry-After (capped — see :func:`_retry_wait`).
+    - Read/connect timeouts: ONE retry for light requests; NEVER retried
+      for heavy ones (``heavy=True`` — the full-market bulk EOD payload is
+      several MB; re-issuing a request the server was too slow to answer
+      just doubles the load. This preserves the original design decision.)
+    - Connection errors and 5xx: up to two retries with jittered backoff.
     """
-    if isinstance(exc, httpx.TimeoutException):
+
+    def __init__(self, *, heavy: bool = False) -> None:
+        self.heavy = heavy
+
+    def __call__(self, retry_state: Any) -> bool:
+        outcome = retry_state.outcome
+        if outcome is None or not outcome.failed:
+            return False
+        exc = outcome.exception()
+        n = retry_state.attempt_number
+        if isinstance(exc, _RateLimited):
+            return n < 3
+        if isinstance(exc, httpx.TimeoutException):
+            return (not self.heavy) and n < 2
+        if isinstance(exc, (httpx.TransportError, httpx.HTTPStatusError)):
+            return n < 3
         return False
-    return isinstance(exc, (httpx.TransportError, httpx.HTTPStatusError))
+
+
+_jitter_wait = wait_random_exponential(multiplier=1, max=15)
+# Never honor a Retry-After longer than this — a misbehaving server must not
+# park the nightly job for minutes.
+_MAX_RETRY_AFTER_S = 30.0
+
+
+def _retry_wait(retry_state: Any) -> float:
+    """Honor 429 Retry-After; jittered exponential backoff otherwise."""
+    outcome = retry_state.outcome
+    exc = outcome.exception() if outcome is not None and outcome.failed else None
+    if isinstance(exc, _RateLimited):
+        return min(exc.retry_after, _MAX_RETRY_AFTER_S)
+    return _jitter_wait(retry_state)
+
+
+def _log_retry(retry_state: Any) -> None:
+    """One WARNING per retry, with the token redacted from the message."""
+    outcome = retry_state.outcome
+    exc = outcome.exception() if outcome is not None else None
+    sleep = retry_state.next_action.sleep if retry_state.next_action else 0.0
+    log.warning(
+        "EODHD retry: attempt %d failed (%s) — retrying in %.1fs",
+        retry_state.attempt_number,
+        _redact(str(exc)),
+        sleep,
+    )
+
 
 NY_TZ = ZoneInfo("America/New_York")
 DAILY_CLOSE_HOUR = 16  # 16:00 ET
@@ -98,32 +151,46 @@ class EODHDProvider(DataProvider):
     # ------------------------------------------------------------------
     # Internals
     # ------------------------------------------------------------------
-    @retry(
-        retry=retry_if_exception(_should_retry),
-        # Jittered backoff so concurrent retries don't synchronize into a
-        # thundering herd against an already-stressed endpoint.
-        wait=wait_random_exponential(multiplier=1, max=15),
-        stop=stop_after_attempt(2),  # one retry; read-timeouts aren't retried
-        reraise=True,
-    )
     def _get_raw(self, path: str, **params: Any) -> Any:
+        """One HTTP attempt. Raises ``_RateLimited`` on 429 so the retry
+        policy can honor the server's Retry-After instead of backing off
+        blindly."""
         params.setdefault("api_token", self.api_key)
         params.setdefault("fmt", "json")
         resp = self._client.get(path, params=params)
         if resp.status_code >= 500:
             resp.raise_for_status()
+        if resp.status_code == 429:
+            try:
+                retry_after = float(resp.headers.get("retry-after", "5"))
+            except ValueError:  # HTTP-date form or garbage — use the default
+                retry_after = 5.0
+            raise _RateLimited(retry_after)
         if resp.status_code >= 400:
             raise EODHDError(f"EODHD {resp.status_code}: {_redact(resp.text[:200])}")
         return resp.json()
 
-    def _get(self, path: str, **params: Any) -> Any:
-        """Retry wrapper that guarantees the api_token never escapes in an
+    def _get(self, path: str, *, heavy: bool = False, **params: Any) -> Any:
+        """Retrying GET that guarantees the api_token never escapes in an
         exception message (httpx embeds the request URL — token and all — in
-        HTTPStatusError)."""
+        HTTPStatusError).
+
+        ``heavy=True`` marks large-payload requests (bulk EOD): their
+        read-timeouts are never retried — see :class:`_RetryPolicy`.
+        """
+        retryer = Retrying(
+            retry=_RetryPolicy(heavy=heavy),
+            wait=_retry_wait,
+            stop=stop_after_attempt(3),  # absolute ceiling across all classes
+            before_sleep=_log_retry,
+            reraise=True,
+        )
         try:
-            return self._get_raw(path, **params)
+            return retryer(self._get_raw, path, **params)
         except EODHDError:
             raise
+        except _RateLimited as exc:
+            raise EODHDError(f"{exc} — retries exhausted") from None
         except (httpx.HTTPStatusError, httpx.TransportError) as exc:
             # `from None` drops the token-bearing original from the chain so it
             # can't resurface via __cause__ when the error is logged.
@@ -466,7 +533,9 @@ class EODHDProvider(DataProvider):
         if symbols:
             # EODHD wants comma-separated tickers WITHOUT the .US suffix here.
             params["symbols"] = ",".join(symbols)
-        rows = self._get(path, **params)
+        # heavy=True: the full-market payload is several MB — read-timeouts
+        # on it are not retried (see _RetryPolicy).
+        rows = self._get(path, heavy=True, **params)
 
         out: list[BarRow] = []
         for r in rows or []:

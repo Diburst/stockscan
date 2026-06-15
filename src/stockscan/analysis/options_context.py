@@ -23,14 +23,20 @@ to add those - the dataclass is already shaped for it.
 from __future__ import annotations
 
 import logging
+from datetime import timedelta
 from typing import TYPE_CHECKING
 
 from sqlalchemy import text
 
+from stockscan.analysis import black_scholes
 from stockscan.analysis.state import (
     Level,
     OptionsContext,
+    OptionStrike,
+    StrikeSet,
 )
+from stockscan.config import settings
+from stockscan.data.macro_store import latest_macro_value
 
 if TYPE_CHECKING:
     from datetime import date as _date
@@ -43,6 +49,26 @@ if TYPE_CHECKING:
     )
 
 log = logging.getLogger(__name__)
+
+# Strike-suggestion tenors: (days_to_expiry, target_delta). One StrikeSet is
+# produced per row, nearest-expiry first. The defaults map to a weekend
+# trade-planning workflow: ~6 days = this coming Friday, ~13 days = the next
+# Friday, ~30 days = about a month out. Edit this tuple to change the ladder.
+_STRIKE_TENORS: tuple[tuple[int, float], ...] = (
+    (6, 0.15),
+    (13, 0.15),
+    (30, 0.20),
+)
+
+# A suggested strike is "at" a level/MA when it sits within this multiple of
+# ATR(14) of it — a volatility-scaled notion of "close" (per Thomas).
+_CONFLUENCE_ATR_MULT = 0.5
+
+# FRED series for the risk-free rate: 1-month constant-maturity Treasury, the
+# closest tenor to our ≤30-day options. Read from the cached macro_series
+# table (refreshed by `stockscan refresh macro`); falls back to
+# settings.risk_free_rate when absent. Stored by FRED in percent (e.g. 5.31).
+_RISK_FREE_SERIES = "DGS1MO"
 
 
 def compute_options_context(
@@ -104,6 +130,21 @@ def compute_options_context(
     if nearest_resistance is not None and last_close > 0:
         pct_to_resistance = (nearest_resistance.price - last_close) / last_close * 100
 
+    # ---- Black-Scholes suggested strikes (one StrikeSet per tenor) ----
+    # Each tenor's put + call is priced off the EWMA Yang-Zhang forward vol as
+    # an IV proxy (no chain), at the tenor-matched FRED risk-free rate, then
+    # each strike is checked for confluence with key EMAs and S/R levels.
+    # Soft-fails to [] if vol is missing.
+    strike_sets = _build_strike_sets(
+        symbol=symbol,
+        as_of=as_of,
+        last_close=last_close,
+        levels=levels,
+        trend=trend,
+        volatility=volatility,
+        session=session,
+    )
+
     # ---- Observations ----
     observations = _build_observations(
         last_close=last_close,
@@ -114,6 +155,7 @@ def compute_options_context(
         trend=trend,
         volatility=volatility,
         days_to_earnings=days_to_earn,
+        strike_sets=strike_sets,
     )
 
     return OptionsContext(
@@ -125,8 +167,163 @@ def compute_options_context(
         nearest_resistance=nearest_resistance,
         pct_to_support=round(pct_to_support, 4) if pct_to_support is not None else None,
         pct_to_resistance=round(pct_to_resistance, 4) if pct_to_resistance is not None else None,
+        strike_sets=strike_sets,
         observations=observations,
     )
+
+
+def _build_strike_sets(
+    *,
+    symbol: str,
+    as_of: _date,
+    last_close: float,
+    levels: list[Level],
+    trend: TrendState,
+    volatility: VolatilityState,
+    session: Session | None = None,
+) -> list[StrikeSet]:
+    """Solve a put + call for every tenor in ``_STRIKE_TENORS``.
+
+    Each strike is priced off the EWMA Yang-Zhang forward vol (an IV proxy —
+    we have no option chain) at the FRED risk-free rate, then annotated with
+    any structural confluence (key EMA / S/R level within
+    ``_CONFLUENCE_ATR_MULT`` × ATR(14)). Returns an empty list when vol is
+    unavailable; individual legs soft-fail to None.
+    """
+    # Prefer the responsive EWMA-YZ forward vol; fall back to the trailing
+    # 21-day HV if it's missing.
+    vol_pct = volatility.ewma_vol_pct or volatility.realized_vol_21d_pct
+    if not volatility.available or vol_pct is None:
+        return []
+    rate = _risk_free_rate(as_of, session)
+    atr14 = volatility.atr_14  # may be None → confluence check is skipped
+
+    sets: list[StrikeSet] = []
+    for days, delta in _STRIKE_TENORS:
+        legs: dict[str, OptionStrike | None] = {"call": None, "put": None}
+        for kind in ("call", "put"):
+            try:
+                q = black_scholes.suggest_strike(
+                    spot=last_close,
+                    vol_pct=vol_pct,
+                    days_to_expiry=days,
+                    target_delta=delta,
+                    kind=kind,
+                    rate=rate,
+                )
+                confluences = _strike_confluences(
+                    strike=q.strike, levels=levels, trend=trend, atr14=atr14
+                )
+                legs[kind] = OptionStrike(
+                    kind=q.kind,
+                    strike=q.strike,
+                    pct_otm=q.pct_otm,
+                    target_delta=q.target_delta,
+                    delta=q.delta,
+                    price=q.price,
+                    theta=q.theta,
+                    vega=q.vega,
+                    gamma=q.gamma,
+                    days_to_expiry=q.days_to_expiry,
+                    vol_pct=q.vol_pct,
+                    rate_pct=q.rate_pct,
+                    confluences=confluences,
+                )
+            except Exception as exc:
+                log.debug(
+                    "options_context: %s %dd strike solve failed for %s: %s",
+                    kind, days, symbol, exc,
+                )
+        expiry = as_of + timedelta(days=days)
+        sets.append(
+            StrikeSet(
+                days_to_expiry=days,
+                target_delta=delta,
+                expiry_date=expiry,
+                label=f"{days}-day · {expiry:%b %d} ({expiry:%a})",
+                call=legs["call"],
+                put=legs["put"],
+            )
+        )
+    return sets
+
+
+def _risk_free_rate(as_of: _date, session: Session | None) -> float:
+    """Risk-free rate (decimal) from the cached 1-month Treasury, FRED-sourced.
+
+    Reads the most-recent ``DGS1MO`` print at-or-before ``as_of`` from the
+    ``macro_series`` table (no network — refreshed by ``stockscan refresh
+    macro``). FRED stores it in percent, so we divide by 100. Falls back to
+    ``settings.risk_free_rate`` when there's no session, no print on file, or
+    the value looks implausible.
+    """
+    fallback = settings.risk_free_rate
+    if session is None:
+        return fallback
+    try:
+        val = latest_macro_value(_RISK_FREE_SERIES, as_of, session=session)
+    except Exception as exc:
+        log.debug("options_context: risk-free lookup failed: %s", exc)
+        return fallback
+    if val is None:
+        return fallback
+    rate = float(val) / 100.0
+    # Sanity band: a 1-month T-bill outside 0–25% is a data error, not a rate.
+    return rate if 0.0 <= rate < 0.25 else fallback
+
+
+def _strike_confluences(
+    *,
+    strike: float,
+    levels: list[Level],
+    trend: TrendState,
+    atr14: float | None,
+) -> tuple[str, ...]:
+    """Flag EMAs / S/R levels sitting within 0.5×ATR(14) of ``strike``.
+
+    Returns short prose strings (one per nearby reference), ordered by
+    proximity. Empty when ATR is unknown or the strike lands in open space.
+    A strike that coincides with structure is a double-edged flag: it's a
+    natural magnet/pin (good for a short option to expire near) but also a
+    spot where price tends to react, so a sold strike there can get tested.
+    """
+    if atr14 is None or atr14 <= 0 or strike <= 0:
+        return ()
+    band = _CONFLUENCE_ATR_MULT * atr14
+
+    hits: list[tuple[float, str]] = []  # (distance, label)
+
+    # Key EMAs.
+    if trend.available:
+        for period in sorted(trend.emas):
+            value = trend.emas.get(period)
+            if value is None or value <= 0:
+                continue
+            dist = abs(strike - value)
+            if dist <= band:
+                pct = (value - strike) / strike * 100
+                hits.append(
+                    (dist, f"{period} EMA ${value:.2f} ({abs(pct):.1f}% away)")
+                )
+
+    # Support / resistance levels.
+    for lv in levels:
+        dist = abs(strike - lv.price)
+        if dist <= band:
+            pct = (lv.price - strike) / strike * 100
+            flip = " ex-resistance" if (lv.is_flipped and lv.kind == "support") else (
+                " ex-support" if (lv.is_flipped and lv.kind == "resistance") else ""
+            )
+            hits.append(
+                (
+                    dist,
+                    f"{lv.kind} ${lv.price:.2f}{flip} "
+                    f"(str {lv.strength:.2f}, {abs(pct):.1f}% away)",
+                )
+            )
+
+    hits.sort(key=lambda h: h[0])
+    return tuple(label for _, label in hits)
 
 
 def _build_observations(
@@ -139,6 +336,7 @@ def _build_observations(
     trend: TrendState,
     volatility: VolatilityState,
     days_to_earnings: int | None,
+    strike_sets: list[StrikeSet] | None = None,
 ) -> list[str]:
     """Compose the bullet observations shown in the dashboard card.
 
@@ -270,6 +468,34 @@ def _build_observations(
             f"30-day ±1sigma expected range: ${er.low:.2f} - ${er.high:.2f} "
             f"(±{er.sigma_pct:.1f}% / ±${er.sigma_dollars:.2f} from current). "
             f"~68% of historical 30-day moves stay inside this band."
+        )
+
+    # Black-Scholes suggested strikes — one strangle per tenor, priced off
+    # 21-day realized HV as an IV proxy.
+    for ss in strike_sets or []:
+        if ss.put is None or ss.call is None:
+            continue
+        obs.append(
+            f"{ss.label}: Δ{ss.target_delta:.2f} short put ${ss.put.strike:.2f} "
+            f"({ss.put.pct_otm:.1f}% OTM) / short call ${ss.call.strike:.2f} "
+            f"(+{ss.call.pct_otm:.1f}% OTM), off EWMA Yang-Zhang HV."
+        )
+
+    # Confluence callout — strikes landing on an EMA or S/R level are
+    # natural pin/magnet spots but also where price reacts; surface them.
+    confluence_lines: list[str] = []
+    for ss in strike_sets or []:
+        for leg in (ss.put, ss.call):
+            if leg is not None and leg.confluences:
+                confluence_lines.append(
+                    f"{ss.days_to_expiry}-day {leg.kind} ${leg.strike:.2f} sits near "
+                    f"{'; '.join(leg.confluences)}."
+                )
+    if confluence_lines:
+        obs.append(
+            "Strike confluence (within 0.5×ATR of structure — a magnet for "
+            "expiry but also a level price tends to react at): "
+            + " ".join(confluence_lines)
         )
 
     return obs

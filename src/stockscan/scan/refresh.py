@@ -67,9 +67,12 @@ class SignalsRefreshResult:
 
     bars_upserted: int  # rows upserted across all bulk-EOD calls
     bars_days_covered: int  # actual trading days the bulk loop iterated
-    strategies_run: int  # strategies whose scan completed (success or empty)
-    signals_emitted: int  # sum of passing across all strategies
-    rejected_count: int  # sum of rejected across all strategies
+    # Trading days whose bulk fetch failed (partial outage) — shown in the
+    # refresh banner so a half-complete catch-up is visible, not silent.
+    bars_failed_days: tuple[date, ...] = ()
+    strategies_run: int = 0  # strategies whose scan completed (success or empty)
+    signals_emitted: int = 0  # sum of passing across all strategies
+    rejected_count: int = 0  # sum of rejected across all strategies
     # True when the store already had the latest completed session, so the
     # bulk fetch AND strategy fan-out were skipped — a zero-API-cost no-op.
     up_to_date: bool = False
@@ -175,18 +178,26 @@ def refresh_signals(
         )
 
     bars_upserted = 0
-    if dates:
-        try:
-            bars_upserted = refresh_recent_days_bulk(
-                provider,
-                dates,
-                exchange="US",
-                filter_to=universe or None,
+    bars_failed_days: tuple[date, ...] = ()
+    try:
+        bulk = refresh_recent_days_bulk(
+            provider,
+            dates,
+            exchange="US",
+            filter_to=universe or None,
+        )
+        bars_upserted = bulk.upserted
+        bars_failed_days = bulk.failed_days
+        if bars_failed_days:
+            log.warning(
+                "scan refresh: %d of %d days failed to fetch (%s)",
+                len(bars_failed_days),
+                len(dates),
+                ", ".join(str(d) for d in bars_failed_days),
             )
-        except Exception as exc:  # provider hard-down; continue to scans anyway
-            log.exception("scan refresh: bulk bars fetch failed: %s", exc)
-    else:
-        log.info("scan refresh: no trading days in window (days_back=%d)", days_back)
+    except Exception as exc:  # provider hard-down; continue to scans anyway
+        log.exception("scan refresh: bulk bars fetch failed: %s", exc)
+        bars_failed_days = tuple(dates)
 
     # ------------------------------------------------------------------
     # Phase 2: Strategy fan-out.
@@ -212,6 +223,7 @@ def refresh_signals(
     result = SignalsRefreshResult(
         bars_upserted=bars_upserted,
         bars_days_covered=len(dates),
+        bars_failed_days=bars_failed_days,
         strategies_run=len(summaries),
         signals_emitted=sum(s.signals_emitted for s in summaries),
         rejected_count=sum(s.rejected_count for s in summaries),

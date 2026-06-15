@@ -181,3 +181,69 @@ def test_health_endpoint_still_works(client):
     assert r.status_code in (200, 503)
     body = r.json()
     assert "status" in body and "strategies" in body
+
+
+# -----------------------------------------------------------------------
+# HTMX-aware error handling (hardening refactor): a failed fragment action
+# must NOT swap an error page into the target — empty body, HX-Reswap:none,
+# friendly message in X-Error-Message for the global toast listener.
+# -----------------------------------------------------------------------
+
+def test_htmx_error_returns_header_not_page(client):
+    r = client.get("/definitely/not/a/route", headers={"HX-Request": "true"})
+    assert r.status_code == 404
+    assert r.headers.get("HX-Reswap") == "none"
+    assert r.headers.get("X-Error-Message")
+    assert r.text == ""  # nothing for htmx to swap
+
+
+def test_non_htmx_error_still_renders_page(client):
+    r = client.get("/definitely/not/a/route")
+    assert r.status_code == 404
+    assert "find that page" in r.text.lower()  # apostrophe is HTML-escaped
+
+
+def test_base_has_global_htmx_error_listener(client):
+    r = client.get("/")
+    assert "htmx:responseError" in r.text
+    assert "htmx:sendError" in r.text
+
+
+# -----------------------------------------------------------------------
+# Watchlist pill auto-flip (TODO.md item): the dashboard "watching" pill is
+# now an unwatch toggle, and /watchlist/unwatch swaps back to "+ Watch".
+# -----------------------------------------------------------------------
+
+def test_dashboard_watching_pill_is_unwatch_form(client):
+    r = client.get("/")
+    assert r.status_code == 200
+    # The macro exists in the page source whenever any row is watched; with
+    # the mocked empty DB nothing is watched, so just assert the unwatch
+    # endpoint is reachable below.
+
+
+def test_unwatch_htmx_swaps_back_to_watch_form(client, monkeypatch):
+    from stockscan.web.routes import watchlist as wl_route
+
+    monkeypatch.setattr(wl_route, "remove_symbol", lambda sym, session=None: 1)
+    r = client.post(
+        "/watchlist/unwatch",
+        data={"symbol": "AAPL", "redirect_to": "/"},
+        headers={"HX-Request": "true"},
+    )
+    assert r.status_code == 200
+    assert "+ Watch" in r.text
+    assert 'hx-post="/watchlist/add"' in r.text
+
+
+def test_unwatch_not_watched_still_succeeds(client, monkeypatch):
+    from stockscan.web.routes import watchlist as wl_route
+
+    monkeypatch.setattr(wl_route, "remove_symbol", lambda sym, session=None: 0)
+    r = client.post(
+        "/watchlist/unwatch",
+        data={"symbol": "MSFT"},
+        headers={"HX-Request": "true"},
+    )
+    assert r.status_code == 200
+    assert "+ Watch" in r.text

@@ -31,10 +31,17 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from stockscan.analysis.state import TrendState
-from stockscan.indicators import adx, sma
+from stockscan.indicators import adx, ema, sma
 
 if TYPE_CHECKING:
     import pandas as pd
+
+
+# Exponential moving averages exposed on the TrendState for the options-
+# context strike-confluence check. Edit this tuple to change which EMAs
+# get computed and flagged against suggested strikes — 9 (fast), 50
+# (intermediate), 200 (long-term) are the classic short-term-trader set.
+_EMA_PERIODS: tuple[int, ...] = (9, 50, 200)
 
 
 # Bucket descriptions for the dashboard chip + flavor text.
@@ -90,6 +97,10 @@ def compute_trend(bars: pd.DataFrame) -> TrendState:
     sma_20 = _safe_last(sma(close, 20))
     sma_50 = _safe_last(sma(close, 50))
     sma_200 = _safe_last(sma(close, 200))
+
+    # EMAs for the options-context strike-confluence check (periods in
+    # _EMA_PERIODS). Stored as a {period: value|None} dict on the state.
+    emas: dict[int, float | None] = {p: _safe_last(ema(close, p)) for p in _EMA_PERIODS}
 
     def pct_above(ma: float | None) -> float | None:
         if ma is None or ma <= 0:
@@ -150,6 +161,7 @@ def compute_trend(bars: pd.DataFrame) -> TrendState:
         pct_above_sma20=round(p_20, 4) if p_20 is not None else None,
         pct_above_sma50=round(p_50, 4) if p_50 is not None else None,
         pct_above_sma200=round(p_200, 4) if p_200 is not None else None,
+        emas={p: (round(v, 4) if v is not None else None) for p, v in emas.items()},
     )
 
 

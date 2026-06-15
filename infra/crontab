@@ -1,0 +1,16 @@
+# stockscan scheduled jobs — run by supercronic inside the `scheduler`
+# compose service (see docker-compose.yml). The container's TZ is
+# America/New_York, so these times read in ET, matching the launchd
+# templates this replaces on non-Mac hosts.
+#
+# Edit + `docker compose restart scheduler` to apply changes.
+
+# Nightly: refresh bars -> sector composites -> scan all strategies ->
+# watchlist alerts -> regime -> summary notification. M-F 20:00 ET.
+0 20 * * 1-5 stockscan jobs nightly-scan
+
+# Daily logical DB backup (pg_dump, rotated). 02:00 ET.
+0 2 * * * /app/infra/scripts/db_backup_compose.sh
+
+# Weekly fundamentals refresh (most fields change quarterly). Sun 03:00 ET.
+0 3 * * 0 stockscan refresh fundamentals --current-only

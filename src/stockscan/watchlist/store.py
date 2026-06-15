@@ -410,6 +410,24 @@ def remove_from_watchlist(watchlist_id: int, *, session: Session | None = None) 
         _run(s)
 
 
+def remove_symbol(symbol: str, *, session: Session | None = None) -> int:
+    """Remove every watchlist entry for ``symbol`` (across all lists).
+
+    Backs the Dashboard pill's click-to-unwatch toggle, which knows the
+    symbol but not the watchlist_id. Returns the number of rows removed
+    so the caller can distinguish "removed" from "wasn't watched".
+    """
+    sql = text("DELETE FROM watchlist_items WHERE UPPER(symbol) = UPPER(:sym)")
+
+    def _run(s: Session) -> int:
+        return s.execute(sql, {"sym": symbol.strip()}).rowcount or 0
+
+    if session is not None:
+        return _run(session)
+    with session_scope() as s:
+        return _run(s)
+
+
 def set_target(
     watchlist_id: int,
     target_price: Decimal | None,

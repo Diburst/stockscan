@@ -202,3 +202,100 @@ def avg_dollar_volume(close: pd.Series, volume: pd.Series, period: int = 20) -> 
     return (close.astype(float) * volume.astype(float)).rolling(
         window=period, min_periods=period
     ).mean()
+
+
+# ---------------------------------------------------------------------
+# Realized volatility — Yang-Zhang (OHLC range estimator)
+# ---------------------------------------------------------------------
+# Close-to-close vol throws away the high and low of every bar. Yang-Zhang
+# (2000) combines three pieces — the overnight gap (open vs prior close),
+# the open-to-close drift, and the drift-free Rogers-Satchell intraday
+# range — into one estimator that is both drift-independent and handles
+# the overnight jumps single stocks gap on. At equal sample size it is
+# several times more statistically efficient than close-to-close, so the
+# same bars yield a steadier, less noisy σ.
+#
+# Both functions return *annualised* vol as a fraction (0.30 = 30%), a
+# Series aligned to the input index with NaN warmup. Everything is
+# vectorised (rolling / ewm run in C) — no per-cell Python loops.
+
+
+def _yang_zhang_components(
+    open_: pd.Series, high: pd.Series, low: pd.Series, close: pd.Series
+) -> tuple[pd.Series, pd.Series, pd.Series]:
+    """Per-bar Yang-Zhang inputs: (overnight, open-to-close, Rogers-Satchell).
+
+    ``o`` and ``c`` are log returns whose *variance* feeds the overnight
+    and open-close terms; ``rs`` is the per-bar Rogers-Satchell value whose
+    *mean* feeds the intraday term. The overnight term needs the prior
+    close, so the first row of ``o`` (and therefore every combined output)
+    is NaN.
+    """
+    o_ = np.log(open_.astype(float))
+    h_ = np.log(high.astype(float))
+    l_ = np.log(low.astype(float))
+    c_ = np.log(close.astype(float))
+    prev_c = c_.shift(1)
+
+    overnight = o_ - prev_c          # ln(O_t / C_{t-1})
+    open_close = c_ - o_             # ln(C_t / O_t)
+    u = h_ - o_                      # ln(H_t / O_t)
+    d = l_ - o_                      # ln(L_t / O_t)
+    rs = u * (u - open_close) + d * (d - open_close)  # Rogers-Satchell
+    return overnight, open_close, rs
+
+
+def _yang_zhang_k(n_eff: float) -> float:
+    """Yang-Zhang weighting constant k for an (effective) sample size."""
+    if n_eff <= 1:
+        return 0.0
+    return 0.34 / (1.34 + (n_eff + 1.0) / (n_eff - 1.0))
+
+
+def yang_zhang_volatility(
+    open_: pd.Series,
+    high: pd.Series,
+    low: pd.Series,
+    close: pd.Series,
+    window: int,
+    *,
+    trading_periods: int = 252,
+) -> pd.Series:
+    """Rolling Yang-Zhang annualised volatility (fraction) over ``window`` bars."""
+    overnight, open_close, rs = _yang_zhang_components(open_, high, low, close)
+    # Overnight + open-close *variances*, Rogers-Satchell *mean*.
+    v_o = overnight.rolling(window=window, min_periods=window).var(ddof=1)
+    v_c = open_close.rolling(window=window, min_periods=window).var(ddof=1)
+    v_rs = rs.rolling(window=window, min_periods=window).mean()
+    k = _yang_zhang_k(float(window))
+    yz_var = v_o + k * v_c + (1.0 - k) * v_rs
+    yz_var = yz_var.clip(lower=0.0)
+    return np.sqrt(yz_var * trading_periods)
+
+
+def yang_zhang_volatility_ewm(
+    open_: pd.Series,
+    high: pd.Series,
+    low: pd.Series,
+    close: pd.Series,
+    *,
+    lam: float = 0.94,
+    trading_periods: int = 252,
+) -> pd.Series:
+    """EWMA Yang-Zhang annualised volatility (fraction), decay ``lam``.
+
+    Exponentially weights the per-bar components (most-recent bar heaviest),
+    the RiskMetrics convention. ``lam=0.94`` ≈ a 16-day centre of mass — a
+    responsive, forward-leaning vol estimate. The weighting constant ``k``
+    uses the EWMA effective sample size ``(1+lam)/(1-lam)``.
+    """
+    overnight, open_close, rs = _yang_zhang_components(open_, high, low, close)
+    alpha = 1.0 - lam
+    v_o = overnight.ewm(alpha=alpha, adjust=False).var(bias=False)
+    v_c = open_close.ewm(alpha=alpha, adjust=False).var(bias=False)
+    v_rs = rs.ewm(alpha=alpha, adjust=False).mean()
+    n_eff = (1.0 + lam) / (1.0 - lam)
+    k = _yang_zhang_k(n_eff)
+    yz_var = v_o + k * v_c + (1.0 - k) * v_rs
+    yz_var = yz_var.clip(lower=0.0)
+    return np.sqrt(yz_var * trading_periods)

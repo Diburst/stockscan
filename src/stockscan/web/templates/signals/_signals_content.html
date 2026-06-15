@@ -78,27 +78,34 @@ days={{ days }}&show_rejected={{ 'true' if show_rejected else 'false' }}
         {% endif %}
       </div>
     </div>
-    <form
-      hx-post="/signals/refresh?{{ _base_params() }}&sort={{ sort_key }}&dir={{ sort_dir }}"
-      hx-target="#signals-content"
-      hx-swap="outerHTML"
-      hx-disabled-elt="this"
-      hx-indicator="#signals-refresh-indicator"
-    >
-      <button
-        type="submit"
-        class="inline-flex items-center gap-1.5 text-xs px-3 py-1.5 rounded border border-ink-300 hover:bg-ink-100 transition-colors min-h-[36px] disabled:opacity-50 disabled:cursor-wait"
-        title="Backfill the last 7 days of bars and re-run all strategies"
+    {% if refresh_job_active %}
+      {# A background refresh is running — show the polling strip instead
+         of the button. It re-polls /signals/refresh/status every 2s and
+         the final poll swaps in the refreshed content. #}
+      {% include "signals/_refresh_status.html" %}
+    {% else %}
+      <form
+        hx-post="/signals/refresh?{{ _base_params() }}&sort={{ sort_key }}&dir={{ sort_dir }}"
+        hx-target="#signals-content"
+        hx-swap="outerHTML"
+        hx-disabled-elt="this"
+        hx-indicator="#signals-refresh-indicator"
       >
-        ⟳ Refresh
-      </button>
-      <span
-        id="signals-refresh-indicator"
-        class="htmx-indicator ml-2 text-xs text-ink-500 italic"
-      >
-        Backfilling bars + re-running scans…
-      </span>
-    </form>
+        <button
+          type="submit"
+          class="inline-flex items-center gap-1.5 text-xs px-3 py-1.5 rounded border border-ink-300 hover:bg-ink-100 transition-colors min-h-[36px] disabled:opacity-50 disabled:cursor-wait"
+          title="Backfill the last 7 days of bars and re-run all strategies (runs in the background)"
+        >
+          ⟳ Refresh
+        </button>
+        <span
+          id="signals-refresh-indicator"
+          class="htmx-indicator ml-2 text-xs text-ink-500 italic"
+        >
+          Starting background refresh…
+        </span>
+      </form>
+    {% endif %}
   </div>
 
   <!-- Refresh feedback / error banners -->
@@ -116,6 +123,12 @@ days={{ days }}&show_rejected={{ 'true' if show_rejected else 'false' }}
       {{ signals_refresh_summary.signals_emitted }} new
       ({{ signals_refresh_summary.rejected_count }} rejected) ·
       {{ signals_refresh_summary.duration_seconds }}s
+      {% if signals_refresh_summary.bars_failed_days %}
+        <div class="mt-1 text-warn-600">
+          ⚠ {{ signals_refresh_summary.bars_failed_days | length }} day{{ '' if signals_refresh_summary.bars_failed_days|length == 1 else 's' }} failed to fetch:
+          {{ signals_refresh_summary.bars_failed_days | join(", ") }}
+        </div>
+      {% endif %}
       {% if signals_refresh_summary.failures %}
         <div class="mt-1 text-bad-600">
           {{ signals_refresh_summary.failures | length }} strategy failure{{ '' if signals_refresh_summary.failures|length == 1 else 's' }}:

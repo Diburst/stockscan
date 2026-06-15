@@ -1,0 +1,26 @@
+{# Background-refresh polling strip.
+
+   Rendered (a) inside _signals_content.html when a refresh job is active,
+   and (b) standalone by GET /signals/refresh/status while the job runs —
+   the hx-get below replaces this element with the next poll's response
+   (default target = the element itself, outerHTML swap). When the job
+   completes, the status endpoint returns the full page content with
+   HX-Retarget: #signals-content so the final swap replaces everything.
+
+   Inputs:
+     refresh_qs      — query string preserving filter/sort state
+     refresh_elapsed — int seconds since the job started
+#}
+<div id="refresh-status"
+     hx-get="/signals/refresh/status?{{ refresh_qs }}"
+     hx-trigger="load delay:2s"
+     hx-swap="outerHTML"
+     class="inline-flex items-center gap-2 text-xs text-ink-500">
+  <span class="inline-block w-3.5 h-3.5 border-2 border-ink-300 border-t-ink-700 rounded-full animate-spin"
+        aria-hidden="true"></span>
+  <span role="status">
+    Refreshing in background — bars + strategies
+    {%- if refresh_elapsed and refresh_elapsed > 0 %} · {{ refresh_elapsed }}s{% endif %}
+    <span class="text-ink-400">(page stays usable)</span>
+  </span>
+</div>

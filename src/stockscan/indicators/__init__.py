@@ -27,6 +27,8 @@ from stockscan.indicators.ta import (
     rsi,
     sma,
     true_range,
+    yang_zhang_volatility,
+    yang_zhang_volatility_ewm,
 )
 from stockscan.indicators.trend import trend_location
 from stockscan.indicators.volume import volume_confirm
@@ -43,6 +45,8 @@ __all__ = [
     "rsi",
     "sma",
     "true_range",
+    "yang_zhang_volatility",
+    "yang_zhang_volatility_ewm",
     # --- primitives: chart studies ---
     "fibonacci_retracement",
     # --- primitives: reversal-composite building blocks ---

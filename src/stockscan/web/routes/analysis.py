@@ -41,7 +41,7 @@ log = logging.getLogger(__name__)
 
 @router.get("")
 @router.get("/")
-async def analysis_list(
+def analysis_list(
     request: Request,
     list: str | None = Query(None),
     s: Session = Depends(get_session),
@@ -90,7 +90,7 @@ async def analysis_list(
 
 
 @router.get("/{symbol}")
-async def analysis_detail(
+def analysis_detail(
     symbol: str,
     request: Request,
     s: Session = Depends(get_session),
@@ -173,7 +173,7 @@ async def analysis_detail(
 
 
 @router.post("/{symbol}/refresh-insider")
-async def analysis_refresh_insider(
+def analysis_refresh_insider(
     symbol: str,
     request: Request,
     s: Session = Depends(get_session),

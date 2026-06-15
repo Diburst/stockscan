@@ -7,32 +7,52 @@ SPY's close history backwards from ``as_of``.
     days since the ATH was made.
   * Days since the most recent 5%, 10%, and 20% correction — defined
     as the most recent date on which SPY closed >=N% below the
-    contemporaneous trailing ATH.
+    contemporaneous trailing ATH — together with where that gap ranks
+    against the distribution of *historical* gaps between corrections
+    in our window (a percentile, so "overdue" means something).
 
 These don't predict anything; they answer "where are we in the cycle?".
-The historical median gap between 10% corrections is ~290 trading
-days — a current gap of 600 days is in the 90th percentile of "overdue."
+Rather than compare the current dry spell to a hardcoded threshold, we
+build the empirical distribution of past inter-correction gaps from the
+same SPY history and report the current gap's percentile — e.g. a gap at
+the 90th percentile really is unusually long; one at the 55th is roughly
+typical.
 """
 
 from __future__ import annotations
 
+import statistics
 from dataclasses import dataclass
+from itertools import pairwise
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from datetime import date as _date
 
+    import numpy as np
     import pandas as pd
 
 
 @dataclass(frozen=True, slots=True)
 class CorrectionGap:
-    """Days since the most recent close at-least-X% below trailing ATH."""
+    """Days since the most recent close ≥X% below the trailing ATH, plus
+    where that gap ranks against the history of gaps between corrections.
+
+    ``gap_percentile`` is the share of *completed* historical gaps that were
+    shorter than the current ongoing one (0–100; higher = longer dry spell =
+    more genuinely "overdue"). ``n_historical_gaps`` is the sample size
+    behind it, and ``median_gap_days`` the historical median — both surfaced
+    so the percentile can be read honestly (a percentile over n=3 is noise).
+    All gaps are measured in calendar days, matching ``days_since``.
+    """
 
     threshold_pct: float  # 5.0, 10.0, 20.0
     available: bool
     days_since: int | None
     last_correction_date: _date | None
+    gap_percentile: float | None = None
+    n_historical_gaps: int | None = None
+    median_gap_days: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -109,31 +129,80 @@ def compute_drawdown_state(
 
 
 def _correction_gap(closes, threshold_pct: float) -> CorrectionGap:
-    """Walk backwards through ``closes`` and find the most recent bar
-    whose close was >= ``threshold_pct`` below the contemporaneous
-    trailing ATH.
+    """Days since the last ≥``threshold_pct`` correction + its percentile.
 
-    Returns the gap in calendar days. We use calendar days (not
-    trading days) so the number is intuitive against typical
-    "X days since the last correction" framing.
+    Identifies discrete correction *episodes* (so one long bear isn't
+    double-counted as many corrections), measures the calendar-day gaps
+    between consecutive episodes, and ranks the current ongoing gap against
+    that historical distribution. ``days_since`` itself is unchanged — it's
+    still calendar days since the most recent under-water bar.
     """
-    import pandas as pd  # noqa: F401 — used implicitly by closes accessors
-
     cum_max = closes.cummax()
-    drawdowns = (closes / cum_max - 1.0) * 100  # negative when below ATH
-    # Bars where drawdown was AT LEAST threshold_pct below.
-    breached = drawdowns[drawdowns <= -threshold_pct]
-    if breached.empty:
-        # Either insufficient history or never breached — return
-        # ``available=True`` with ``days_since=None`` to convey "no
-        # correction at this threshold in our history".
+    dd = ((closes / cum_max - 1.0) * 100.0).to_numpy()  # negative below ATH
+    episodes = _correction_episodes(dd, threshold_pct)
+    if not episodes:
+        # Insufficient history or never breached — convey "no correction at
+        # this threshold in our history".
         return CorrectionGap(threshold_pct, True, None, None)
-    last_breach_idx = breached.index[-1]
-    last_breach_date = last_breach_idx.date()
-    last_close_date = closes.index[-1].date()
+
+    index = closes.index
+    last_close_date = index[-1].date()
+    # Most recent episode's last under-water bar = the "last correction" bar.
+    last_corr_date = index[episodes[-1][1]].date()
+    days_since = (last_close_date - last_corr_date).days
+
+    # Completed historical gaps: end of one episode → start of the next.
+    gaps = [
+        (index[nxt[0]].date() - index[prev[1]].date()).days
+        for prev, nxt in pairwise(episodes)
+    ]
+    gap_percentile: float | None = None
+    median_gap: int | None = None
+    if gaps:
+        median_gap = round(statistics.median(gaps))
+        gap_percentile = sum(1 for g in gaps if g <= days_since) / len(gaps) * 100.0
+
     return CorrectionGap(
         threshold_pct=threshold_pct,
         available=True,
-        days_since=(last_close_date - last_breach_date).days,
-        last_correction_date=last_breach_date,
+        days_since=days_since,
+        last_correction_date=last_corr_date,
+        gap_percentile=round(gap_percentile, 1) if gap_percentile is not None else None,
+        n_historical_gaps=len(gaps) if gaps else None,
+        median_gap_days=median_gap,
     )
+
+
+def _correction_episodes(dd: np.ndarray, threshold_pct: float) -> list[tuple[int, int]]:
+    """Group bars into discrete correction episodes as (start_i, end_i).
+
+    A bar is "in correction" when its drawdown from the trailing ATH is
+    ≤ −``threshold_pct``. Consecutive in-correction bars belong to the same
+    episode; the episode only *ends* once price recovers to within half the
+    threshold of the high (drawdown back above −``threshold_pct``/2). That
+    reset rule keeps a single choppy bear — which can dip below the line,
+    bounce, and dip again — as one correction rather than several, while
+    still separating genuinely distinct corrections.
+
+    ``start_i`` is the first under-water bar; ``end_i`` is the last
+    under-water bar of that episode. A trailing episode still under water at
+    the end of the data is included (its ``end_i`` is the final breach bar).
+    Pure index math over a NumPy array — one cheap pass, no pandas per-cell.
+    """
+    reset = -threshold_pct / 2.0
+    episodes: list[tuple[int, int]] = []
+    in_episode = False
+    start_i = end_i = 0
+    for i in range(dd.shape[0]):
+        d = dd[i]
+        if d <= -threshold_pct:
+            if not in_episode:
+                in_episode = True
+                start_i = i
+            end_i = i
+        elif in_episode and d >= reset:
+            episodes.append((start_i, end_i))
+            in_episode = False
+    if in_episode:
+        episodes.append((start_i, end_i))
+    return episodes

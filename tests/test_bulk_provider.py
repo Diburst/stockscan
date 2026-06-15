@@ -71,3 +71,33 @@ def test_trading_days_since_none_uses_recent_window():
     days = trading_days_since(None, date(2024, 1, 8))
     # Should be 1-2 trading days max (10 calendar day fallback − weekends)
     assert len(days) >= 1
+
+
+# -----------------------------------------------------------------------
+# Partial-failure reporting (hardening refactor): one bad day must not
+# abort the refresh, and must be visible in the result.
+# -----------------------------------------------------------------------
+
+def test_bulk_refresh_reports_failed_days(monkeypatch):
+    import datetime as _dt
+
+    from stockscan.data.backfill import refresh_recent_days_bulk
+
+    class _FlakyProvider:
+        def get_eod_bulk(self, d, *, exchange="US", symbols=None):
+            if d.day == 2:
+                raise RuntimeError("provider hiccup")
+            return []
+
+    upserts: list[int] = []
+    monkeypatch.setattr(
+        "stockscan.data.store.upsert_bars", lambda rows: upserts.append(len(rows)) or len(rows)
+    )
+
+    days = [_dt.date(2026, 6, 1), _dt.date(2026, 6, 2), _dt.date(2026, 6, 3)]
+    result = refresh_recent_days_bulk(_FlakyProvider(), days)
+    assert result.failed_days == (_dt.date(2026, 6, 2),)
+    assert result.upserted == 0  # empty payloads → nothing upserted
+    assert not result.ok
+    assert int(result) == 0
+    assert 5 + result == 5  # __radd__ keeps `total += result` call sites working

@@ -30,7 +30,7 @@ log = logging.getLogger(__name__)
 
 
 @router.post("/signals/{signal_id}/paper-trade")
-async def create_paper_trade(
+def create_paper_trade(
     signal_id: int,
     request: Request,
     entry_price: str = Form(...),
@@ -167,7 +167,7 @@ async def create_paper_trade(
 
 
 @router.post("/paper-trades/{paper_trade_id}/close")
-async def close_paper_trade_endpoint(
+def close_paper_trade_endpoint(
     paper_trade_id: int,
     request: Request,
     exit_price: str = Form(...),
@@ -220,7 +220,7 @@ async def close_paper_trade_endpoint(
 
 
 @router.get("/paper-trades/{paper_trade_id}")
-async def paper_trade_detail(
+def paper_trade_detail(
     paper_trade_id: int,
     request: Request,
     s: Session = Depends(get_session),

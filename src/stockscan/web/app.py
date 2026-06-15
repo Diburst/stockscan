@@ -7,14 +7,20 @@ Phase 2: dashboard, signals, trades, backtests, base-rates, strategies, manual
 from __future__ import annotations
 
 import logging
+import time
 from http import HTTPStatus
 
+from pathlib import Path
+
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
+from fastapi.staticfiles import StaticFiles
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from stockscan import __version__
+from stockscan.config import config_warnings, settings
 from stockscan.db import healthcheck
+from stockscan.logging_setup import setup_logging
 from stockscan.strategies import STRATEGY_REGISTRY, discover_strategies
 from stockscan.web.deps import render
 from stockscan.web.routes import (
@@ -86,6 +92,11 @@ def _friendly_message(code: int, fallback: str = "") -> str:
     return fallback or "An unexpected error occurred."
 
 
+def _is_htmx(request: Request) -> bool:
+    """True when the request came from an HTMX fragment action."""
+    return request.headers.get("hx-request", "").lower() == "true"
+
+
 def _render_error(
     request: Request,
     *,
@@ -94,6 +105,21 @@ def _render_error(
 ) -> JSONResponse | object:
     label = _status_label(status_code)
     message = _friendly_message(status_code, fallback=detail or "")
+    if _is_htmx(request):
+        # An HTMX action failed. Swapping a full error page into a small
+        # fragment target would mangle the page — instead return an empty
+        # body with HX-Reswap:none and carry the friendly message in a
+        # header. The global htmx:responseError listener in base.html
+        # reads it and shows an error toast; the page stays intact.
+        return Response(
+            status_code=status_code,
+            headers={
+                "HX-Reswap": "none",
+                # Header values must be latin-1; the message is ASCII but
+                # encode defensively in case a detail sneaks unicode in.
+                "X-Error-Message": message.encode("ascii", "replace").decode("ascii"),
+            },
+        )
     if not _wants_html(request):
         return JSONResponse(
             {"status": label, "code": status_code, "detail": detail or message},
@@ -123,6 +149,9 @@ def _render_error(
 
 
 def create_app() -> FastAPI:
+    """Build the FastAPI app: logging, middleware, error handlers, routers."""
+    setup_logging(component="web")
+
     # FastAPI's auto-Swagger has been moved from /docs to /api-docs so the
     # /docs path can host the in-app documentation hub (rendered markdown +
     # CLI reference). The OpenAPI JSON moves to /api-openapi.json for the
@@ -136,10 +165,54 @@ def create_app() -> FastAPI:
         openapi_url="/api-openapi.json",
     )
 
+    # Self-hosted assets (Tailwind build + htmx) — see base.html. Keeps the
+    # UI fully functional with zero internet access.
+    app.mount(
+        "/static",
+        StaticFiles(directory=Path(__file__).parent / "static"),
+        name="static",
+    )
+
     @app.on_event("startup")
     async def _startup() -> None:
         # Auto-discover strategies on boot.
         discover_strategies()
+        # Announce degraded capabilities once, loudly, at boot.
+        if not settings.is_test:
+            for warning in config_warnings():
+                log.warning("config: %s", warning)
+
+    # ------------------------------------------------------------------
+    # Request timing — one line per request, WARNING above the slow
+    # threshold. This is the primary latency instrument (DESIGN-level
+    # decision: measure before optimizing). /health is logged at DEBUG so
+    # container healthchecks don't flood INFO.
+    # ------------------------------------------------------------------
+    @app.middleware("http")
+    async def _request_timing(request: Request, call_next):  # type: ignore[no-untyped-def]
+        start = time.perf_counter()
+        try:
+            response = await call_next(request)
+        except Exception:
+            elapsed_ms = (time.perf_counter() - start) * 1000
+            log.warning(
+                "%s %s -> EXC in %.0fms",
+                request.method,
+                request.url.path,
+                elapsed_ms,
+            )
+            raise
+        elapsed_ms = (time.perf_counter() - start) * 1000
+        response.headers["X-Response-Time"] = f"{elapsed_ms:.0f}ms"
+        line = "%s %s -> %d in %.0fms"
+        args = (request.method, request.url.path, response.status_code, elapsed_ms)
+        if request.url.path == "/health":
+            log.debug(line, *args)
+        elif elapsed_ms >= settings.slow_request_ms:
+            log.warning(line + " [slow]", *args)
+        else:
+            log.info(line, *args)
+        return response
 
     @app.exception_handler(StarletteHTTPException)
     async def _http_exception_handler(

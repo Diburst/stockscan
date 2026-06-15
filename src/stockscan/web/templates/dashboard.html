@@ -3,13 +3,25 @@
 
 {% block title %}Dashboard{% endblock %}
 
-{# Render either the "+ Watch" form (HTMX-enabled) or a static "watching" pill,
-   depending on whether the symbol is already on the watchlist. The pill
-   markup MUST match what /watchlist/add returns to HTMX so the look is
-   identical pre- and post-click. #}
+{# Render either the "+ Watch" form or the "✓ watching" unwatch toggle,
+   depending on whether the symbol is already on the watchlist. Both states
+   are HTMX forms that swap into each other in place; the markup MUST match
+   what /watchlist/add and /watchlist/unwatch return to HTMX so the look is
+   identical pre- and post-click (see _watching_snippet/_watch_form_snippet
+   in web/routes/watchlist.py). #}
 {% macro watch_button(symbol, redirect_to="/", watching=set()) %}
   {% if symbol in watching %}
-    <span class="text-xs px-2 py-1 rounded bg-ok-100 text-ok-600 border border-ok-600/30 inline-block">✓ watching</span>
+    <form action="/watchlist/unwatch" method="post" class="inline"
+          hx-post="/watchlist/unwatch"
+          hx-target="this"
+          hx-swap="outerHTML"
+          hx-disabled-elt="find button">
+      <input type="hidden" name="symbol" value="{{ symbol }}">
+      <input type="hidden" name="redirect_to" value="{{ redirect_to }}">
+      <button type="submit"
+              class="text-xs px-2 py-1 rounded bg-ok-100 text-ok-600 border border-ok-600/30 hover:bg-bad-100 hover:text-bad-600 hover:border-bad-600/30 disabled:opacity-50 disabled:cursor-wait"
+              title="Click to remove {{ symbol }} from the watchlist">✓ watching</button>
+    </form>
   {% else %}
     <form action="/watchlist/add" method="post"
           hx-post="/watchlist/add"
@@ -156,8 +168,13 @@
           <div class="text-xs text-ink-500 mt-1 leading-snug">
             since 10% pullback:
             {% if dd.correction_10pct.days_since is not none %}
-              <span class="font-mono">{{ dd.correction_10pct.days_since }}d</span>
-              {% if dd.correction_10pct.days_since > 400 %}<span class="text-warn-600">overdue</span>{% endif %}
+              {%- set c10 = dd.correction_10pct -%}
+              <span class="font-mono">{{ c10.days_since }}d</span>
+              {% if c10.gap_percentile is not none %}
+                · {{ c10.gap_percentile|round|int }}th pct
+                {% if c10.gap_percentile >= 80 %}<span class="text-warn-600">overdue</span>{% endif %}
+                <span class="block text-ink-400">vs {{ c10.n_historical_gaps }} prior gaps · median {{ c10.median_gap_days }}d</span>
+              {% endif %}
             {% else %}<span class="text-ok-600">none on file</span>{% endif %}
           </div>
         {% else %}

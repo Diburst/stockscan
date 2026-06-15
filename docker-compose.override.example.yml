@@ -1,0 +1,15 @@
+# Optional local overrides. Copy to docker-compose.override.yml (gitignored;
+# compose merges it automatically) when you want host access to Postgres —
+# e.g. psql, a GUI client, or running the bare-metal CLI against the
+# containerized DB.
+#
+#   cp docker-compose.override.example.yml docker-compose.override.yml
+#   docker compose up -d db
+#   psql "postgresql://stockscan:<password>@127.0.0.1:5432/stockscan"
+#
+# Loopback-only on purpose — never expose 5432 to the LAN.
+
+services:
+  db:
+    ports:
+      - "127.0.0.1:5432:5432"

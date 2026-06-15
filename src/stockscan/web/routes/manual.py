@@ -101,11 +101,21 @@ _DOCS: tuple[_DocEntry, ...] = (
         filename="TODO.md",
     ),
     _DocEntry(
-        slug="migration",
-        title="Migrations",
+        slug="deploy",
+        title="Deployment",
         subtitle=(
-            "How the custom SQL migration runner works, the rules for "
-            "writing new migrations, and what the runner won't do."
+            "Docker Compose deployment to any host (db + migrate + web + "
+            "scheduler), day-2 operations, and the legacy macOS/launchd path."
+        ),
+        filename="DEPLOY.md",
+    ),
+    _DocEntry(
+        slug="migration",
+        title="Host Migration",
+        subtitle=(
+            "Moving the project and its database to a new machine: rsync "
+            "rules, pg_dump/pg_restore recipes, what travels and what "
+            "stays machine-local."
         ),
         filename="MIGRATION.md",
     ),
@@ -133,7 +143,7 @@ def _docs_by_slug() -> dict[str, _DocEntry]:
 
 @router.get("")
 @router.get("/")
-async def docs_index(request: Request):
+def docs_index(request: Request):
     """Linked-card index of every doc + the CLI reference."""
     return render(
         request,
@@ -143,7 +153,7 @@ async def docs_index(request: Request):
 
 
 @router.get("/cli")
-async def docs_cli(request: Request):
+def docs_cli(request: Request):
     """Auto-generated CLI reference page.
 
     Walks the Typer app's Click command tree and captures the
@@ -162,7 +172,7 @@ async def docs_cli(request: Request):
 
 
 @router.get("/{slug}")
-async def docs_render(slug: str, request: Request):
+def docs_render(slug: str, request: Request):
     """Render a registered markdown file as HTML."""
     entry = _docs_by_slug().get(slug)
     if entry is None:
