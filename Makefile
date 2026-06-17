@@ -1,6 +1,10 @@
 .PHONY: help install sync db-up db-down db-init db-migrate db-status db-verify db-reset \
-        test test-int lint fmt typecheck check run-web shell clean \
+        test test-int lint fmt typecheck check run-web run-web-local run-mcp-local shell clean \
         css docker-build docker-up docker-down docker-logs
+
+# Local uvicorn bind for run-web; tailscale serve proxies HTTPS:443 to this.
+WEB_HOST ?= 127.0.0.1
+WEB_PORT ?= 8000
 
 help:
 	@echo "Stockscan dev targets:"
@@ -19,7 +23,9 @@ help:
 	@echo "  fmt           Run ruff format"
 	@echo "  typecheck     Run mypy"
 	@echo "  check         Run lint + typecheck + tests"
-	@echo "  run-web       Run the FastAPI dev server"
+	@echo "  run-web       Run web + MCP, exposed over HTTPS on your tailnet (for AI clients)"
+	@echo "  run-web-local Run the plain FastAPI dev server (no MCP, no tailscale)"
+	@echo "  run-mcp-local Run web + MCP on http://localhost:8000 (no tailscale, no auth)"
 	@echo "  css           Rebuild the Tailwind stylesheet (web/static/app.css)"
 	@echo "  shell         Open a Python shell with app context loaded"
 	@echo "  clean         Remove caches and build artifacts"
@@ -83,8 +89,43 @@ typecheck:
 
 check: lint typecheck test
 
+# Run the web app AND the MCP server, exposed over HTTPS on your tailnet so AI
+# clients (e.g. Claude Desktop) can connect. uvicorn binds to localhost; Tailscale
+# Serve terminates TLS with a valid *.ts.net cert and proxies to it. The tailnet
+# hostname (and thus the OAuth issuer URL) is derived automatically — override by
+# exporting STOCKSCAN_MCP_BASE_URL. Set STOCKSCAN_MCP_ALLOW_WRITES=true to also
+# expose the mutating tools. For plain local dev without any of this, use
+# `make run-web-local`.
 run-web:
-	uv run uvicorn stockscan.web.app:app --reload --host 0.0.0.0 --port 8000
+	@command -v tailscale >/dev/null 2>&1 || { \
+	  echo "ERROR: tailscale not found. Install it, or use 'make run-web-local' for plain local dev."; exit 1; }
+	@TS_HOST=$$(tailscale status --json 2>/dev/null | python3 -c "import json,sys; print(json.load(sys.stdin)['Self']['DNSName'].rstrip('.'))" 2>/dev/null); \
+	if [ -z "$$TS_HOST" ]; then \
+	  echo "ERROR: could not read your tailnet hostname (is tailscaled running and logged in?)."; \
+	  echo "       Run 'tailscale up', or use 'make run-web-local'."; exit 1; \
+	fi; \
+	BASE_URL=$${STOCKSCAN_MCP_BASE_URL:-https://$$TS_HOST}; \
+	echo "→ Exposing $(WEB_HOST):$(WEB_PORT) over HTTPS on your tailnet via Tailscale Serve…"; \
+	tailscale serve --bg http://$(WEB_HOST):$(WEB_PORT); \
+	echo "→ stockscan UI + MCP live at $$BASE_URL"; \
+	echo "  Add this URL as a custom connector in Claude:  $$BASE_URL/mcp"; \
+	echo "  (view/stop sharing later: 'tailscale serve status' / 'tailscale serve reset')"; \
+	STOCKSCAN_MCP_ENABLED=true STOCKSCAN_MCP_BASE_URL=$$BASE_URL \
+	  uv run uvicorn stockscan.web.app:app --reload --host $(WEB_HOST) --port $(WEB_PORT)
+
+# Plain dev server: no MCP, no tailscale. Forces MCP off so a leftover
+# STOCKSCAN_MCP_ENABLED=true in .env can't pull in the MCP server here.
+run-web-local:
+	STOCKSCAN_MCP_ENABLED=false uv run uvicorn stockscan.web.app:app --reload --host 0.0.0.0 --port 8000
+
+# Web + MCP for a same-machine setup: no tailscale, no HTTPS, no OAuth. Binds to
+# 127.0.0.1 only (localhost is exempt from the OAuth HTTPS rule, and binding to
+# loopback keeps the unauthenticated endpoint off your LAN). Connect a client on
+# THIS machine to http://localhost:8000/mcp. Set STOCKSCAN_MCP_ALLOW_WRITES=true
+# to also expose the write tools. Needs the mcp extra: `uv sync --all-extras`.
+run-mcp-local:
+	STOCKSCAN_MCP_ENABLED=true STOCKSCAN_MCP_AUTH=none \
+	  uv run uvicorn stockscan.web.app:app --reload --host 127.0.0.1 --port 8000
 
 # Rebuild the self-hosted Tailwind stylesheet after template/theme changes.
 # Uses npx so no permanent node_modules is needed; the Docker build runs the

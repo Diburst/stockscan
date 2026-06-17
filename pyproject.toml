@@ -59,6 +59,13 @@ ml = [
     "xgboost>=2.1",
     "scikit-learn>=1.5",
 ]
+mcp = [
+    # MCP server (stockscan.mcp): exposes signals/watchlist/scans/analysis to AI
+    # agents over the Model Context Protocol. Only needed when
+    # STOCKSCAN_MCP_ENABLED=true or the `stockscan mcp` CLI is used; the core
+    # web app and CLI never import it otherwise.
+    "fastmcp>=3.4,<4",
+]
 
 [dependency-groups]
 dev = [

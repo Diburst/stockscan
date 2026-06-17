@@ -11,7 +11,6 @@ Endpoints:
 from __future__ import annotations
 
 import logging
-from datetime import date, timedelta
 from typing import Any
 
 from fastapi import APIRouter, Depends, Query, Request
@@ -26,10 +25,10 @@ from stockscan.scan.refresh_job import (
     current_job as current_refresh_job,
     start_refresh,
 )
+from stockscan.signals import SORT_COLUMNS, query_signals
 from stockscan.strategies import (
     STRATEGY_REGISTRY,
     Strategy,
-    current_version_filter,
     discover_strategies,
 )
 from stockscan.web.deps import (
@@ -57,16 +56,9 @@ def _to_float(v: str | None) -> float | None:
     return float(v)
 
 
-_SORT_COLUMNS: dict[str, str] = {
-    "symbol": "s.symbol",
-    "strategy": "s.strategy_name",
-    "score": "s.score",
-    "entry": "s.suggested_entry",
-    "stop": "s.suggested_stop",
-    "qty": "s.suggested_qty",
-    "date": "s.as_of_date",
-    "side": "s.side",
-}
+# Sort columns now live on the signals service (single home for the query
+# contract); kept here only for the template's valid-sort-key echo.
+_SORT_COLUMNS = SORT_COLUMNS
 
 
 def _query_signals_view(
@@ -84,67 +76,26 @@ def _query_signals_view(
     sort: str | None = None,
     sort_dir: str | None = None,
 ) -> dict[str, Any]:
-    """Run the signals SELECT and bundle the template context.
+    """Bundle the template context for the signals list view.
 
-    Extracted from the GET handler so the POST /refresh endpoint can
-    re-render the same view without duplicating SQL. Returns the dict
-    of kwargs that gets splatted into ``render()``.
+    The SELECT itself lives in :func:`stockscan.signals.query_signals` so the
+    POST /refresh endpoint and the MCP ``list_signals`` tool share one query.
+    This helper only splits passing/rejected and adds the template-specific
+    bits (strategy registry, freshness, filter/sort echo state).
     """
-    discover_strategies()
-    cutoff = date.today() - timedelta(days=days)
-
-    where = ["s.as_of_date >= :d"]
-    params: dict[str, object] = {"d": cutoff}
-    if strategy:
-        where.append("s.strategy_name = :strat")
-        params["strat"] = strategy
-    if not show_rejected:
-        where.append("s.status = 'new'")
-
-    # Symbol search filter
-    if symbol:
-        where.append("UPPER(s.symbol) LIKE UPPER(:sym_filter)")
-        params["sym_filter"] = f"%{symbol}%"
-
-    # Side filter
-    if side and side in ("long", "short"):
-        where.append("s.side = :side_filter")
-        params["side_filter"] = side
-
-    # Score range filters
-    if score_min is not None:
-        where.append("s.score >= :score_min")
-        params["score_min"] = score_min
-    if score_max is not None:
-        where.append("s.score <= :score_max")
-        params["score_max"] = score_max
-
-    # Restrict to the CURRENT registered version of each strategy.
-    version_clause, version_params = current_version_filter(prefix="s")
-    where.append(version_clause)
-    params.update(version_params)
-
-    # Sorting
-    sort_key = sort if sort in _SORT_COLUMNS else None
-    direction = "ASC" if sort_dir == "asc" else "DESC"
-    if sort_key:
-        order_by = f"{_SORT_COLUMNS[sort_key]} {direction} NULLS LAST, s.signal_id DESC"
-    else:
-        order_by = "s.as_of_date DESC, s.status ASC, s.score DESC NULLS LAST"
-
-    sql = text(
-        f"""
-        SELECT s.signal_id, s.run_id, s.strategy_name, s.symbol, s.side,
-               s.score, s.status, s.as_of_date,
-               s.suggested_entry, s.suggested_stop, s.suggested_qty,
-               s.rejected_reason, s.metadata
-        FROM signals s
-        WHERE {" AND ".join(where)}
-        ORDER BY {order_by}
-        LIMIT 500
-        """
+    rows = query_signals(
+        session=s,
+        strategy=strategy,
+        days=days,
+        show_rejected=show_rejected,
+        symbol=symbol,
+        side=side,
+        score_min=score_min,
+        score_max=score_max,
+        sort=sort,
+        sort_dir=sort_dir,
     )
-    rows = s.execute(sql, params).all()
+    sort_key = sort if sort in _SORT_COLUMNS else None
     passing = [r for r in rows if r.status == "new"]
     rejected = [r for r in rows if r.status == "rejected"]
 

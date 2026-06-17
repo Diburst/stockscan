@@ -148,15 +148,42 @@ def _render_error(
         )
 
 
+def _boot() -> None:
+    """Startup work shared by both the on_event and lifespan code paths."""
+    # Auto-discover strategies on boot.
+    discover_strategies()
+    # Announce degraded capabilities once, loudly, at boot.
+    if not settings.is_test:
+        for warning in config_warnings():
+            log.warning("config: %s", warning)
+
+
 def create_app() -> FastAPI:
     """Build the FastAPI app: logging, middleware, error handlers, routers."""
     setup_logging(component="web")
+
+    # Optionally build the MCP server's streamable-HTTP app. Imported lazily so
+    # the core app never depends on fastmcp unless STOCKSCAN_MCP_ENABLED is set.
+    mcp_app = None
+    if settings.mcp_enabled:
+        try:
+            from stockscan.mcp.server import build_mcp_http_app
+
+            mcp_app = build_mcp_http_app()
+        except ModuleNotFoundError as exc:
+            if (exc.name or "").split(".")[0] != "fastmcp":
+                raise
+            raise RuntimeError(
+                "STOCKSCAN_MCP_ENABLED is true but the 'mcp' extra isn't installed. "
+                "Install it with `uv sync --all-extras` (or `uv pip install fastmcp`), "
+                "or set STOCKSCAN_MCP_ENABLED=false (e.g. run `make run-web-local`)."
+            ) from exc
 
     # FastAPI's auto-Swagger has been moved from /docs to /api-docs so the
     # /docs path can host the in-app documentation hub (rendered markdown +
     # CLI reference). The OpenAPI JSON moves to /api-openapi.json for the
     # same reason.
-    app = FastAPI(
+    fastapi_kwargs: dict[str, object] = dict(
         title="stockscan",
         version=__version__,
         description="Personal swing-trading scanner, backtester, and position manager",
@@ -165,6 +192,26 @@ def create_app() -> FastAPI:
         openapi_url="/api-openapi.json",
     )
 
+    if mcp_app is not None:
+        # A mounted ASGI app's lifespan is NOT auto-run by FastAPI, so the MCP
+        # session manager would never initialize. Chain it explicitly: do our
+        # boot work, then enter the MCP app's lifespan for the server's life.
+        from contextlib import asynccontextmanager
+
+        @asynccontextmanager
+        async def _lifespan(app: FastAPI):  # type: ignore[no-untyped-def]
+            _boot()
+            async with mcp_app.lifespan(app):
+                yield
+
+        app = FastAPI(lifespan=_lifespan, **fastapi_kwargs)  # type: ignore[arg-type]
+    else:
+        app = FastAPI(**fastapi_kwargs)  # type: ignore[arg-type]
+
+        @app.on_event("startup")
+        async def _startup() -> None:
+            _boot()
+
     # Self-hosted assets (Tailwind build + htmx) — see base.html. Keeps the
     # UI fully functional with zero internet access.
     app.mount(
@@ -172,15 +219,6 @@ def create_app() -> FastAPI:
         StaticFiles(directory=Path(__file__).parent / "static"),
         name="static",
     )
-
-    @app.on_event("startup")
-    async def _startup() -> None:
-        # Auto-discover strategies on boot.
-        discover_strategies()
-        # Announce degraded capabilities once, loudly, at boot.
-        if not settings.is_test:
-            for warning in config_warnings():
-                log.warning("config: %s", warning)
 
     # ------------------------------------------------------------------
     # Request timing — one line per request, WARNING above the slow
@@ -260,6 +298,17 @@ def create_app() -> FastAPI:
     app.include_router(manual.router)
     app.include_router(analysis.router)
     app.include_router(regime.router)
+
+    # Graft the MCP app's concrete routes onto the FastAPI router: the message
+    # endpoint at settings.mcp_path (e.g. /mcp) and the OAuth + well-known routes
+    # at the root — exactly where MCP clients look for discovery. We add the
+    # individual routes (not app.mount("/", ...)) so that unknown paths still
+    # reach FastAPI's friendly 404 handler instead of being swallowed by a
+    # catch-all mount. Added after every web router, so the UI wins for its own
+    # paths. The MCP session manager is initialized by mcp_app.lifespan, chained
+    # into the FastAPI lifespan above.
+    if mcp_app is not None:
+        app.router.routes.extend(mcp_app.routes)
 
     return app
 

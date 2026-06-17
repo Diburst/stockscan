@@ -93,6 +93,22 @@ class Settings(BaseSettings):
     # stockscan.analysis.black_scholes.
     risk_free_rate: float = Field(0.04, alias="STOCKSCAN_RISK_FREE_RATE")
 
+    # ---- MCP server (stockscan.mcp) ----
+    # Off by default: the core web app and CLI never import fastmcp unless this
+    # is enabled or the `stockscan mcp` CLI is used.
+    mcp_enabled: bool = Field(False, alias="STOCKSCAN_MCP_ENABLED")
+    # Gate for mutating / expensive tools (watchlist edits, run_scan,
+    # refresh_data). Reads are always available; writes only when this is True.
+    mcp_allow_writes: bool = Field(False, alias="STOCKSCAN_MCP_ALLOW_WRITES")
+    # Auth mode for the remote HTTP transport: "oauth" (self-contained OAuth 2.1
+    # authorization server) or "none" (local stdio dev only — never expose).
+    mcp_auth: Literal["oauth", "none"] = Field("oauth", alias="STOCKSCAN_MCP_AUTH")
+    # Externally-reachable base URL of this server (e.g. the Tailscale hostname),
+    # used as the OAuth issuer/resource base. No trailing path.
+    mcp_base_url: str = Field("http://127.0.0.1:8000", alias="STOCKSCAN_MCP_BASE_URL")
+    # Mount path for the MCP endpoint on the FastAPI app.
+    mcp_path: str = Field("/mcp", alias="STOCKSCAN_MCP_PATH")
+
     @property
     def resolved_log_dir(self) -> Path:
         """Log directory as a Path — explicit setting or <repo_root>/logs."""

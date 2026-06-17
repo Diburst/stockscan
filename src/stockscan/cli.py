@@ -163,6 +163,10 @@ composites_app = typer.Typer(
     help="Equal-weight sector composites (for cross-sectional relative strength).",
     no_args_is_help=True,
 )
+mcp_app_cli = typer.Typer(
+    help="MCP server: expose stockscan tools (signals, watchlist, scans) to AI agents.",
+    no_args_is_help=True,
+)
 app.add_typer(db_app, name="db")
 app.add_typer(refresh_app, name="refresh")
 app.add_typer(strat_app, name="strategies")
@@ -174,6 +178,7 @@ app.add_typer(ml_app, name="ml")
 app.add_typer(signals_app, name="signals")
 app.add_typer(analysis_app, name="analysis")
 app.add_typer(composites_app, name="composites")
+app.add_typer(mcp_app_cli, name="mcp")
 
 
 # ----------------------------------------------------------------------
@@ -2017,6 +2022,76 @@ def composites_symbol_cmd(
         )
         raise typer.Exit(1)
     console.print(f"{symbol.upper()} → [cyan]{comp}[/cyan]")
+
+
+# ----------------------------------------------------------------------
+# MCP server
+# ----------------------------------------------------------------------
+@mcp_app_cli.command("serve")
+def mcp_serve(
+    transport: str = typer.Option(
+        "stdio", "--transport", "-t", help="'stdio' (local dev) or 'http' (remote)."
+    ),
+    host: str = typer.Option("127.0.0.1", "--host", help="HTTP bind host."),
+    port: int = typer.Option(8000, "--port", help="HTTP bind port."),
+    allow_writes: bool = typer.Option(
+        False, "--allow-writes", help="Expose mutating tools (watchlist edits, scans, refresh)."
+    ),
+) -> None:
+    """Run the MCP server.
+
+    stdio is the fast local-dev path (no auth) for connecting an agent on the
+    same machine. http runs the standalone streamable-HTTP server with the
+    configured auth (OAuth 2.1 by default — see STOCKSCAN_MCP_AUTH).
+
+    The primary remote deployment mounts MCP on the web app instead:
+    ``STOCKSCAN_MCP_ENABLED=true uvicorn stockscan.web.app:app`` serves it at
+    ``/mcp`` alongside the UI.
+    """
+    from stockscan.mcp.server import build_auth, build_server
+
+    writes = allow_writes or None  # None -> fall back to settings
+    if transport == "stdio":
+        # CRITICAL: stdio transport uses STDOUT exclusively for the JSON-RPC
+        # protocol. Anything else written to stdout corrupts the stream and the
+        # client fails to parse it. So log to stderr (never console.print here)
+        # and disable FastMCP's stdout banner.
+        log.info("MCP server on stdio (auth: none, local dev)")
+        server = build_server(allow_writes=writes, auth=None)
+        server.run(transport="stdio", show_banner=False)
+    elif transport == "http":
+        console.print(
+            f"[cyan]→[/cyan] MCP server on http://{host}:{port} (auth: {settings.mcp_auth})"
+        )
+        server = build_server(allow_writes=writes, auth=build_auth())
+        server.run(transport="http", host=host, port=port)
+    else:
+        console.print(f"[red]Unknown transport: {transport!r} (use stdio or http)[/red]")
+        raise typer.Exit(1)
+
+
+@mcp_app_cli.command("tools")
+def mcp_tools(
+    allow_writes: bool = typer.Option(
+        False, "--allow-writes", help="Also list the write tools."
+    ),
+) -> None:
+    """List the MCP tools that would be exposed (read tools always, writes if enabled)."""
+    from stockscan.mcp.server import READ_TOOLS, WRITE_TOOLS
+
+    writes = settings.mcp_allow_writes or allow_writes
+    table = Table(title="MCP tools")
+    table.add_column("Tool")
+    table.add_column("Kind")
+    table.add_column("Summary")
+    for fn in READ_TOOLS:
+        doc = (fn.__doc__ or "").strip().splitlines()[0] if fn.__doc__ else ""
+        table.add_row(fn.__name__, "[green]read[/green]", doc)
+    for fn in WRITE_TOOLS:
+        doc = (fn.__doc__ or "").strip().splitlines()[0] if fn.__doc__ else ""
+        kind = "[yellow]write[/yellow]" if writes else "[dim]write (disabled)[/dim]"
+        table.add_row(fn.__name__, kind, doc)
+    console.print(table)
 
 
 def main() -> None:

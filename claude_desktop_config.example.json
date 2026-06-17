@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "stockscan": {
+      "command": "/Users/Thomas/Projects/Claude/stockscan/.venv/bin/stockscan",
+      "args": ["mcp", "serve", "--transport", "stdio", "--allow-writes"]
+    }
+  }
+}
