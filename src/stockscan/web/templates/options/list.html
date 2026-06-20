@@ -1,0 +1,102 @@
+{% extends "base.html" %}
+{% block title %}Options{% endblock %}
+
+{% block content %}
+<div class="max-w-5xl mx-auto px-4 py-6">
+  <div class="flex items-baseline justify-between mb-4">
+    <h1 class="text-xl font-semibold">Options — proposed book</h1>
+    <span class="text-sm text-ink-400">
+      {{ as_of }} ·
+      {% if regime %}regime: {{ regime.regime }}
+        {% if regime.composite_score is not none %}({{ '%.2f'|format(regime.composite_score|float) }}){% endif %}
+      {% else %}regime: n/a{% endif %}
+      · {{ book|length }} of {{ candidates }} candidates
+    </span>
+  </div>
+
+  <p class="text-xs text-ink-400 mb-4">
+    Short-premium proposals, ranked. IV is a realized-vol proxy (not live implied
+    vol) — treat scores as relative and verify strikes on a live chain. Not advice.
+  </p>
+
+  {% if not book %}
+    <div class="text-ink-400 text-sm border border-ink-800 rounded p-6 text-center">
+      No qualifying proposals right now — no day-color triggers cleared the filters.
+    </div>
+  {% else %}
+    <div class="space-y-2">
+      {% for p in book %}
+      <div class="border border-ink-800 rounded-lg">
+        <!-- Summary row -->
+        <div class="p-3 flex items-center gap-4">
+          <div class="w-10 text-center">
+            <div class="text-xs text-ink-500">#{{ loop.index }}</div>
+            <div class="text-sm font-semibold">{{ '%.0f'|format(p.score * 100) }}</div>
+          </div>
+          <div class="w-28">
+            <a href="/analysis/{{ p.symbol }}" class="font-semibold hover:underline">{{ p.symbol }}</a>
+            {% if p.side == 'sell_call' %}
+              <span class="text-xs px-1.5 py-0.5 rounded bg-rose-900/40 text-rose-300">sell call</span>
+            {% else %}
+              <span class="text-xs px-1.5 py-0.5 rounded bg-emerald-900/40 text-emerald-300">sell put</span>
+            {% endif %}
+          </div>
+          <div class="flex-1 text-sm">
+            <div>
+              <span class="font-medium">{{ '%g'|format(p.strike) }}</span>
+              <span class="text-ink-400">({{ '%+.0f'|format(p.pct_otm) }}% OTM · {{ p.days_to_expiry }}d · {{ p.expiry_date }})</span>
+              {% if p.price_at_level %}
+                <span class="ml-1 text-xs px-1.5 py-0.5 rounded bg-amber-900/40 text-amber-300"
+                      title="Current price is sitting at this level now — the 'confirmed level' timing signal (context only, not scored).">
+                  ● price at {{ 'resistance' if p.side == 'sell_call' else 'support' }}
+                </span>
+              {% endif %}
+            </div>
+            <div class="text-xs text-ink-400">{{ p.rationale }}</div>
+          </div>
+          <div class="w-32 text-right text-xs text-ink-400">
+            <div>IV ~{{ '%.0f'|format(p.iv_pct) }}% · cr ${{ '%.2f'|format(p.est_credit * 100) }}</div>
+            <div>size {{ '%.2f'|format(p.size_weight) }}
+              {% if p.day_move_pct is not none %}· {{ '%+.1f'|format(p.day_move_pct) }}% today{% endif %}
+            </div>
+          </div>
+        </div>
+
+        <!-- Why this trade (expandable score derivation) -->
+        <details class="border-t border-ink-800/60 px-3 py-2 text-xs">
+          <summary class="cursor-pointer text-ink-400 hover:text-ink-200 select-none">Why this trade</summary>
+          <div class="mt-3 grid sm:grid-cols-2 gap-x-6 gap-y-3">
+            <div class="space-y-1.5">
+              {% for key, label, weight in score_inputs %}
+              {% set val = p.score_breakdown.get(key, 0) %}
+              <div>
+                <div class="flex justify-between text-ink-400">
+                  <span>{{ label }} <span class="text-ink-600">×{{ '%.2f'|format(weight) }}</span></span>
+                  <span class="tabular-nums">{{ '%.2f'|format(val) }} → {{ '%.3f'|format(val * weight) }}</span>
+                </div>
+                <div class="h-1 bg-ink-800 rounded">
+                  <div class="h-1 bg-sky-600 rounded" style="width: {{ (val * 100)|round }}%"></div>
+                </div>
+              </div>
+              {% endfor %}
+              <div class="flex justify-between pt-1 font-medium text-ink-200">
+                <span>Score</span><span class="tabular-nums">{{ '%.3f'|format(p.score) }}</span>
+              </div>
+            </div>
+            <div class="text-ink-400 space-y-1.5">
+              <div>Day move: <span class="text-ink-200">{% if p.day_move_pct is not none %}{{ '%+.1f'|format(p.day_move_pct) }}%{% else %}n/a{% endif %}</span> · trend <span class="text-ink-200">{{ p.trend_bucket }}</span></div>
+              <div>Strike δ ~{{ '%.2f'|format(p.delta) }} · {{ p.confluence_count }} level confluence(s)</div>
+              <div>{% if p.pct_to_threat is not none %}{{ '%.0f'|format(p.pct_to_threat) }}% to {{ 'resistance' if p.side == 'sell_call' else 'support' }}{% endif %}
+                {% if p.days_to_earnings is not none %} · earnings in {{ p.days_to_earnings }}d{% endif %}</div>
+              <div class="pt-1">
+                <a href="/analysis/{{ p.symbol }}" class="text-sky-400 hover:underline">Full analysis →</a>
+              </div>
+            </div>
+          </div>
+        </details>
+      </div>
+      {% endfor %}
+    </div>
+  {% endif %}
+</div>
+{% endblock %}

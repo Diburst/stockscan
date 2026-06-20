@@ -167,6 +167,10 @@ mcp_app_cli = typer.Typer(
     help="MCP server: expose stockscan tools (signals, watchlist, scans) to AI agents.",
     no_args_is_help=True,
 )
+options_app = typer.Typer(
+    help="Options-premium proposals: ranked short-put/short-call book.",
+    no_args_is_help=True,
+)
 app.add_typer(db_app, name="db")
 app.add_typer(refresh_app, name="refresh")
 app.add_typer(strat_app, name="strategies")
@@ -179,6 +183,7 @@ app.add_typer(signals_app, name="signals")
 app.add_typer(analysis_app, name="analysis")
 app.add_typer(composites_app, name="composites")
 app.add_typer(mcp_app_cli, name="mcp")
+app.add_typer(options_app, name="options")
 
 
 # ----------------------------------------------------------------------
@@ -2092,6 +2097,53 @@ def mcp_tools(
         kind = "[yellow]write[/yellow]" if writes else "[dim]write (disabled)[/dim]"
         table.add_row(fn.__name__, kind, doc)
     console.print(table)
+
+
+# ----------------------------------------------------------------------
+# Options proposals
+# ----------------------------------------------------------------------
+@options_app.command("propose")
+def options_propose(
+    n: int = typer.Option(30, "-n", "--limit", help="Max book size."),
+    min_score: float = typer.Option(0.0, "--min-score", help="Drop candidates below this score."),
+    list_id: int | None = typer.Option(None, "--list", help="Restrict to one watchlist list id."),
+    save: bool = typer.Option(False, "--save", help="Persist the run (needs migration 0022)."),
+) -> None:
+    """Generate and print the ranked short-premium options book."""
+    from stockscan.proposals import generate_book
+
+    run = generate_book(n=n, min_score=min_score, list_id=list_id)
+    reg = run.regime
+    label = reg.regime if reg is not None else "n/a"
+    console.print(
+        f"[cyan]→[/cyan] {run.as_of} | regime {label} | "
+        f"{len(run.book)} of {run.candidates} candidates"
+    )
+    table = Table(title="Proposed options book")
+    table.add_column("#", justify="right")
+    table.add_column("Sym")
+    table.add_column("Side")
+    table.add_column("Strike", justify="right")
+    table.add_column("OTM%", justify="right")
+    table.add_column("DTE", justify="right")
+    table.add_column("IV%", justify="right")
+    table.add_column("Score", justify="right")
+    table.add_column("Size", justify="right")
+    table.add_column("@Level")
+    for i, p in enumerate(run.book, start=1):
+        side = "[rose]call[/rose]" if p.side == "sell_call" else "[green]put[/green]"
+        at_level = "[cyan]● at level[/cyan]" if p.price_at_level else ""
+        table.add_row(
+            str(i), p.symbol, side, f"{p.strike:g}", f"{p.pct_otm:+.0f}",
+            str(p.days_to_expiry), f"{p.iv_pct:.0f}", f"{p.score:.2f}",
+            f"{p.size_weight:.2f}", at_level,
+        )
+    console.print(table)
+    if save:
+        from stockscan.proposals.store import save_run
+
+        run_id = save_run(run, list_id=list_id)
+        console.print(f"[green]✓[/green] saved proposal run #{run_id}")
 
 
 def main() -> None:

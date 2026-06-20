@@ -18,6 +18,7 @@ from stockscan.mcp.tools import analysis as t_analysis
 from stockscan.mcp.tools import backtests as t_backtests
 from stockscan.mcp.tools import context as t_context
 from stockscan.mcp.tools import data as t_data
+from stockscan.mcp.tools import proposals as t_proposals
 from stockscan.mcp.tools import scan as t_scan
 from stockscan.mcp.tools import signals as t_signals
 from stockscan.mcp.tools import strategies as t_strategies
@@ -54,6 +55,8 @@ READ_TOOLS = (
     t_analysis.get_analysis,
     t_analysis.analyze_watchlist,
     t_analysis.get_regime,
+    # options-premium proposals
+    t_proposals.propose_options,
     # market context
     t_context.get_fundamentals,
     t_context.screen_by_market_cap,
