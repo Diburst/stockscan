@@ -1,0 +1,35 @@
+{% macro money(v) %}<span class="{{ 'text-ok-600' if v >= 0 else 'text-bad-600' }}">{{ "{:+,.0f}".format(v) }}</span>{% endmacro %}
+{% set m = result.mc %}{% set h = result.hist %}
+<h2 class="text-sm font-semibold text-ink-700 mb-2">Result — Monte Carlo · {{ m.n_paths }} paths · {{ result.spec.option }}</h2>
+
+<div class="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-4">
+  <div class="bg-white rounded-xl shadow-sm border border-ink-300/40 p-3">
+    <div class="text-xs text-ink-500">Net P&L mean / median</div>
+    <div class="text-lg tabular-nums font-semibold">{{ money(m.net_pnl.mean) }} / {{ money(m.net_pnl.median) }}</div>
+    <div class="text-xs text-ink-400">std ${{ "{:,.0f}".format(m.net_pnl.std) }}</div>
+  </div>
+  <div class="bg-white rounded-xl shadow-sm border border-ink-300/40 p-3">
+    <div class="text-xs text-ink-500">5th – 95th pct</div>
+    <div class="text-sm tabular-nums">{{ money(m.net_pnl.p5) }} … {{ money(m.net_pnl.p95) }}</div>
+    <div class="text-xs text-ink-400">min {{ money(m.net_pnl.min) }} · max {{ money(m.net_pnl.max) }}</div>
+  </div>
+  <div class="bg-white rounded-xl shadow-sm border border-ink-300/40 p-3">
+    <div class="text-xs text-ink-500">Win rate</div>
+    <div class="text-lg tabular-nums font-semibold">{{ "{:.1%}".format(m.win_rate) }}</div>
+    <div class="text-xs text-ink-400">net &gt; 0 across paths</div>
+  </div>
+  <div class="bg-white rounded-xl shadow-sm border border-ink-300/40 p-3">
+    <div class="text-xs text-ink-500">Avg trades / cost</div>
+    <div class="text-lg tabular-nums">{{ m.avg_trades }} · <span class="text-ink-500">${{ "{:,.0f}".format(m.avg_cost) }}</span></div>
+    <div class="text-xs text-ink-400">opt {{ money(m.avg_option_pnl) }} · hdg {{ money(m.avg_hedge_pnl) }}</div>
+  </div>
+</div>
+
+<div class="bg-white rounded-xl shadow-sm border border-ink-300/40 p-3">
+  <div class="text-xs text-ink-500 mb-1">Net P&L distribution (red line = break-even)</div>
+  <svg viewBox="0 0 {{ h.width }} {{ h.height }}" preserveAspectRatio="none" class="w-full" style="height:130px">
+    {% for b in h.bars %}<rect x="{{ b.x }}" y="{{ h.height - b.h }}" width="{{ b.w }}" height="{{ b.h }}" fill="#94a3b8"/>{% endfor %}
+    {% if h.zero_x is not none %}<line x1="{{ h.zero_x }}" y1="0" x2="{{ h.zero_x }}" y2="{{ h.height }}" stroke="#dc2626" stroke-width="0.8"/>{% endif %}
+  </svg>
+  <div class="flex justify-between text-ink-400" style="font-size:10px"><span>{{ "{:,.0f}".format(h.lo) }}</span><span>{{ "{:,.0f}".format(h.hi) }}</span></div>
+</div>

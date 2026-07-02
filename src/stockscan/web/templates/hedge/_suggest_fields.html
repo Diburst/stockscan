@@ -1,0 +1,25 @@
+{# Strike / expiry / premium inputs — auto-filled from a ~30-delta suggestion.
+   Swapped (outerHTML) by the /hedge/suggest HTMX endpoint when the symbol,
+   side, or kind changes. `d` is the defaults/suggestion dict. #}
+<div id="suggest-fields" class="grid grid-cols-1 sm:grid-cols-3 gap-3">
+  <label class="flex flex-col gap-1">
+    <span class="text-xs text-ink-500">Strike</span>
+    <input name="strike" value="{{ d.strike }}" required placeholder="strike"
+           class="px-3 py-2 rounded border border-ink-300 text-sm font-mono">
+  </label>
+  <label class="flex flex-col gap-1">
+    <span class="text-xs text-ink-500">Expiry</span>
+    <input name="expiry" type="date" value="{{ d.expiry }}" required
+           class="px-3 py-2 rounded border border-ink-300 text-sm">
+  </label>
+  <label class="flex flex-col gap-1">
+    <span class="text-xs text-ink-500" title="Total premium for the whole position ($)">Premium ($)</span>
+    <input name="premium" value="{{ d.premium }}" required placeholder="premium"
+           class="px-3 py-2 rounded border border-ink-300 text-sm font-mono">
+  </label>
+  <p class="sm:col-span-3 text-xs text-ink-500 -mt-1">
+    {% if d.spot %}Last {{ d.symbol }} ≈ ${{ '%.2f'|format(d.spot) }}{% endif %}
+    {% if d.iv_pct is not none %} · vol ≈ {{ d.iv_pct }}% · auto-suggested ~30-delta {{ d.option_kind }}{% endif %}
+    {% if not d.spot %}Enter a symbol to auto-fill a strike &amp; premium.{% endif %}
+  </p>
+</div>

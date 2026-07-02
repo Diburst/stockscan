@@ -585,6 +585,30 @@ def get_triggered(*, session: Session | None = None) -> list[WatchlistItem]:
     return [it for it in items if it.alert_enabled and it.target_satisfied]
 
 
+def lists_for_symbol(symbol: str, *, session: Session | None = None) -> list[int]:
+    """The list_ids a symbol currently belongs to (across all lists).
+
+    Used by the route layer to know which composites to rebuild *before* a
+    removal drops the membership rows (after which the link is gone)."""
+    sql = text(
+        """
+        SELECT DISTINCT m.list_id
+        FROM watchlist_membership m
+        JOIN watchlist_items w ON w.watchlist_id = m.watchlist_id
+        WHERE UPPER(w.symbol) = UPPER(:sym)
+        ORDER BY m.list_id
+        """
+    )
+
+    def _run(s: Session) -> list[int]:
+        return [int(r[0]) for r in s.execute(sql, {"sym": symbol.strip()}).all()]
+
+    if session is not None:
+        return _run(session)
+    with session_scope() as s:
+        return _run(s)
+
+
 def watchlist_symbols(
     *, list_id: int | None = None, session: Session | None = None
 ) -> set[str]:

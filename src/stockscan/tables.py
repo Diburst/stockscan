@@ -364,3 +364,86 @@ trade_note_revisions = Table(
     Column("template_fields_before", JSONB),
     Column("edited_at", TIMESTAMP(timezone=True), nullable=False, server_default="NOW()"),
 )
+
+# ----------------------------------------------------------------------
+# Delta hedging (migration 0024)
+# ----------------------------------------------------------------------
+hedge_positions = Table(
+    "hedge_positions",
+    metadata,
+    Column("hedge_position_id", BigInteger, primary_key=True),
+    Column("symbol", Text, nullable=False),
+    Column("option_kind", Text, nullable=False),
+    Column("option_side", Text, nullable=False),
+    Column("strike", Numeric(14, 6), nullable=False),
+    Column("contracts", Integer, nullable=False),
+    Column("multiplier", Integer, nullable=False, server_default="100"),
+    Column("expiry", TIMESTAMP(timezone=True), nullable=False),
+    Column("premium", Numeric(16, 4), nullable=False),
+    Column("iv_pct", Numeric(10, 4)),
+    Column("rate_pct", Numeric(8, 4)),
+    Column("band_policy", JSONB),
+    Column("status", Text, nullable=False, server_default="'active'"),
+    Column("held_shares", Integer, nullable=False, server_default="0"),
+    Column("avg_cost", Numeric(14, 6), nullable=False, server_default="0"),
+    Column("realized_hedge_pnl", Numeric(16, 4), nullable=False, server_default="0"),
+    Column("last_spot", Numeric(14, 6)),
+    Column("last_delta", Numeric(16, 6)),
+    Column("last_target_shares", Integer),
+    Column("last_hedge_spot", Numeric(14, 6)),
+    Column("last_tick_at", TIMESTAMP(timezone=True)),
+    Column("iv_refreshed_on", Date),
+    Column("created_at", TIMESTAMP(timezone=True), nullable=False, server_default="NOW()"),
+    Column("closed_at", TIMESTAMP(timezone=True)),
+    Column("close_reason", Text),
+    Column("settlement_spot", Numeric(14, 6)),
+    Column("realized_pnl", Numeric(16, 4)),
+    Column("notes", Text),
+    CheckConstraint("option_kind IN ('call','put')"),
+    CheckConstraint("option_side IN ('short','long')"),
+    CheckConstraint("status IN ('active','paused','closed')"),
+    CheckConstraint("contracts > 0"),
+    CheckConstraint("strike > 0"),
+)
+Index("idx_hedge_positions_status", hedge_positions.c.status)
+Index("idx_hedge_positions_symbol", hedge_positions.c.symbol)
+
+hedge_adjustments = Table(
+    "hedge_adjustments",
+    metadata,
+    Column("adjustment_id", BigInteger, primary_key=True),
+    Column(
+        "hedge_position_id",
+        BigInteger,
+        ForeignKey("hedge_positions.hedge_position_id"),
+        nullable=False,
+    ),
+    Column("ts", TIMESTAMP(timezone=True), nullable=False, server_default="NOW()"),
+    Column("side", Text, nullable=False),
+    Column("qty", Integer, nullable=False),
+    Column("price", Numeric(14, 6), nullable=False),
+    Column("spot", Numeric(14, 6)),
+    Column("option_delta", Numeric(16, 6)),
+    Column("target_shares", Integer),
+    Column("held_before", Integer),
+    Column("held_after", Integer),
+    Column("reason", Text),
+    Column("realized_pnl_delta", Numeric(16, 4), nullable=False, server_default="0"),
+    CheckConstraint("side IN ('buy','sell')"),
+    CheckConstraint("qty > 0"),
+)
+Index("idx_hedge_adjustments_position", hedge_adjustments.c.hedge_position_id, hedge_adjustments.c.ts)
+
+hedge_heartbeat = Table(
+    "hedge_heartbeat",
+    metadata,
+    Column("id", Integer, primary_key=True, server_default="1"),
+    Column("pid", Integer),
+    Column("started_at", TIMESTAMP(timezone=True)),
+    Column("last_heartbeat_at", TIMESTAMP(timezone=True)),
+    Column("feed_kind", Text),
+    Column("active_symbols", Integer),
+    Column("status", Text),
+    Column("note", Text),
+    CheckConstraint("id = 1"),
+)

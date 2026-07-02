@@ -1,0 +1,185 @@
+{% extends "base.html" %}
+{% block title %}Delta Hedging{% endblock %}
+
+{% macro pnl_cell(v) %}<span class="{{ 'text-ok-600' if v >= 0 else 'text-bad-600' }}">{{ "{:+,.0f}".format(v) }}</span>{% endmacro %}
+
+{% block content %}
+<div class="max-w-6xl mx-auto px-4 py-6">
+  <div class="flex items-baseline justify-between mb-1">
+    <div class="flex items-baseline gap-3">
+      <h1 class="text-xl font-semibold">Delta hedging</h1>
+      <a href="/hedge/playground" class="text-sm text-ink-500 hover:underline">Playground →</a>
+    </div>
+    <span class="text-sm">
+      {% if heartbeat.alive %}
+        <span class="text-xs px-2 py-0.5 rounded-full bg-ok-100 text-ok-600 font-medium">● daemon live</span>
+        <span class="text-ink-400 ml-1">{{ heartbeat.feed_kind }} · {{ heartbeat.active_symbols }} symbols</span>
+      {% elif heartbeat.present %}
+        <span class="text-xs px-2 py-0.5 rounded-full bg-bad-100 text-bad-600 font-medium">● daemon down</span>
+      {% else %}
+        <span class="text-xs px-2 py-0.5 rounded-full bg-ink-100 text-ink-500">daemon never run</span>
+      {% endif %}
+    </span>
+  </div>
+  <p class="text-xs text-ink-400 mb-5">
+    Local paper only — fills are simulated at the live spot from the websocket. Start the daemon with
+    <code class="bg-ink-100 px-1 rounded">stockscan hedge run</code>. Volatility is auto-derived from realized
+    vol; live spot drives delta each tick.
+  </p>
+
+  <!-- Create form -->
+  <form method="post" action="/hedge" class="bg-white rounded-xl shadow-sm border border-ink-300/40 p-4 mb-6 space-y-4 text-sm">
+    <div class="grid grid-cols-2 sm:grid-cols-4 gap-3">
+      <label class="flex flex-col gap-1">
+        <span class="text-xs text-ink-500">Symbol</span>
+        <input name="symbol" required value="{{ d.symbol }}" placeholder="MU"
+               class="px-3 py-2 rounded border border-ink-300 text-sm font-mono uppercase"
+               hx-get="/hedge/suggest" hx-trigger="change" hx-include="closest form"
+               hx-target="#suggest-fields" hx-swap="outerHTML">
+      </label>
+      <label class="flex flex-col gap-1">
+        <span class="text-xs text-ink-500">Side</span>
+        <select name="option_side" class="px-3 py-2 rounded border border-ink-300 text-sm bg-white"
+                hx-get="/hedge/suggest" hx-trigger="change" hx-include="closest form"
+                hx-target="#suggest-fields" hx-swap="outerHTML">
+          <option value="short" {{ 'selected' if d.option_side == 'short' }}>short (sold)</option>
+          <option value="long" {{ 'selected' if d.option_side == 'long' }}>long (bought)</option>
+        </select>
+      </label>
+      <label class="flex flex-col gap-1">
+        <span class="text-xs text-ink-500">Kind</span>
+        <select name="option_kind" class="px-3 py-2 rounded border border-ink-300 text-sm bg-white"
+                hx-get="/hedge/suggest" hx-trigger="change" hx-include="closest form"
+                hx-target="#suggest-fields" hx-swap="outerHTML">
+          <option value="call" {{ 'selected' if d.option_kind == 'call' }}>call</option>
+          <option value="put" {{ 'selected' if d.option_kind == 'put' }}>put</option>
+        </select>
+      </label>
+      <label class="flex flex-col gap-1">
+        <span class="text-xs text-ink-500">Contracts</span>
+        <input name="contracts" type="number" min="1" step="1" value="{{ d.contracts }}" required
+               class="px-3 py-2 rounded border border-ink-300 text-sm">
+      </label>
+    </div>
+
+    {% include "hedge/_suggest_fields.html" %}
+
+    <details class="text-sm">
+      <summary class="cursor-pointer text-ink-500 hover:text-ink-700 select-none">Band policy (advanced)</summary>
+      <div class="grid grid-cols-2 sm:grid-cols-4 gap-3 mt-3">
+        <label class="flex flex-col gap-1">
+          <span class="text-xs text-ink-500">Policy</span>
+          <select name="band_mode" class="px-3 py-2 rounded border border-ink-300 text-sm bg-white">
+            <option value="whalley_wilmott" {{ 'selected' if d.band_mode == 'whalley_wilmott' }}>Whalley-Wilmott (default)</option>
+            <option value="fixed_shares">Fixed share band</option>
+            <option value="pct_move">Percent-move</option>
+          </select>
+        </label>
+        <label class="flex flex-col gap-1">
+          <span class="text-xs text-ink-500" title="Risk aversion a — bigger = tighter band">Risk aversion (a)</span>
+          <input name="risk_aversion" value="{{ d.risk_aversion }}" class="px-3 py-2 rounded border border-ink-300 text-sm">
+        </label>
+        <label class="flex flex-col gap-1">
+          <span class="text-xs text-ink-500">Fixed band (shares)</span>
+          <input name="fixed_band_shares" value="{{ d.fixed_band_shares }}" class="px-3 py-2 rounded border border-ink-300 text-sm">
+        </label>
+        <label class="flex flex-col gap-1">
+          <span class="text-xs text-ink-500">Percent-move trigger</span>
+          <input name="pct_move" value="{{ d.pct_move }}" class="px-3 py-2 rounded border border-ink-300 text-sm">
+        </label>
+      </div>
+    </details>
+
+    <div class="flex justify-end">
+      <button type="submit" class="px-4 py-2 rounded bg-ink-900 text-white text-sm hover:bg-ink-800">
+        Create &amp; hedge
+      </button>
+    </div>
+  </form>
+
+  <!-- Live positions (HTMX self-refresh every 5s) -->
+  <div id="hedge-live"
+       hx-get="/hedge" hx-trigger="every 5s" hx-select="#hedge-live" hx-target="#hedge-live" hx-swap="outerHTML">
+    <h2 class="text-sm font-semibold text-ink-700 mb-2">Active ({{ active_rows|length }})</h2>
+    {% if not active_rows %}
+      <div class="text-ink-400 text-sm bg-white border border-ink-300/40 rounded-xl p-6 text-center mb-6">
+        No active hedges yet — create one above.
+      </div>
+    {% else %}
+    <div class="bg-white rounded-xl shadow-sm border border-ink-300/40 overflow-x-auto mb-6">
+      <table class="w-full text-sm">
+        <thead class="text-ink-500 text-xs bg-ink-50">
+          <tr class="border-b border-ink-300/60">
+            <th class="text-left p-2 font-medium">Position</th>
+            <th class="text-right p-2 font-medium">Spot</th>
+            <th class="text-right p-2 font-medium" title="Signed option-position delta, share-equivalents">Δ</th>
+            <th class="text-right p-2 font-medium">Held</th>
+            <th class="text-right p-2 font-medium">Target</th>
+            <th class="text-right p-2 font-medium">Premium</th>
+            <th class="text-right p-2 font-medium" title="Option leg mark-to-market P&L">Option</th>
+            <th class="text-right p-2 font-medium" title="Realised + unrealised on the stock hedge">Hedge</th>
+            <th class="text-right p-2 font-medium">Net</th>
+            <th class="p-2"></th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in active_rows %}
+          {% set p = row.pos %}{% set n = row.pnl %}
+          <tr class="border-b border-ink-300/40 hover:bg-ink-50">
+            <td class="p-2">
+              <a href="/hedge/{{ p.hedge_position_id }}" class="font-semibold hover:underline">{{ p.symbol }}</a>
+              <span class="text-xs text-ink-500">{{ p.option_side }} {{ p.contracts }}× {{ p.option_kind }} ${{ '%g'|format(p.strike|float) }}</span>
+              {% if p.status == 'paused' %}<span class="text-xs px-1.5 py-0.5 rounded-full bg-warn-100 text-warn-600">paused</span>{% endif %}
+            </td>
+            <td class="text-right p-2 tabular-nums">{{ "{:.2f}".format(p.last_spot|float) if p.last_spot is not none else '—' }}</td>
+            <td class="text-right p-2 tabular-nums">{{ "{:.0f}".format(p.last_delta|float) if p.last_delta is not none else '—' }}</td>
+            <td class="text-right p-2 tabular-nums">{{ p.held_shares }}</td>
+            <td class="text-right p-2 tabular-nums">{{ p.last_target_shares if p.last_target_shares is not none else '—' }}</td>
+            <td class="text-right p-2 tabular-nums text-ink-500">{{ "{:,.0f}".format(p.premium|float) }}</td>
+            <td class="text-right p-2 tabular-nums">{{ pnl_cell(n.option_open_pnl) }}</td>
+            <td class="text-right p-2 tabular-nums">{{ pnl_cell(n.realized_hedge_pnl + n.hedge_unrealized_pnl) }}</td>
+            <td class="text-right p-2 tabular-nums font-semibold">{{ pnl_cell(n.net_open_pnl) }}</td>
+            <td class="p-2 text-right whitespace-nowrap">
+              <form method="post" action="/hedge/{{ p.hedge_position_id }}/toggle" class="inline">
+                <button class="text-xs text-ink-500 hover:text-ink-900">{{ 'resume' if p.status == 'paused' else 'pause' }}</button>
+              </form>
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% endif %}
+
+    {% if closed_rows %}
+    <h2 class="text-sm font-semibold text-ink-700 mb-2">Closed ({{ closed_rows|length }})</h2>
+    <div class="bg-white rounded-xl shadow-sm border border-ink-300/40 overflow-x-auto">
+      <table class="w-full text-sm">
+        <thead class="text-ink-500 text-xs bg-ink-50">
+          <tr class="border-b border-ink-300/60">
+            <th class="text-left p-2 font-medium">Position</th>
+            <th class="text-right p-2 font-medium">Settle spot</th>
+            <th class="text-right p-2 font-medium">Reason</th>
+            <th class="text-right p-2 font-medium">Booked P&L</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in closed_rows %}
+          {% set p = row.pos %}
+          <tr class="border-b border-ink-300/40">
+            <td class="p-2">
+              <a href="/hedge/{{ p.hedge_position_id }}" class="hover:underline">{{ p.symbol }}</a>
+              <span class="text-xs text-ink-500">{{ p.option_side }} {{ p.contracts }}× {{ p.option_kind }} ${{ '%g'|format(p.strike|float) }}</span>
+            </td>
+            <td class="text-right p-2 tabular-nums">{{ "{:.2f}".format(p.settlement_spot|float) if p.settlement_spot is not none else '—' }}</td>
+            <td class="text-right p-2 text-ink-500">{{ p.close_reason }}</td>
+            <td class="text-right p-2 tabular-nums font-semibold">{{ pnl_cell(p.realized_pnl|float) if p.realized_pnl is not none else '—' }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% endif %}
+  </div>
+</div>
+{% endblock %}

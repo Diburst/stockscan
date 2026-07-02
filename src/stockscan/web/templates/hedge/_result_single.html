@@ -1,0 +1,73 @@
+{% macro money(v) %}<span class="{{ 'text-ok-600' if v >= 0 else 'text-bad-600' }}">{{ "{:+,.0f}".format(v) }}</span>{% endmacro %}
+{% macro spark(title, sp, color, fmt) %}
+<div class="bg-white rounded-xl shadow-sm border border-ink-300/40 p-3">
+  <div class="flex justify-between text-xs text-ink-500 mb-1"><span>{{ title }}</span><span>last {{ fmt|format(sp.last) }}</span></div>
+  <svg viewBox="0 0 {{ sp.width }} {{ sp.height }}" preserveAspectRatio="none" class="w-full" style="height:56px">
+    {% if sp.zero_y is not none %}<line x1="0" y1="{{ sp.zero_y }}" x2="{{ sp.width }}" y2="{{ sp.zero_y }}" stroke="#cbd5e1" stroke-width="0.6"/>{% endif %}
+    <polyline points="{{ sp.points }}" fill="none" stroke="{{ color }}" stroke-width="1.3"/>
+  </svg>
+  <div class="flex justify-between text-ink-400" style="font-size:10px"><span>{{ fmt|format(sp.lo) }}</span><span>{{ fmt|format(sp.hi) }}</span></div>
+</div>
+{% endmacro %}
+
+{% set s = result.summary %}
+<h2 class="text-sm font-semibold text-ink-700 mb-2">Result — single path · {{ s.label }}</h2>
+
+<div class="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-4">
+  <div class="bg-white rounded-xl shadow-sm border border-ink-300/40 p-3">
+    <div class="text-xs text-ink-500">Net P&L</div>
+    <div class="text-lg tabular-nums font-semibold">{{ money(s.net_pnl) }}</div>
+    <div class="text-xs text-ink-400">{{ s.net_pct_premium }}% of premium</div>
+  </div>
+  <div class="bg-white rounded-xl shadow-sm border border-ink-300/40 p-3">
+    <div class="text-xs text-ink-500">Option / Hedge</div>
+    <div class="text-sm tabular-nums">{{ money(s.option_pnl) }} / {{ money(s.hedge_pnl) }}</div>
+    <div class="text-xs text-ink-400">{{ 'ITM' if s.in_the_money else 'OTM' }} at expiry</div>
+  </div>
+  <div class="bg-white rounded-xl shadow-sm border border-ink-300/40 p-3">
+    <div class="text-xs text-ink-500">Trades / cost</div>
+    <div class="text-lg tabular-nums">{{ s.num_trades }} · <span class="text-ink-500">${{ "{:,.0f}".format(s.transaction_cost) }}</span></div>
+    <div class="text-xs text-ink-400">{{ s.shares_traded }} shares traded</div>
+  </div>
+  <div class="bg-white rounded-xl shadow-sm border border-ink-300/40 p-3">
+    <div class="text-xs text-ink-500">Tracking / drawdown</div>
+    <div class="text-sm tabular-nums">σ {{ s.tracking_error_shares }} sh · dd {{ money(s.max_drawdown) }}</div>
+    <div class="text-xs text-ink-400">band {{ s.band_mode }}</div>
+  </div>
+</div>
+
+<div class="grid sm:grid-cols-3 gap-3 mb-4">
+  {{ spark("Spot", result.chart.spot, "#0f172a", "%.2f") }}
+  {{ spark("Hedge shares held", result.chart.held, "#2563eb", "%.0f") }}
+  {{ spark("Net P&L", result.chart.net, "#059669", "%.0f") }}
+</div>
+
+<details class="bg-white rounded-xl shadow-sm border border-ink-300/40 p-3">
+  <summary class="cursor-pointer text-sm text-ink-600 select-none">Trades ({{ result.n_trades }})</summary>
+  <div class="overflow-x-auto mt-2">
+    <table class="w-full text-sm">
+      <thead class="text-ink-500 text-xs bg-ink-50">
+        <tr class="border-b border-ink-300/60">
+          <th class="text-left p-2 font-medium">Time</th><th class="text-left p-2 font-medium">Side</th>
+          <th class="text-right p-2 font-medium">Qty</th><th class="text-right p-2 font-medium">Price</th>
+          <th class="text-right p-2 font-medium">Δ</th><th class="text-right p-2 font-medium">Target</th>
+          <th class="text-right p-2 font-medium">Held→</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for t in result.trades %}
+        <tr class="border-b border-ink-300/40">
+          <td class="p-2 text-ink-500">{{ t.ts[11:19] }}</td>
+          <td class="p-2">{% if t.side == 'buy' %}<span class="text-ok-600">buy</span>{% else %}<span class="text-bad-600">sell</span>{% endif %}</td>
+          <td class="text-right p-2 tabular-nums">{{ t.qty }}</td>
+          <td class="text-right p-2 tabular-nums">{{ "%.2f"|format(t.price) }}</td>
+          <td class="text-right p-2 tabular-nums">{{ "%.0f"|format(t.delta) }}</td>
+          <td class="text-right p-2 tabular-nums">{{ t.target }}</td>
+          <td class="text-right p-2 tabular-nums">{{ t.held_after }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% if result.n_trades > result.trades|length %}<div class="text-xs text-ink-400 p-2">showing first {{ result.trades|length }}</div>{% endif %}
+  </div>
+</details>

@@ -85,6 +85,60 @@ def chain_to_levels(returns: pd.Series, *, base: float = DEFAULT_BASE) -> pd.Ser
     return (base * (1.0 + r).cumprod()).rename(returns.name)
 
 
+def weighted_composite(
+    closes: pd.DataFrame,
+    weights: pd.DataFrame | None = None,
+    *,
+    base: float = DEFAULT_BASE,
+    min_members: int = DEFAULT_MIN_MEMBERS,
+) -> pd.Series:
+    """Collapse a wide adjusted-close frame into a single base-``base`` index level.
+
+    This is the generic engine behind the watchlist composites (the sector
+    builder above is the equal-weight, per-sector specialization). Same causal,
+    no-look-ahead discipline: ``level_t`` depends only on prices ``≤ t``.
+
+    ``weights=None`` → **equal weight**: each day's index return is the mean of
+    its members' 1-day returns (NaN-skipped), so it rebalances to equal weights
+    daily — the "median peer" benchmark.
+
+    ``weights`` given (a frame aligned to ``closes``: per-symbol, per-day weight,
+    e.g. market cap = raw_close x shares) → **weighted**: each day's return is the
+    weight-weighted mean of member returns, using *prior-day* weights
+    (start-of-period, the standard convention) renormalized over the members that
+    have a valid return AND a positive weight that day. A name with a data gap or
+    missing weight is cleanly dropped from that day's average rather than
+    distorting it.
+
+    A day with fewer than ``min_members`` valid members yields ``NaN`` and the
+    level carries flat across it (no discontinuity).
+
+    Fully vectorized (no per-cell pandas loops — see orientation principle #6).
+    """
+    closes = closes.sort_index()
+    returns = daily_returns(closes)
+    if returns.shape[1] == 0:
+        return pd.Series(dtype="float64")
+
+    if weights is None:
+        valid = returns.notna()
+        count = valid.sum(axis=1)
+        daily = returns.mean(axis=1)  # skipna mean over available members
+    else:
+        # Prior-day weights aligned to today's return (start-of-period weighting).
+        w = weights.reindex(index=closes.index, columns=closes.columns).shift(1)
+        mask = returns.notna() & w.notna() & (w > 0)
+        w_masked = w.where(mask)
+        r_masked = returns.where(mask)
+        w_sum = w_masked.sum(axis=1)
+        daily = (w_masked * r_masked).sum(axis=1) / w_sum
+        daily = daily.where(w_sum > 0)
+        count = mask.sum(axis=1)
+
+    daily = daily.where(count >= min_members)
+    return chain_to_levels(daily.rename(None), base=base)
+
+
 def sector_daily_returns(
     returns: pd.DataFrame,
     sector_of: Mapping[str, str],

@@ -1,0 +1,150 @@
+{% extends "base.html" %}
+{% block title %}Hedge Playground{% endblock %}
+
+{% macro field(label, name, value, ph="", typ="text", cls="") %}
+<label class="flex flex-col gap-1">
+  <span class="text-xs text-ink-500">{{ label }}</span>
+  <input name="{{ name }}" value="{{ value }}" placeholder="{{ ph }}" type="{{ typ }}"
+         class="px-3 py-2 rounded border border-ink-300 text-sm {{ cls }}">
+</label>
+{% endmacro %}
+
+{% macro money(v) %}<span class="{{ 'text-ok-600' if v >= 0 else 'text-bad-600' }}">{{ "{:+,.0f}".format(v) }}</span>{% endmacro %}
+
+{% block content %}
+<div class="max-w-6xl mx-auto px-4 py-6">
+  <div class="flex items-baseline justify-between mb-1">
+    <h1 class="text-xl font-semibold">Hedge playground</h1>
+    <a href="/hedge" class="text-sm text-ink-500 hover:underline">← hedges</a>
+  </div>
+  <p class="text-xs text-ink-400 mb-5">
+    Replay the exact live hedging logic offline over a synthetic or historical price path — experiment
+    with the option, the band, and the market, and tune your settings. Nothing here touches a live position.
+  </p>
+
+  {% if error %}
+  <div class="mb-4 text-sm bg-bad-100 border border-bad-600/30 text-bad-600 px-4 py-3 rounded">{{ error }}</div>
+  {% endif %}
+
+  <form method="post" action="/hedge/playground" class="bg-white rounded-xl shadow-sm border border-ink-300/40 p-4 mb-6 space-y-5 text-sm">
+    <!-- Scenario -->
+    <div>
+      <div class="flex items-center gap-4 mb-3">
+        <span class="text-xs font-semibold text-ink-700 uppercase tracking-wide">Price path</span>
+        <label class="flex items-center gap-1 text-sm"><input type="radio" name="source" value="synthetic" {{ 'checked' if f.source != 'historical' }} onchange="pgToggle()"> Synthetic</label>
+        <label class="flex items-center gap-1 text-sm"><input type="radio" name="source" value="historical" {{ 'checked' if f.source == 'historical' }} onchange="pgToggle()"> Historical</label>
+      </div>
+      <div data-src="synthetic" class="grid grid-cols-2 sm:grid-cols-5 gap-3">
+        {{ field("Start price", "spot", f.spot, "1300") }}
+        {{ field("Annual vol %", "vol", f.vol, "40") }}
+        {{ field("Annual drift %", "drift", f.drift, "0") }}
+        {{ field("Days (blank=DTE)", "days", f.days, "") }}
+        {{ field("Seed", "seed", f.seed, "1") }}
+      </div>
+      <div data-src="historical" class="grid grid-cols-2 sm:grid-cols-4 gap-3 mt-3">
+        {{ field("Symbol", "symbol", f.symbol, "MU", "text", "font-mono uppercase") }}
+        {{ field("From (YYYY-MM-DD)", "from_date", f.from_date, "") }}
+        {{ field("To (YYYY-MM-DD)", "to_date", f.to_date, "") }}
+        {{ field("Steps / day", "steps_per_day", f.steps_per_day, "39") }}
+      </div>
+    </div>
+
+    <!-- Option -->
+    <div>
+      <div class="text-xs font-semibold text-ink-700 uppercase tracking-wide mb-3">Option</div>
+      <div class="grid grid-cols-2 sm:grid-cols-4 gap-3">
+        <label class="flex flex-col gap-1">
+          <span class="text-xs text-ink-500">Side</span>
+          <select name="option_side" class="px-3 py-2 rounded border border-ink-300 text-sm bg-white">
+            <option value="short" {{ 'selected' if f.option_side == 'short' }}>short</option>
+            <option value="long" {{ 'selected' if f.option_side == 'long' }}>long</option>
+          </select>
+        </label>
+        <label class="flex flex-col gap-1">
+          <span class="text-xs text-ink-500">Kind</span>
+          <select name="option_kind" class="px-3 py-2 rounded border border-ink-300 text-sm bg-white">
+            <option value="call" {{ 'selected' if f.option_kind == 'call' }}>call</option>
+            <option value="put" {{ 'selected' if f.option_kind == 'put' }}>put</option>
+          </select>
+        </label>
+        {{ field("Contracts", "contracts", f.contracts, "1") }}
+        {{ field("DTE (days)", "dte", f.dte, "30") }}
+        {{ field("Strike (blank=from Δ)", "strike", f.strike, "") }}
+        {{ field("Target delta", "delta", f.delta, "0.30") }}
+        {{ field("IV % (blank=auto)", "iv", f.iv, "") }}
+        {{ field("Premium (blank=BS)", "premium", f.premium, "") }}
+      </div>
+    </div>
+
+    <!-- Band -->
+    <div>
+      <div class="text-xs font-semibold text-ink-700 uppercase tracking-wide mb-3">Band policy</div>
+      <div class="grid grid-cols-2 sm:grid-cols-5 gap-3">
+        <label class="flex flex-col gap-1">
+          <span class="text-xs text-ink-500">Mode</span>
+          <select name="band_mode" class="px-3 py-2 rounded border border-ink-300 text-sm bg-white">
+            <option value="whalley_wilmott" {{ 'selected' if f.band_mode == 'whalley_wilmott' }}>Whalley-Wilmott</option>
+            <option value="fixed_shares" {{ 'selected' if f.band_mode == 'fixed_shares' }}>Fixed share</option>
+            <option value="pct_move" {{ 'selected' if f.band_mode == 'pct_move' }}>Percent-move</option>
+          </select>
+        </label>
+        {{ field("Risk aversion (a)", "risk_aversion", f.risk_aversion, "0.05") }}
+        {{ field("Fixed band (sh)", "fixed_band", f.fixed_band, "5") }}
+        {{ field("Pct-move", "pct_move", f.pct_move, "0.01") }}
+        {{ field("Cost rate", "cost_rate", f.cost_rate, "0.0005") }}
+      </div>
+    </div>
+
+    <!-- Experiment -->
+    <div>
+      <div class="flex items-center gap-4 mb-3">
+        <span class="text-xs font-semibold text-ink-700 uppercase tracking-wide">Experiment</span>
+        <select name="experiment" class="px-3 py-2 rounded border border-ink-300 text-sm bg-white" onchange="pgToggle()">
+          <option value="single" {{ 'selected' if f.experiment == 'single' }}>Single path</option>
+          <option value="montecarlo" {{ 'selected' if f.experiment == 'montecarlo' }}>Monte Carlo</option>
+          <option value="sweep" {{ 'selected' if f.experiment == 'sweep' }}>Parameter sweep</option>
+        </select>
+      </div>
+      <div data-exp="montecarlo" class="grid grid-cols-2 sm:grid-cols-4 gap-3">
+        {{ field("Paths", "n_paths", f.n_paths, "500") }}
+      </div>
+      <div data-exp="sweep" class="grid grid-cols-2 sm:grid-cols-4 gap-3">
+        <label class="flex flex-col gap-1">
+          <span class="text-xs text-ink-500">Sweep over</span>
+          <select name="sweep_over" class="px-3 py-2 rounded border border-ink-300 text-sm bg-white">
+            <option value="risk_aversion" {{ 'selected' if f.sweep_over == 'risk_aversion' }}>risk aversion</option>
+            <option value="fixed_band" {{ 'selected' if f.sweep_over == 'fixed_band' }}>fixed band</option>
+          </select>
+        </label>
+        {{ field("Values (comma-sep)", "sweep_values", f.sweep_values, "0.005,0.05,0.5") }}
+      </div>
+    </div>
+
+    <div class="flex justify-end">
+      <button type="submit" class="px-4 py-2 rounded bg-ink-900 text-white text-sm hover:bg-ink-800">Run</button>
+    </div>
+  </form>
+
+  {% if result %}
+    {% if result.kind == 'single' %}
+      {% include "hedge/_result_single.html" %}
+    {% elif result.kind == 'montecarlo' %}
+      {% include "hedge/_result_montecarlo.html" %}
+    {% elif result.kind == 'sweep' %}
+      {% include "hedge/_result_sweep.html" %}
+    {% endif %}
+  {% endif %}
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+  function pgToggle() {
+    var src = document.querySelector('input[name=source]:checked').value;
+    document.querySelectorAll('[data-src]').forEach(function(el){ el.style.display = (el.getAttribute('data-src')===src)?'':'none'; });
+    var exp = document.querySelector('select[name=experiment]').value;
+    document.querySelectorAll('[data-exp]').forEach(function(el){ el.style.display = (el.getAttribute('data-exp')===exp)?'':'none'; });
+  }
+  pgToggle();
+</script>
+{% endblock %}

@@ -1,0 +1,375 @@
+{# ------------------------------------------------------------------ #}
+{# Watchlist composite chart — equal-weight + cap-weight index lines    #}
+{# plus an S&P 500 (SPY) benchmark, all three selectable, with          #}
+{# selectable time windows, a crosshair price tooltip, and toggle chips #}
+{# to overlay individual member symbols. Rendered below the table on a  #}
+{# specific-list view (a single list_id is required for the persisted   #}
+{# $WLEQ:/$WLCW: synthetic series).                                     #}
+{# Expects: selected_id (int), selected_label (str), items (truthy).    #}
+{# ------------------------------------------------------------------ #}
+{% from "_macros.html" import card %}
+{% if selected_id is not none and items %}
+<script src="https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
+
+{% call card(
+    title="Group performance",
+    subtitle="Equal-weight and market-cap-weighted composites of this list, plus the S&P 500, indexed to 100 at the start of the selected window. Toggle any baseline off, or add individual symbols, to compare how names lead or lag during sector highs and lows.") %}
+
+  <!-- Toolbar: time windows + freshness + rebuild -->
+  <div class="flex items-center justify-between flex-wrap gap-3 mb-3">
+    <div id="wlc-window-toolbar" class="flex items-center gap-1" role="group"
+         aria-label="Chart time window">
+      <span class="text-xs text-ink-500 mr-1">Window</span>
+      {% for w in ['30d', '90d', '1y', '3y', 'All'] %}
+        <button type="button" data-window="{{ w }}"
+                class="wlc-window-btn text-xs px-2.5 py-1 rounded border border-ink-300
+                       bg-white hover:bg-ink-100 transition-colors"
+                title="Show the last {{ w }} and rebase every line to 100 at that start">{{ w }}</button>
+      {% endfor %}
+    </div>
+    <div class="flex items-center gap-3 text-xs">
+      <span id="wlc-asof" class="text-ink-500"
+            title="Date of the last bar in the composite. Composites refresh when you add/remove symbols or click Rebuild.">—</span>
+      <form action="/watchlist/composite/rebuild" method="post" class="inline">
+        <input type="hidden" name="list_id" value="{{ selected_id }}">
+        <button type="submit"
+                class="text-ink-500 hover:text-ink-900 underline"
+                title="Recompute both composites from current membership and the latest stored bars (no data is fetched from the provider).">
+          ↻ Rebuild
+        </button>
+      </form>
+    </div>
+  </div>
+
+  <!-- Baseline toggles (Equal-weight / Cap-weight / S&P 500) -->
+  <div id="wlc-baselines" class="flex items-center gap-1.5 flex-wrap mb-2"></div>
+
+  <!-- Legend (live values for whatever is visible) -->
+  <div id="wlc-legend" class="flex items-center gap-4 flex-wrap text-xs mb-2"></div>
+
+  <!-- Chart + hover tooltip -->
+  <div id="wlc-chart-wrap" class="relative">
+    <div id="wlc-chart" style="width:100%; height: 420px;"></div>
+    <div id="wlc-tooltip"
+         style="position:absolute; display:none; pointer-events:none; top:8px; left:12px;
+                z-index:5; background:rgba(255,255,255,0.96); border:1px solid #cbd5e1;
+                border-radius:6px; padding:8px 10px;
+                font:12px/1.5 ui-monospace, SFMono-Regular, monospace;
+                color:#1e293b; box-shadow:0 2px 6px rgba(0,0,0,0.08); min-width:190px;">
+    </div>
+  </div>
+
+  <!-- Empty / unbuilt state -->
+  <div id="wlc-empty" class="hidden text-sm text-ink-500 py-8 text-center"></div>
+
+  <!-- Member overlay chips -->
+  <div class="mt-3 pt-3 border-t border-ink-300/40">
+    <div class="text-xs text-ink-500 mb-1.5">Overlay a symbol (rebased to the same window):</div>
+    <div id="wlc-chips" class="flex items-center gap-1.5 flex-wrap"></div>
+  </div>
+
+  <script>
+  (function () {
+    const LIST_ID = {{ selected_id | tojson }};
+    const ROOT = document.getElementById('wlc-chart');
+    const WRAP = document.getElementById('wlc-chart-wrap');
+    const TIP = document.getElementById('wlc-tooltip');
+    const EMPTY = document.getElementById('wlc-empty');
+    const LEGEND = document.getElementById('wlc-legend');
+    const BASELINES = document.getElementById('wlc-baselines');
+    const CHIPS = document.getElementById('wlc-chips');
+    if (!ROOT || typeof LightweightCharts === 'undefined') return;
+
+    const WIN_DAYS = { '30d': 30, '90d': 90, '1y': 365, '3y': 1095, 'All': null };
+    const WIN_KEY = 'wlc.window.' + LIST_ID;
+    const OVL_KEY = 'wlc.overlays.' + LIST_ID;
+    const HIDE_KEY = 'wlc.hidden.' + LIST_ID;  // baselines the user has toggled off
+    const OVERLAY_COLORS = ['#0ea5e9', '#16a34a', '#db2777', '#9333ea',
+                            '#0891b2', '#ca8a04', '#dc2626', '#4f46e5'];
+
+    let curWin = '1y';
+    try { const w = localStorage.getItem(WIN_KEY); if (w && WIN_DAYS.hasOwnProperty(w)) curWin = w; } catch (e) {}
+
+    // Unified series registry: key → { meta:{label,color,dashed,raw}, s:LWSeries, visible:bool }.
+    // Baselines (eq/cw/spy) keep their data and toggle visibility; member overlays
+    // are added/removed on demand.
+    const reg = {};
+    let chart = null;
+    const fmtPct = (v) => (v >= 0 ? '+' : '') + v.toFixed(2) + '%';
+
+    function hiddenSet() {
+      try { return new Set(JSON.parse(localStorage.getItem(HIDE_KEY) || '[]')); } catch (e) { return new Set(); }
+    }
+    function persistHidden() {
+      const off = Object.keys(reg).filter(k => reg[k].baseline && !reg[k].visible);
+      try { localStorage.setItem(HIDE_KEY, JSON.stringify(off)); } catch (e) {}
+    }
+
+    function makeChart() {
+      chart = LightweightCharts.createChart(ROOT, {
+        height: 420,
+        layout: { background: { type: 'solid', color: 'transparent' }, textColor: '#475569', fontSize: 11 },
+        grid: { vertLines: { color: 'rgba(148,163,184,0.12)' }, horzLines: { color: 'rgba(148,163,184,0.12)' } },
+        rightPriceScale: { borderColor: 'rgba(148,163,184,0.4)' },
+        timeScale: { borderColor: 'rgba(148,163,184,0.4)', timeVisible: false },
+        crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
+        localization: { priceFormatter: (p) => fmtPct(p - 100) },
+      });
+      new ResizeObserver((entries) => {
+        for (const e of entries) chart.applyOptions({ width: e.contentRect.width });
+      }).observe(ROOT);
+      chart.subscribeCrosshairMove(onCrosshair);
+    }
+
+    // Slice an absolute series to the selected window and rebase to 100 at its
+    // first in-window point — what makes "who's outperforming over this period"
+    // directly readable.
+    function rebased(raw) {
+      if (!raw || !raw.length) return [];
+      let from = 0;
+      const days = WIN_DAYS[curWin];
+      if (days != null) {
+        const lastMs = Date.parse(raw[raw.length - 1].time + 'T00:00:00Z');
+        const cutoff = lastMs - days * 86400000;
+        from = raw.findIndex(p => Date.parse(p.time + 'T00:00:00Z') >= cutoff);
+        if (from < 0) from = 0;
+      }
+      const base = raw[from].value;
+      if (!base) return [];
+      const out = [];
+      for (let i = from; i < raw.length; i++) {
+        out.push({ time: raw[i].time, value: (raw[i].value / base) * 100 });
+      }
+      return out;
+    }
+
+    function redrawAll() {
+      for (const key in reg) reg[key].s.setData(rebased(reg[key].meta.raw));
+      chart.timeScale().fitContent();
+      renderLegend();
+    }
+
+    function addSeries(key, meta, baseline, visible) {
+      const s = chart.addLineSeries({
+        color: meta.color,
+        lineWidth: 2,
+        lineStyle: meta.dashed ? LightweightCharts.LineStyle.Dashed : LightweightCharts.LineStyle.Solid,
+        priceLineVisible: false,
+        lastValueVisible: false,
+        visible: visible !== false,
+        title: meta.label,
+      });
+      s.setData(rebased(meta.raw));
+      reg[key] = { meta, s, baseline: !!baseline, visible: visible !== false };
+    }
+
+    function removeSeries(key) {
+      if (reg[key]) { chart.removeSeries(reg[key].s); delete reg[key]; }
+    }
+
+    function setVisible(key, on) {
+      if (!reg[key]) return;
+      reg[key].visible = on;
+      reg[key].s.applyOptions({ visible: on });
+      renderLegend();
+    }
+
+    function renderLegend() {
+      const bits = [];
+      for (const key in reg) {
+        const e = reg[key];
+        if (!e.visible) continue;
+        const r = rebased(e.meta.raw);
+        const last = r.length ? r[r.length - 1].value - 100 : null;
+        bits.push(
+          '<span class="inline-flex items-center gap-1.5">' +
+          '<span style="display:inline-block;width:12px;height:0;border-top:3px ' +
+          (e.meta.dashed ? 'dashed' : 'solid') + ' ' + e.meta.color + '"></span>' +
+          '<span class="font-mono">' + e.meta.label + '</span>' +
+          (last != null ? '<span class="' + (last >= 0 ? 'text-ok-600' : 'text-bad-600') +
+            '">' + fmtPct(last) + '</span>' : '') +
+          '</span>'
+        );
+      }
+      LEGEND.innerHTML = bits.join('');
+    }
+
+    function onCrosshair(param) {
+      if (!param || !param.time || !param.point || param.point.y < 0) {
+        TIP.style.display = 'none';
+        return;
+      }
+      const rows = [];
+      for (const key in reg) {
+        if (!reg[key].visible) continue;
+        const sd = param.seriesData.get(reg[key].s);
+        if (!sd) continue;
+        rows.push(
+          '<div style="display:flex;justify-content:space-between;gap:14px">' +
+          '<span style="color:' + reg[key].meta.color + '">' + reg[key].meta.label + '</span>' +
+          '<span>' + fmtPct(sd.value - 100) + '</span></div>'
+        );
+      }
+      if (!rows.length) { TIP.style.display = 'none'; return; }
+      TIP.innerHTML = '<div style="font-weight:600;margin-bottom:3px">' + param.time + '</div>' + rows.join('');
+      TIP.style.display = 'block';
+    }
+
+    function setWindow(label) {
+      curWin = label;
+      try { localStorage.setItem(WIN_KEY, label); } catch (e) {}
+      document.querySelectorAll('.wlc-window-btn').forEach(b => {
+        const on = b.dataset.window === label;
+        b.classList.toggle('bg-ink-900', on);
+        b.classList.toggle('text-white', on);
+        b.classList.toggle('bg-white', !on);
+      });
+      if (chart) redrawAll();
+    }
+    document.querySelectorAll('.wlc-window-btn').forEach(b => {
+      b.addEventListener('click', () => setWindow(b.dataset.window));
+    });
+
+    // ---- Baseline toggle chips (Equal-weight / Cap-weight / S&P 500) ----
+    function styleChip(chip, on, color) {
+      chip.classList.toggle('text-white', on);
+      chip.style.background = on ? color : '#fff';
+      chip.style.borderColor = color;
+      chip.style.color = on ? '#fff' : color;
+    }
+    function renderBaselineChips(keys) {
+      BASELINES.innerHTML = '';
+      keys.forEach(key => {
+        const e = reg[key];
+        if (!e) return;
+        const chip = document.createElement('button');
+        chip.type = 'button';
+        chip.textContent = e.meta.label;
+        chip.className = 'text-xs px-2.5 py-1 rounded border transition-colors';
+        chip.title = 'Show or hide the ' + e.meta.label + ' line';
+        styleChip(chip, e.visible, e.meta.color);
+        chip.addEventListener('click', () => {
+          const on = !reg[key].visible;
+          setVisible(key, on);
+          styleChip(chip, on, e.meta.color);
+          persistHidden();
+        });
+        BASELINES.appendChild(chip);
+      });
+    }
+
+    // ---- Member overlay chips ----
+    function savedOverlays() {
+      try { return JSON.parse(localStorage.getItem(OVL_KEY) || '[]'); } catch (e) { return []; }
+    }
+    function persistOverlays() {
+      const on = Object.keys(reg).filter(k => k.startsWith('sym:')).map(k => k.slice(4));
+      try { localStorage.setItem(OVL_KEY, JSON.stringify(on)); } catch (e) {}
+    }
+
+    async function toggleSymbol(sym, chip) {
+      const key = 'sym:' + sym;
+      if (reg[key]) {
+        removeSeries(key);
+        chip.classList.remove('bg-ink-900', 'text-white');
+        chip.classList.add('bg-white');
+        persistOverlays();
+        renderLegend();
+        return;
+      }
+      chip.disabled = true;
+      try {
+        const r = await fetch('/watchlist/series?symbols=' + encodeURIComponent(sym));
+        const j = await r.json();
+        const raw = (j.series && j.series[sym]) || [];
+        if (!raw.length) { chip.title = 'No price history for ' + sym; return; }
+        const idx = Object.keys(reg).filter(k => k.startsWith('sym:')).length;
+        addSeries(key, { label: sym, color: OVERLAY_COLORS[idx % OVERLAY_COLORS.length],
+                         dashed: false, raw }, false, true);
+        chip.classList.remove('bg-white');
+        chip.classList.add('bg-ink-900', 'text-white');
+        chart.timeScale().fitContent();
+        persistOverlays();
+        renderLegend();
+      } catch (e) {
+        chip.title = 'Failed to load ' + sym;
+      } finally {
+        chip.disabled = false;
+      }
+    }
+
+    function renderChips(members) {
+      CHIPS.innerHTML = '';
+      members.forEach(sym => {
+        const chip = document.createElement('button');
+        chip.type = 'button';
+        chip.textContent = sym;
+        chip.className = 'wlc-chip text-xs font-mono px-2 py-1 rounded border ' +
+                         'border-ink-300 bg-white hover:bg-ink-100 transition-colors ' +
+                         'disabled:opacity-50 disabled:cursor-wait';
+        chip.addEventListener('click', () => toggleSymbol(sym, chip));
+        CHIPS.appendChild(chip);
+      });
+    }
+
+    // ---- Boot ----
+    async function boot() {
+      let payload;
+      try {
+        const r = await fetch('/watchlist/composite?list_id=' + LIST_ID);
+        payload = await r.json();
+      } catch (e) {
+        EMPTY.textContent = 'Could not load the composite chart.';
+        EMPTY.classList.remove('hidden');
+        WRAP.classList.add('hidden');
+        return;
+      }
+      const eq = (payload.series && payload.series.equal_weight) || [];
+      const cw = (payload.series && payload.series.cap_weight) || [];
+      const bench = (payload.series && payload.series.benchmark) || [];
+      document.getElementById('wlc-asof').textContent =
+        payload.as_of ? ('Composite as of ' + payload.as_of) : 'Not built yet';
+
+      if (!payload.built || !eq.length) {
+        WRAP.classList.add('hidden');
+        LEGEND.classList.add('hidden');
+        EMPTY.innerHTML = 'No composite yet for this list. It builds automatically when you ' +
+          'add or remove symbols — or click <strong>↻ Rebuild</strong> above (needs price ' +
+          'history, so run a Refresh first if these symbols are brand new).';
+        EMPTY.classList.remove('hidden');
+        renderChips(payload.members || []);
+        return;
+      }
+
+      makeChart();
+      const hidden = hiddenSet();
+      const baselineKeys = [];
+      addSeries('eq', { label: 'Equal-weight', color: '#4f46e5', dashed: false, raw: eq },
+                true, !hidden.has('eq'));
+      baselineKeys.push('eq');
+      if (cw.length) {
+        addSeries('cw', { label: 'Cap-weight', color: '#d97706', dashed: true, raw: cw },
+                  true, !hidden.has('cw'));
+        baselineKeys.push('cw');
+      }
+      if (bench.length) {
+        addSeries('spy', { label: payload.benchmark_label || 'S&P 500', color: '#64748b',
+                           dashed: false, raw: bench }, true, !hidden.has('spy'));
+        baselineKeys.push('spy');
+      }
+      renderBaselineChips(baselineKeys);
+      renderChips(payload.members || []);
+      setWindow(curWin);  // draws + rebases + highlights the active window button
+
+      // Restore previously-toggled member overlays.
+      const want = savedOverlays();
+      const chipByText = {};
+      CHIPS.querySelectorAll('.wlc-chip').forEach(c => { chipByText[c.textContent] = c; });
+      want.forEach(sym => { if (chipByText[sym]) toggleSymbol(sym, chipByText[sym]); });
+    }
+
+    boot();
+  })();
+  </script>
+{% endcall %}
+{% endif %}

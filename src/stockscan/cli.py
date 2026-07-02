@@ -136,7 +136,12 @@ def _configure(ctx: typer.Context) -> None:
     from stockscan.config import config_warnings
     from stockscan.logging_setup import setup_logging
 
-    component = "nightly" if ctx.invoked_subcommand == "jobs" else "cli"
+    if ctx.invoked_subcommand == "jobs":
+        component = "nightly"
+    elif ctx.invoked_subcommand == "hedge":
+        component = "hedge"  # long-running daemon → its own rotating log file.
+    else:
+        component = "cli"
     setup_logging(component=component)
     # Scheduled jobs announce degraded config loudly; interactive commands
     # stay quiet (the `health` command reports the same facts on demand).
@@ -171,6 +176,10 @@ options_app = typer.Typer(
     help="Options-premium proposals: ranked short-put/short-call book.",
     no_args_is_help=True,
 )
+hedge_app = typer.Typer(
+    help="Delta hedging: run the real-time stock-hedge daemon; inspect state.",
+    no_args_is_help=True,
+)
 app.add_typer(db_app, name="db")
 app.add_typer(refresh_app, name="refresh")
 app.add_typer(strat_app, name="strategies")
@@ -184,6 +193,7 @@ app.add_typer(analysis_app, name="analysis")
 app.add_typer(composites_app, name="composites")
 app.add_typer(mcp_app_cli, name="mcp")
 app.add_typer(options_app, name="options")
+app.add_typer(hedge_app, name="hedge")
 
 
 # ----------------------------------------------------------------------
@@ -746,6 +756,61 @@ def watchlist_check_alerts_cmd() -> None:
     console.print(f"[green]✓[/green] {len(result.fired)} alert(s) fired")
     for it in result.fired:
         console.print(f"  • {it.symbol} crossed {it.target_direction} ${it.target_price}")
+
+
+@watchlist_app.command("rebuild-composites")
+def watchlist_rebuild_composites_cmd(
+    skip_shares: bool = typer.Option(
+        False, "--skip-shares",
+        help="Don't (re)extract shares history from stored fundamentals first.",
+    ),
+) -> None:
+    """Build the equal-weight + cap-weight composites for every watchlist.
+
+    Writes two synthetic instruments per list — ``$WLEQ:<id>`` (equal-weight) and
+    ``$WLCW:<id>`` (cap-weight) — into the bars hypertable, the same way sector
+    composites are stored. This is the one-shot backfill for existing lists and a
+    safe, idempotent rebuild thereafter.
+
+    **Zero API budget.** It reads only data already in Postgres: stored member
+    bars, and point-in-time shares reconstructed from the EODHD payloads already
+    in ``fundamentals_snapshot.raw_payload``. Nothing is fetched from the provider.
+
+    Examples:
+        stockscan watchlist rebuild-composites
+        stockscan watchlist rebuild-composites --skip-shares
+    """
+    from stockscan.fundamentals.history import backfill_shares_history_from_snapshots
+    from stockscan.watchlist.composite import backfill_all_lists
+
+    if not skip_shares:
+        console.print("[cyan]→[/cyan] extracting point-in-time shares history (no API calls)")
+        hist = backfill_shares_history_from_snapshots()
+        console.print(
+            f"[green]✓[/green] shares history for {len(hist)} symbol(s), "
+            f"{sum(hist.values()):,} period rows"
+        )
+
+    console.print("[cyan]→[/cyan] rebuilding watchlist composites (no API calls)")
+    results = backfill_all_lists()
+    if not results:
+        console.print("[yellow]No watchlists found.[/yellow]")
+        raise typer.Exit(0)
+
+    table = Table(title="Watchlist composites")
+    table.add_column("List", justify="right", style="cyan")
+    table.add_column("Members", justify="right")
+    table.add_column("EQ bars", justify="right")
+    table.add_column("CW bars", justify="right")
+    table.add_column("As of")
+    for r in results:
+        table.add_row(
+            str(r.list_id), str(r.members), f"{r.eq_rows:,}", f"{r.cw_rows:,}",
+            str(r.as_of) if r.as_of else "—",
+        )
+    console.print(table)
+    built = sum(1 for r in results if r.eq_rows)
+    console.print(f"[green]✓[/green] {built}/{len(results)} list(s) have a composite")
 
 
 # ----------------------------------------------------------------------
@@ -2144,6 +2209,268 @@ def options_propose(
 
         run_id = save_run(run, list_id=list_id)
         console.print(f"[green]✓[/green] saved proposal run #{run_id}")
+
+
+# ----------------------------------------------------------------------
+# Delta hedging
+# ----------------------------------------------------------------------
+@hedge_app.command("run")
+def hedge_run() -> None:
+    """Run the real-time delta-hedge daemon (blocking).
+
+    Opens one price feed (EODHD websocket when EODHD_API_KEY is set, otherwise a
+    simulated feed), then hedges every active position on the /hedge page until
+    interrupted (Ctrl-C / SIGTERM). All state is in Postgres, so this is safe to
+    restart — it resumes from the adjustment ledger.
+    """
+    from stockscan.hedge.daemon import run_daemon
+
+    console.print("[cyan]Starting delta-hedge daemon[/cyan] (Ctrl-C to stop)…")
+    run_daemon()
+
+
+@hedge_app.command("status")
+def hedge_status() -> None:
+    """Show the daemon heartbeat and every active hedge position with live P&L."""
+    from stockscan.hedge import service, store
+
+    hb = store.get_heartbeat()
+    if hb is None:
+        console.print("[yellow]No heartbeat — the daemon has never run.[/yellow]")
+    else:
+        console.print(
+            f"daemon: [bold]{hb['status']}[/bold] pid={hb['pid']} feed={hb['feed_kind']} "
+            f"symbols={hb['active_symbols']} last_beat={hb['last_heartbeat_at']}"
+        )
+
+    positions = store.list_hedge_positions()
+    active = [p for p in positions if p.status != "closed"]
+    if not active:
+        console.print("No open hedge positions.")
+        return
+
+    table = Table(title="Delta-hedge positions")
+    for col in ("#", "Symbol", "Option", "Held", "Target", "Δ", "Net P&L", "Status"):
+        table.add_column(col, justify="right" if col not in ("Symbol", "Option", "Status") else "left")
+    for p in active:
+        pnl = service.live_pnl(p)
+        opt = f"{p.option_side} {p.contracts}x {p.option_kind} {float(p.strike):g}"
+        delta = f"{float(p.last_delta):.0f}" if p.last_delta is not None else "—"
+        target = str(p.last_target_shares) if p.last_target_shares is not None else "—"
+        table.add_row(
+            str(p.hedge_position_id), p.symbol, opt, str(p.held_shares), target, delta,
+            f"{pnl['net_open_pnl']:+,.0f}", p.status,
+        )
+    console.print(table)
+
+
+def _hedge_build_spec_and_path(
+    *, symbol, from_, to, spot, vol, drift, days, steps_per_day, seed,
+    side, kind, strike, delta, contracts, dte, iv, rate, premium,
+):
+    """Resolve CLI flags into an (OptionSpec, PricePath) via the shared resolver."""
+    from stockscan.hedge import simulate as sim
+
+    try:
+        return sim.resolve_spec_and_path(
+            symbol=symbol, from_date=from_, to_date=to, spot=spot, annual_vol_pct=vol,
+            drift_pct=drift, days=days, steps_per_day=steps_per_day, seed=seed,
+            option_side=side, option_kind=kind, strike=strike, target_delta=delta,
+            contracts=contracts, dte=dte, iv_pct=iv, rate_pct=rate, premium=premium,
+        )
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+
+
+def _hedge_policy(band_mode, risk_aversion, fixed_band, pct_move, cost_rate):
+    from stockscan.hedge.policy import HedgePolicy
+
+    return HedgePolicy(mode=band_mode, risk_aversion=risk_aversion,
+                       fixed_band_shares=fixed_band, pct_move=pct_move, cost_rate=cost_rate)
+
+
+@hedge_app.command("simulate")
+def hedge_simulate(
+    symbol: str | None = typer.Option(None, "--symbol", "-s", help="Historical source (stored bars)."),
+    from_: str | None = typer.Option(None, "--from", help="Historical start YYYY-MM-DD (default 90d before --to)."),
+    to: str | None = typer.Option(None, "--to", help="Historical end (default today)."),
+    spot: float | None = typer.Option(None, "--spot", help="Synthetic start price (if no --symbol)."),
+    vol: float = typer.Option(40.0, "--vol", help="Synthetic annual vol %; also IV if --iv unset."),
+    drift: float = typer.Option(0.0, "--drift", help="Synthetic annual drift %."),
+    days: float | None = typer.Option(None, "--days", help="Synthetic path length (default = --dte)."),
+    steps_per_day: int = typer.Option(39, "--steps-per-day"),
+    seed: int = typer.Option(0, "--seed"),
+    side: str = typer.Option("short", "--side", help="short | long"),
+    kind: str = typer.Option("call", "--kind", help="call | put"),
+    strike: float | None = typer.Option(None, "--strike", help="Explicit strike (else solved from --delta)."),
+    delta: float = typer.Option(0.30, "--delta", help="Target delta for the strike."),
+    contracts: int = typer.Option(1, "--contracts"),
+    dte: int = typer.Option(30, "--dte", help="Days to expiry (synthetic)."),
+    iv: float | None = typer.Option(None, "--iv", help="Override IV %."),
+    rate: float | None = typer.Option(None, "--rate", help="Risk-free % (default from settings)."),
+    premium: float | None = typer.Option(None, "--premium", help="Override premium (else BS fair value)."),
+    band_mode: str = typer.Option("whalley_wilmott", "--band-mode"),
+    risk_aversion: float = typer.Option(0.05, "--risk-aversion"),
+    fixed_band: float = typer.Option(5.0, "--fixed-band"),
+    pct_move: float = typer.Option(0.01, "--pct-move"),
+    cost_rate: float = typer.Option(0.0005, "--cost-rate"),
+    show_trades: bool = typer.Option(False, "--show-trades/--no-show-trades"),
+    out: str | None = typer.Option(None, "--out", "-o", help="Write full result JSON here."),
+) -> None:
+    """Simulate the hedge over one price path (synthetic or historical)."""
+    from stockscan.hedge import simulate as sim
+
+    spec, path = _hedge_build_spec_and_path(
+        symbol=symbol, from_=from_, to=to, spot=spot, vol=vol, drift=drift, days=days,
+        steps_per_day=steps_per_day, seed=seed, side=side, kind=kind, strike=strike,
+        delta=delta, contracts=contracts, dte=dte, iv=iv, rate=rate, premium=premium,
+    )
+    policy = _hedge_policy(band_mode, risk_aversion, fixed_band, pct_move, cost_rate)
+    res = sim.simulate_hedge(spec, policy, path, cost_rate=cost_rate)
+    s = res.summary
+
+    console.print(f"[bold]{s['label']}[/bold] — {s['option']} · premium ${s['premium']:,.0f} · IV {s['iv_pct']:g}%")
+    table = Table(show_header=False, box=None)
+    for k in ("steps", "num_trades", "shares_traded", "transaction_cost", "option_pnl",
+              "hedge_pnl", "gross_pnl", "net_pnl", "net_pct_premium", "max_drawdown",
+              "tracking_error_shares", "in_the_money"):
+        table.add_row(k, f"{s[k]:,.2f}" if isinstance(s[k], float) else str(s[k]))
+    console.print(table)
+
+    if show_trades and res.trades:
+        tt = Table(title=f"Trades ({len(res.trades)})")
+        for c in ("ts", "side", "qty", "price", "delta", "target", "held_after"):
+            tt.add_column(c)
+        for tr in res.trades[:200]:
+            tt.add_row(tr["ts"][11:19], tr["side"], str(tr["qty"]), f"{tr['price']:.2f}",
+                       f"{tr['delta']:.0f}", str(tr["target"]), str(tr["held_after"]))
+        console.print(tt)
+
+    if out:
+        import json
+
+        with open(out, "w") as f:
+            json.dump({"summary": s, "trades": res.trades, "series": res.sampled_series()}, f, indent=2)
+        console.print(f"[green]✓[/green] wrote {out}")
+
+
+@hedge_app.command("montecarlo")
+def hedge_montecarlo(
+    spot: float = typer.Option(..., "--spot", help="Start price."),
+    vol: float = typer.Option(40.0, "--vol", help="Annual vol %."),
+    drift: float = typer.Option(0.0, "--drift", help="Annual drift %."),
+    dte: int = typer.Option(30, "--dte"),
+    days: float | None = typer.Option(None, "--days", help="Path length (default = --dte)."),
+    n_paths: int = typer.Option(500, "--paths", "-n"),
+    steps_per_day: int = typer.Option(20, "--steps-per-day"),
+    seed: int = typer.Option(0, "--seed"),
+    side: str = typer.Option("short", "--side"),
+    kind: str = typer.Option("call", "--kind"),
+    strike: float | None = typer.Option(None, "--strike"),
+    delta: float = typer.Option(0.30, "--delta"),
+    contracts: int = typer.Option(1, "--contracts"),
+    iv: float | None = typer.Option(None, "--iv"),
+    rate: float | None = typer.Option(None, "--rate"),
+    premium: float | None = typer.Option(None, "--premium"),
+    band_mode: str = typer.Option("whalley_wilmott", "--band-mode"),
+    risk_aversion: float = typer.Option(0.05, "--risk-aversion"),
+    fixed_band: float = typer.Option(5.0, "--fixed-band"),
+    pct_move: float = typer.Option(0.01, "--pct-move"),
+    cost_rate: float = typer.Option(0.0005, "--cost-rate"),
+) -> None:
+    """Monte Carlo: many random paths → the distribution of net P&L."""
+    from stockscan.hedge import simulate as sim
+
+    rate_pct = rate if rate is not None else settings.risk_free_rate * 100.0
+    iv_used = iv if iv is not None else vol
+    days_used = days if days is not None else float(dte)
+    spec = sim.build_option_spec(option_kind=kind, option_side=side, spot=spot, dte=dte,
+                                 iv_pct=iv_used, rate_pct=rate_pct, contracts=contracts,
+                                 strike=strike, target_delta=delta, premium=premium)
+    policy = _hedge_policy(band_mode, risk_aversion, fixed_band, pct_move, cost_rate)
+    m = sim.monte_carlo(spec, policy, n_paths=n_paths, s0=spot, annual_vol_pct=vol,
+                        drift_pct=drift, days=days_used, steps_per_day=steps_per_day,
+                        seed=seed, cost_rate=cost_rate)
+    d = m["net_pnl"]
+    console.print(f"[bold]Monte Carlo[/bold] — {n_paths} paths · {side} {kind} · IV {iv_used:g}% · premium ${spec.premium:,.0f}")
+    t = Table(show_header=False, box=None)
+    t.add_row("net mean", f"${d['mean']:,.0f}")
+    t.add_row("net median", f"${d['median']:,.0f}")
+    t.add_row("net std", f"${d['std']:,.0f}")
+    t.add_row("p5 / p95", f"${d['p5']:,.0f} / ${d['p95']:,.0f}")
+    t.add_row("min / max", f"${d['min']:,.0f} / ${d['max']:,.0f}")
+    t.add_row("win rate", f"{m['win_rate']:.1%}")
+    t.add_row("avg trades", f"{m['avg_trades']:g}")
+    t.add_row("avg cost", f"${m['avg_cost']:,.0f}")
+    console.print(t)
+
+
+@hedge_app.command("sweep")
+def hedge_sweep(
+    over: str = typer.Option("risk_aversion", "--over", help="risk_aversion | fixed_band"),
+    values: str = typer.Option("0.005,0.02,0.05,0.2,1.0", "--values", help="Comma-separated grid."),
+    mc_paths: int = typer.Option(0, "--mc", help="If >0, run this many MC paths per point (else single path)."),
+    symbol: str | None = typer.Option(None, "--symbol", "-s"),
+    from_: str | None = typer.Option(None, "--from"),
+    to: str | None = typer.Option(None, "--to"),
+    spot: float | None = typer.Option(None, "--spot"),
+    vol: float = typer.Option(40.0, "--vol"),
+    drift: float = typer.Option(0.0, "--drift"),
+    days: float | None = typer.Option(None, "--days"),
+    steps_per_day: int = typer.Option(39, "--steps-per-day"),
+    seed: int = typer.Option(0, "--seed"),
+    side: str = typer.Option("short", "--side"),
+    kind: str = typer.Option("call", "--kind"),
+    strike: float | None = typer.Option(None, "--strike"),
+    delta: float = typer.Option(0.30, "--delta"),
+    contracts: int = typer.Option(1, "--contracts"),
+    dte: int = typer.Option(30, "--dte"),
+    iv: float | None = typer.Option(None, "--iv"),
+    rate: float | None = typer.Option(None, "--rate"),
+    premium: float | None = typer.Option(None, "--premium"),
+    cost_rate: float = typer.Option(0.0005, "--cost-rate"),
+) -> None:
+    """Sweep a band setting across a grid and compare the metrics side by side."""
+    from stockscan.hedge import simulate as sim
+
+    try:
+        grid_vals = [float(v) for v in values.split(",") if v.strip()]
+    except ValueError as exc:
+        raise typer.BadParameter(f"--values must be comma-separated numbers: {exc}") from exc
+    variations = (sim.fixed_band_grid(grid_vals, cost_rate=cost_rate) if over == "fixed_band"
+                  else sim.ww_risk_aversion_grid(grid_vals, cost_rate=cost_rate))
+
+    spec, path = _hedge_build_spec_and_path(
+        symbol=symbol, from_=from_, to=to, spot=spot, vol=vol, drift=drift, days=days,
+        steps_per_day=steps_per_day, seed=seed, side=side, kind=kind, strike=strike,
+        delta=delta, contracts=contracts, dte=dte, iv=iv, rate=rate, premium=premium,
+    )
+    if mc_paths > 0:
+        s0 = spot if spot is not None else path.spots[0]
+        days_used = days if days is not None else float(dte)
+        sw = sim.sweep(spec, variations, mc={"n_paths": mc_paths, "s0": s0, "annual_vol_pct": vol,
+                                             "drift_pct": drift, "days": days_used,
+                                             "steps_per_day": max(10, steps_per_day // 2), "seed": seed})
+    else:
+        sw = sim.sweep(spec, variations, path=path, cost_rate=cost_rate)
+
+    console.print(f"[bold]Sweep over {over}[/bold] — {sw['mode']} · {spec.option_side} {spec.option_kind} {spec.strike:g}")
+    t = Table()
+    if sw["mode"] == "single_path":
+        for c in ("variation", "trades", "cost", "track_err", "net_pnl", "net_%prem"):
+            t.add_column(c)
+        for r in sw["rows"]:
+            t.add_row(r["variation"], str(r["num_trades"]), f"{r['transaction_cost']:,.0f}",
+                      f"{r['tracking_error_shares']:g}", f"{r['net_pnl']:,.0f}",
+                      f"{r['net_pct_premium']}" if r["net_pct_premium"] is not None else "—")
+    else:
+        for c in ("variation", "avg_trades", "avg_cost", "net_mean", "net_median", "net_p5", "win_rate"):
+            t.add_column(c)
+        for r in sw["rows"]:
+            t.add_row(r["variation"], f"{r['avg_trades']:g}", f"{r['avg_cost']:,.0f}",
+                      f"{r['net_pnl_mean']:,.0f}", f"{r['net_pnl_median']:,.0f}",
+                      f"{r['net_pnl_p5']:,.0f}", f"{r['win_rate']:.1%}")
+    console.print(t)
 
 
 def main() -> None:

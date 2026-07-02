@@ -18,6 +18,7 @@ from stockscan.mcp.tools import analysis as t_analysis
 from stockscan.mcp.tools import backtests as t_backtests
 from stockscan.mcp.tools import context as t_context
 from stockscan.mcp.tools import data as t_data
+from stockscan.mcp.tools import hedge as t_hedge
 from stockscan.mcp.tools import proposals as t_proposals
 from stockscan.mcp.tools import scan as t_scan
 from stockscan.mcp.tools import signals as t_signals
@@ -37,7 +38,14 @@ INSTRUCTIONS = (
     "strategy's current version. Write tools (watchlist edits, running scans, "
     "refreshing data) are only available when the server is started with writes "
     "enabled; refresh_data is fire-and-poll — start it, then poll "
-    "get_refresh_status."
+    "get_refresh_status. The delta-hedge tools (list_hedges, get_hedge, "
+    "get_hedge_adjustments, hedge_daemon_status) are read-only: inspect the "
+    "hedged option positions, their live prices, greeks, no-transaction band, "
+    "P&L, and fill history — including a what-if via get_hedge(at_spot=...) — "
+    "but you cannot open, close, or steer a hedge from here. The hedge "
+    "simulation tools (simulate_hedge, hedge_monte_carlo, hedge_sweep) are an "
+    "offline playground: replay the hedging logic over synthetic or historical "
+    "price paths to experiment with and tune the band settings — no live effect."
 )
 
 # Read-only tools: always registered.
@@ -70,6 +78,15 @@ READ_TOOLS = (
     # backtests
     t_backtests.list_backtests,
     t_backtests.get_backtest,
+    # delta hedging (read-only — agents can inspect but never open/close/steer)
+    t_hedge.list_hedges,
+    t_hedge.get_hedge,
+    t_hedge.get_hedge_adjustments,
+    t_hedge.hedge_daemon_status,
+    # delta-hedge simulation playground (read-only — offline experiments)
+    t_hedge.simulate_hedge,
+    t_hedge.hedge_monte_carlo,
+    t_hedge.hedge_sweep,
     # refresh status (read side of the fire-and-poll refresh)
     t_scan.get_refresh_status,
 )

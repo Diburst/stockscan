@@ -28,6 +28,7 @@ from stockscan.web.routes import (
     backtests,
     base_rates,
     dashboard,
+    hedge,
     manual,
     news,
     options,
@@ -299,6 +300,7 @@ def create_app() -> FastAPI:
     app.include_router(manual.router)
     app.include_router(analysis.router)
     app.include_router(options.router)
+    app.include_router(hedge.router)
     app.include_router(regime.router)
 
     # Graft the MCP app's concrete routes onto the FastAPI router: the message

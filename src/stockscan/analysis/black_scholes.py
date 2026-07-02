@@ -187,6 +187,129 @@ def strike_for_delta(
 
 
 # ---------------------------------------------------------------------------
+# Delta hedging — position-level greeks + share target
+# ---------------------------------------------------------------------------
+# The strike-suggestion math above is a *pricing* helper: given a target delta,
+# find a strike. The functions below are the mirror image, used by the live
+# delta-hedge daemon: given a concrete option *position* (a strike we're already
+# short or long), how many shares of the underlying neutralise its delta right
+# now? Everything here is expressed in **share-equivalents** — the natural unit
+# for a stock hedge — and carries the sign of the position so a short call and a
+# long put (both negative-delta, both hedged with *long* stock) fall out of one
+# formula without special-casing.
+
+_CONTRACT_MULTIPLIER = 100  # US equity options: 1 contract = 100 shares.
+
+
+def years_to_expiry(expiry: object, now: object, *, floor: float = 1.0 / (365.0 * 24.0)) -> float:
+    """Time to expiry in **years**, from two timezone-aware datetimes (or dates).
+
+    ``floor`` (default ≈ 1 hour) keeps t strictly positive so Black-Scholes
+    doesn't divide by zero on expiry day; the daemon treats t at the floor as
+    "settle now". Accepts ``date`` or ``datetime`` for ``expiry``; a bare date
+    is taken as that day's 16:00 US-market-ish close is *not* assumed here —
+    callers that care pass a datetime. Both are converted to POSIX seconds.
+    """
+    import datetime as _dt
+
+    def _epoch(x: object) -> float:
+        if isinstance(x, _dt.datetime):
+            d = x
+        elif isinstance(x, _dt.date):
+            d = _dt.datetime(x.year, x.month, x.day, tzinfo=_dt.UTC)
+        else:
+            raise TypeError(f"expected date/datetime, got {type(x)!r}")
+        if d.tzinfo is None:
+            d = d.replace(tzinfo=_dt.UTC)
+        return d.timestamp()
+
+    dt_years = (_epoch(expiry) - _epoch(now)) / (_DAYS_PER_YEAR * 24.0 * 3600.0)
+    return max(floor, dt_years)
+
+
+def _position_sign(option_side: str) -> int:
+    """+1 if we are *long* the option, −1 if *short* it."""
+    if option_side == "long":
+        return 1
+    if option_side == "short":
+        return -1
+    raise ValueError(f"option_side must be 'long' or 'short', got {option_side!r}")
+
+
+def position_delta(
+    s: float,
+    k: float,
+    t: float,
+    r: float,
+    sigma: float,
+    kind: str,
+    option_side: str,
+    contracts: int,
+    *,
+    multiplier: int = _CONTRACT_MULTIPLIER,
+) -> float:
+    """Signed delta of the whole option **position**, in share-equivalents.
+
+    = per-share BS delta × multiplier × contracts × (±1 for long/short).
+
+    A short call (side=−1, call delta > 0) yields a **negative** position
+    delta, so the neutralising stock position is **positive** (long shares) —
+    matching intuition. A long put (side=+1, put delta < 0) is *also* negative,
+    and *also* hedged with long shares; the two only differ in how the number
+    moves with spot (short call = short gamma, long put = long gamma).
+    """
+    per_share = greeks(s, k, t, r, sigma, kind).delta
+    return per_share * multiplier * contracts * _position_sign(option_side)
+
+
+def position_gamma(
+    s: float,
+    k: float,
+    t: float,
+    r: float,
+    sigma: float,
+    kind: str,
+    option_side: str,
+    contracts: int,
+    *,
+    multiplier: int = _CONTRACT_MULTIPLIER,
+) -> float:
+    """Signed gamma of the position, in share-equivalents per $1 of spot.
+
+    dΔ_position/dS. Short options carry **negative** gamma (the delta moves
+    against you as spot moves — the source of the hedge's bleed); long options
+    carry positive gamma. Magnitude drives the Whalley-Wilmott band width.
+    """
+    per_share = greeks(s, k, t, r, sigma, kind).gamma
+    return per_share * multiplier * contracts * _position_sign(option_side)
+
+
+def hedge_target_shares(
+    s: float,
+    k: float,
+    t: float,
+    r: float,
+    sigma: float,
+    kind: str,
+    option_side: str,
+    contracts: int,
+    *,
+    multiplier: int = _CONTRACT_MULTIPLIER,
+) -> int:
+    """Whole-share stock position that makes the combined book delta-neutral.
+
+    target_shares = round( −position_delta ). Long stock for a short call /
+    long put; short stock for a long call / short put. This is the number the
+    hedger steers ``held_shares`` toward, inside the no-transaction band.
+    """
+    return round(
+        -position_delta(
+            s, k, t, r, sigma, kind, option_side, contracts, multiplier=multiplier
+        )
+    )
+
+
+# ---------------------------------------------------------------------------
 # High-level convenience wrapper
 # ---------------------------------------------------------------------------
 @dataclass(frozen=True, slots=True)

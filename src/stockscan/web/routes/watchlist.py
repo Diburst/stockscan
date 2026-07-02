@@ -22,6 +22,12 @@ from stockscan.insider import net_buys_90d, refresh_insider_for_watchlist
 from stockscan.refresh_log import mark_refreshed, refresh_due
 from stockscan.scan import refresh_signals
 from stockscan.strategies.reversal_swing import ReversalSwing
+from stockscan.watchlist.composite import (
+    composite_payload,
+    member_series,
+    rebuild_for_symbol,
+    refresh_watchlist_composites,
+)
 from stockscan.watchlist.store import (
     add_symbols,
     add_to_watchlist,
@@ -29,6 +35,7 @@ from stockscan.watchlist.store import (
     delete_watchlist,
     list_watchlist,
     list_watchlists,
+    lists_for_symbol,
     remove_from_list,
     remove_from_watchlist,
     remove_symbol,
@@ -90,6 +97,18 @@ def _backfill_history(symbol: str) -> str:
     return ""  # already up to date — no need to mention it
 
 router = APIRouter(prefix="/watchlist")
+
+
+def _rebuild_composites(list_id: int | None, s: Session) -> None:
+    """Rebuild a list's composites after a membership change. Best-effort: it
+    reads only stored bars + stored share history (no API calls) and must never
+    break the user's add/remove action, so failures are logged and swallowed."""
+    if list_id is None:
+        return
+    safe(
+        lambda: refresh_watchlist_composites(list_id, session=s),
+        label=f"watchlist.rebuild_composites[{list_id}]",
+    )
 
 
 def _bars_as_of(items: list) -> _date | None:
@@ -541,6 +560,9 @@ def watchlist_add(
     # Best-effort: the symbol is already added at this point.
     sym = symbol.strip().upper()
     backfill_suffix = _backfill_history(sym)
+    # Membership changed → rebuild the composites for every list the symbol is
+    # now on (covers the just-added list and any others it already belonged to).
+    safe(lambda: rebuild_for_symbol(sym, session=s), label=f"watchlist.rebuild[{sym}]")
     msg = f"Added {sym} to watchlist{backfill_suffix}"
     kind = "warn" if "failed" in backfill_suffix else "success"
 
@@ -564,7 +586,13 @@ def watchlist_unwatch(
     Dashboard state flips without a reload (TODO.md 'pill auto-flip').
     """
     sym = symbol.strip().upper()
+    # Capture the lists the symbol is on BEFORE removal (the membership rows are
+    # gone afterwards) so we can rebuild each affected composite.
+    affected = safe(lambda: lists_for_symbol(sym, session=s), default=[],
+                    label=f"watchlist.lists_for[{sym}]") or []
     removed = remove_symbol(sym, session=s)
+    for lid in affected:
+        _rebuild_composites(lid, s)
     msg = (
         f"Removed {sym} from watchlist"
         if removed
@@ -651,6 +679,9 @@ def watchlist_add_bulk(
 
     bars, failed = _backfill_many(result.added)
 
+    # One rebuild for the whole batch (not per-symbol) — the bulk-add path.
+    _rebuild_composites(result.list_id, s)
+
     parts = [f"Added {len(result.added)} symbol(s)"]
     if bars:
         parts.append(f"{bars} bars backfilled")
@@ -685,6 +716,72 @@ def watchlist_export(
         body,
         headers={"Content-Disposition": f'inline; filename="{filename}"'},
     )
+
+
+@router.get("/composite")
+def watchlist_composite(
+    list_id: int = Query(...),
+    s: Session = Depends(get_session),
+):
+    """JSON: the two base-100 composite series (equal-weight + cap-weight) for a
+    list, plus its member symbols and the freshness date. The chart rebases these
+    to the selected window client-side. Soft-fails to an empty, unbuilt payload so
+    the page still renders (with a Rebuild prompt) if anything goes wrong."""
+    payload = safe(
+        lambda: composite_payload(list_id, session=s),
+        label=f"watchlist.composite[{list_id}]",
+    )
+    if payload is None:
+        return {
+            "list_id": list_id, "members": [], "built": False,
+            "as_of": None, "series": {"equal_weight": [], "cap_weight": []},
+        }
+    return payload
+
+
+@router.get("/series")
+def watchlist_member_series(
+    symbols: str = Query(...),
+    s: Session = Depends(get_session),
+):
+    """JSON: absolute adjusted-close series for individual symbols, for overlay
+    lines on the composite chart. Accepts a comma-separated ``symbols`` list;
+    capped to a sane number so a crafted request can't fan out unbounded."""
+    wanted = [t.strip().upper() for t in symbols.split(",") if t.strip()][:25]
+    out = safe(
+        lambda: member_series(wanted, session=s),
+        default={},
+        label="watchlist.member_series",
+    )
+    return {"series": out or {}}
+
+
+@router.post("/composite/rebuild")
+def watchlist_composite_rebuild(
+    request: Request,
+    list_id: str = Form(...),
+    s: Session = Depends(get_session),
+):
+    """Manual rebuild button. Recomputes both composites from current membership
+    + newest stored data (no API calls) and redirects back to the list."""
+    try:
+        lid = int(list_id)
+    except ValueError:
+        return flash_redirect("/watchlist", "error", "Invalid list")
+    result = safe(
+        lambda: refresh_watchlist_composites(lid, session=s),
+        label=f"watchlist.composite_rebuild[{lid}]",
+    )
+    if result is None:
+        return flash_redirect(f"/watchlist?list={lid}", "error", "Composite rebuild failed")
+    if result.members == 0:
+        msg = "Composite cleared — list is empty"
+    elif result.eq_rows == 0:
+        msg = "No price history yet for these symbols — rebuild after a Refresh"
+    else:
+        cw = f"{result.cw_rows} cap-weight pts" if result.cw_rows else "cap-weight skipped (no share history)"
+        msg = f"Composite rebuilt — {result.eq_rows} equal-weight pts, {cw} (as of {result.as_of})"
+    return flash_redirect(f"/watchlist?list={lid}", "success", msg)
 
 
 @router.post("/lists/create")
@@ -756,10 +853,20 @@ def watchlist_delete(
 
     if lid is not None:
         remove_from_list(watchlist_id, lid, session=s)
+        _rebuild_composites(lid, s)
         msg = f"Removed {symbol} from this list" if symbol else "Removed from list"
         redirect = f"/watchlist?list={lid}"
     else:
+        # Removing the symbol from every list — capture them first so each
+        # affected composite is rebuilt after the rows are gone.
+        affected = (
+            safe(lambda: lists_for_symbol(symbol, session=s), default=[],
+                 label="watchlist.lists_for_delete") or []
+            if symbol else []
+        )
         remove_from_watchlist(watchlist_id, session=s)
+        for aff in affected:
+            _rebuild_composites(aff, s)
         msg = f"Removed {symbol} from watchlist" if symbol else "Removed from watchlist"
         redirect = "/watchlist?list=all"
     return flash_redirect(redirect, "success", msg)
@@ -777,6 +884,9 @@ def watchlist_delete_list(
     except ValueError:
         return flash_redirect("/watchlist", "error", "Invalid list")
     delete_watchlist(lid, session=s)
+    # The list (and its memberships) are gone; rebuilding now finds no members
+    # and clears the stale $WLEQ/$WLCW synthetic bars for this list.
+    _rebuild_composites(lid, s)
     return flash_redirect("/watchlist?list=all", "success", "List deleted")
 
 

@@ -351,11 +351,23 @@ def upsert_fundamentals(
     cols["symbol"] = symbol
     cols["raw_payload"] = json.dumps(payload, default=str)
 
+    def _store(s: Session) -> None:
+        s.execute(_UPSERT_SQL, cols)
+        # Side effect: extract the point-in-time shares-outstanding history from
+        # the same payload into fundamentals_history (no extra API call). Soft —
+        # a parse hiccup must never abort the snapshot upsert.
+        try:
+            from stockscan.fundamentals.history import store_shares_history_from_payload
+
+            store_shares_history_from_payload(symbol, payload, session=s)
+        except Exception:  # best-effort enrichment; never block the snapshot
+            log.warning("shares-history extract failed for %s", symbol, exc_info=True)
+
     if session is not None:
-        session.execute(_UPSERT_SQL, cols)
+        _store(session)
         return
     with session_scope() as s:
-        s.execute(_UPSERT_SQL, cols)
+        _store(s)
 
 
 # ---------------------------------------------------------------------
