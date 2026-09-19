@@ -147,6 +147,12 @@ class EODHDProvider(DataProvider):
             headers={"User-Agent": "stockscan/0.1"},
             transport=transport,
         )
+        # Entitled endpoint families (EODHD_FEATURES). Snapshotted at
+        # construction so a provider instance is consistent for its lifetime.
+        self.features: frozenset[str] = settings.eodhd_feature_set
+
+    def supports(self, feature: str) -> bool:
+        return feature in self.features
 
     # ------------------------------------------------------------------
     # Internals
@@ -213,6 +219,7 @@ class EODHDProvider(DataProvider):
         interval: str = "1d",
         exchange: str = "US",
     ) -> list[BarRow]:
+        self.require("eod")
         if interval != "1d":
             raise NotImplementedError(
                 "EODHDProvider currently supports only daily bars. "
@@ -255,6 +262,7 @@ class EODHDProvider(DataProvider):
     # Universe (S&P 500)
     # ------------------------------------------------------------------
     def get_sp500_constituents(self) -> list[UniverseMember]:
+        self.require("universe")
         data = self._get("/fundamentals/GSPC.INDX")
         components = (data or {}).get("Components") or {}
         today = date.today()
@@ -267,6 +275,7 @@ class EODHDProvider(DataProvider):
         return out
 
     def get_sp500_historical_constituents(self) -> list[UniverseMember]:
+        self.require("universe")
         data = self._get("/fundamentals/GSPC.INDX")
         history = (data or {}).get("HistoricalTickerComponents") or {}
         out: list[UniverseMember] = []
@@ -300,6 +309,7 @@ class EODHDProvider(DataProvider):
         start: date,
         end: date,
     ) -> list[EarningsRow]:
+        self.require("calendar")
         # EODHD's earnings endpoint accepts comma-separated symbols.
         # If the list is large, batch in groups of 100 to keep URLs sane.
         out: list[EarningsRow] = []
@@ -352,6 +362,7 @@ class EODHDProvider(DataProvider):
         Financials, etc. We hand it back as-is; the store layer extracts
         specific fields.
         """
+        self.require("fundamentals")
         path = f"/fundamentals/{symbol}.US"
         try:
             data = self._get(path)
@@ -380,6 +391,7 @@ class EODHDProvider(DataProvider):
         1 API call per page; default ``limit=1000`` covers a wide
         window in a single call.
         """
+        self.require("econ_events")
         params: dict[str, Any] = {"limit": limit}
         if country:
             params["country"] = country
@@ -404,6 +416,7 @@ class EODHDProvider(DataProvider):
         can upsert independently. Symbols without coverage are simply
         absent from the result.
         """
+        self.require("calendar")
         out: dict[str, list[dict[str, Any]]] = {}
         for batch_start in range(0, len(symbols), 100):
             batch = symbols[batch_start : batch_start + 100]
@@ -449,6 +462,7 @@ class EODHDProvider(DataProvider):
         Returns the raw provider records; the store layer normalises.
         US-only feed (Form 4).
         """
+        self.require("insider")
         params: dict[str, Any] = {"limit": limit}
         if symbol:
             params["code"] = f"{symbol}.US"
@@ -489,6 +503,7 @@ class EODHDProvider(DataProvider):
         Soft-fails on HTTP error: returns ``[]`` and logs a warning.
         Doesn't raise — news is non-load-bearing.
         """
+        self.require("news")
         params: dict[str, Any] = {"limit": limit, "offset": offset}
         if symbol:
             # EODHD wants the .US suffix on the symbol filter.
@@ -528,6 +543,7 @@ class EODHDProvider(DataProvider):
         server typically returns the previous one — we trust the response
         timestamps and store whatever they give us.
         """
+        self.require("bulk")
         path = f"/eod-bulk-last-day/{exchange}"
         params: dict[str, Any] = {"date": bar_date.isoformat()}
         if symbols:

@@ -204,6 +204,10 @@ def analysis_refresh_insider(
         log.exception("analysis_refresh_insider: unexpected error")
         return flash_redirect(f"/analysis/{sym}", "error", f"Refresh failed: {exc}")
 
+    if result.skipped_reason:
+        return flash_redirect(
+            f"/analysis/{sym}", "warn", f"Insider data is {result.skipped_reason}"
+        )
     if result.skipped:
         h = (result.cooldown_remaining_secs or 0) / 3600.0
         return flash_redirect(

@@ -440,6 +440,12 @@
           </span>
         </div>
       </div>
+      {% if 'insider' not in data_features() %}
+      <span class="text-xs text-ink-500 italic"
+            title="Stored transactions are still shown. Set EODHD_FEATURES to include 'insider' after upgrading the data plan.">
+        ○ Insider refresh {{ DATA_PLAN_NOTE }}
+      </span>
+      {% else %}
       <form action="/analysis/{{ a.symbol }}/refresh-insider" method="post">
         <button type="submit"
                 class="text-xs px-3 py-1.5 rounded border border-ink-300 hover:bg-ink-100 transition-colors"
@@ -447,6 +453,7 @@
           ↻ Refresh insider
         </button>
       </form>
+      {% endif %}
     </div>
 
     {% if insider_txns %}

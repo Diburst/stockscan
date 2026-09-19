@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from typing import TYPE_CHECKING
 
+from stockscan.data.providers.base import DISABLED_REASON
 from stockscan.insider.cooldown import (
     REFRESH_COOLDOWN_HOURS,
     can_refresh,
@@ -46,6 +47,7 @@ class InsiderRefreshResult:
     started_at: datetime
     finished_at: datetime
     error: str | None = None
+    skipped_reason: str | None = None  # set when the plan excludes insider data
 
     @property
     def succeeded(self) -> bool:
@@ -87,6 +89,22 @@ def _pull_for_symbol(
     return upsert_transactions(records, symbol=symbol, session=session)
 
 
+def _plan_skip(scope: str, started: datetime) -> InsiderRefreshResult:
+    """Result for a refresh the data plan does not allow — no call, no
+    cooldown row (so nothing to wait out after an upgrade)."""
+    log.info("insider refresh skipped (%s): %s", scope, DISABLED_REASON)
+    return InsiderRefreshResult(
+        scope=scope,
+        skipped=True,
+        cooldown_remaining_secs=None,
+        symbols_refreshed=0,
+        transactions_upserted=0,
+        started_at=started,
+        finished_at=datetime.now(UTC),
+        skipped_reason=DISABLED_REASON,
+    )
+
+
 def refresh_insider_for_watchlist(
     provider: DataProvider,
     symbols: list[str],
@@ -106,6 +124,8 @@ def refresh_insider_for_watchlist(
     """
     scope = "watchlist"
     started = datetime.now(UTC)
+    if not provider.supports("insider"):
+        return _plan_skip(scope, started)
     allowed, remaining = can_refresh(
         scope, cooldown_hours=cooldown_hours, session=session,
     )
@@ -176,6 +196,8 @@ def refresh_insider_for_symbol(
     """
     scope = f"symbol:{symbol}"
     started = datetime.now(UTC)
+    if not provider.supports("insider"):
+        return _plan_skip(scope, started)
     allowed, remaining = can_refresh(
         scope, cooldown_hours=cooldown_hours, session=session,
     )

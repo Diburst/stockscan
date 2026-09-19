@@ -69,6 +69,7 @@ Then open `.env` and set two things:
   DATABASE_URL=postgresql+psycopg://stockscan:<PASTE_PASSWORD_HERE>@127.0.0.1:5432/stockscan
   ```
 - `EODHD_API_KEY` — your key from eodhd.com.
+- `EODHD_FEATURES` — only if you're **not** on the All-In-One plan. `eod,bulk` for the prices-only plan; see [Data plans](#data-plans-eodhd_features) below.
 
 **4. Install Python dependencies**
 
@@ -174,16 +175,55 @@ Mobile-first responsive throughout — tables collapse to cards below 640px, mod
 
 ---
 
+## Data plans (`EODHD_FEATURES`)
+
+Everything the scanner, backtester, regime engine and nightly job need is
+**price data** — per-symbol `/eod` and the bulk endpoint — which the
+cheapest EODHD plan ("EOD Historical Data — All World") includes. The other
+endpoint families are extras: fundamentals (market cap, sector), news,
+earnings/econ calendars, insider transactions — and, less obviously, the
+**index constituents** used by `refresh universe`, which come from
+`/fundamentals/GSPC.INDX` and therefore need the Fundamentals plan.
+
+`EODHD_FEATURES` in `.env` declares what your plan includes. Default `all`.
+
+| Plan | Setting |
+|---|---|
+| All-In-One | `EODHD_FEATURES=all` (or unset) |
+| EOD Historical Data — All World (prices only) | `EODHD_FEATURES=eod,bulk` |
+| EOD + Fundamentals | `EODHD_FEATURES=eod,bulk,universe,fundamentals` |
+
+Valid names: `eod`, `bulk`, `universe`, `fundamentals`, `news`, `calendar`,
+`insider`, `econ_events`. With a family excluded:
+
+- `stockscan refresh fundamentals` / `refresh news` print a one-line notice and exit 0 (so the Sunday fundamentals cron and any scripts keep working), and the watchlist / analysis / MCP refresh paths skip that leg — **no request is made**, nothing counts against quota, no `DEGRADED` nightly summaries.
+- Stored rows are still shown everywhere (the news card, insider tables, fundamentals). Refresh buttons become a muted "not available on current data plan" note.
+- `largecap_rebound` keeps trading on the frozen `fundamentals_snapshot`; its strategy page shows the snapshot's as-of date.
+- `stockscan refresh universe` switches to a **Wikipedia fallback** (see below) so newly added index members still get scanned.
+- `stockscan health` lists the enabled families; startup logs a warning naming the excluded ones.
+
+Nothing is deleted or migrated. Upgrading later is `EODHD_FEATURES=all` + restart.
+
 ## What does `stockscan refresh` actually fetch?
 
 ### `stockscan refresh universe`
 
-One EODHD API call to `/fundamentals/GSPC.INDX`. Pulls and persists into `universe_history`:
+One EODHD API call to `/fundamentals/GSPC.INDX` (Fundamentals plan). Pulls and persists into `universe_history`:
 
 - **Current S&P 500 members** — ~500 symbols
 - **Historical members back to ~2000** — every symbol ever in the index, with `joined_date` and `left_date`. Total ~1,200–1,500 unique symbols across history.
 
 Run **weekly** — the index turns over slowly. Required before any `refresh bars` or backtest.
+
+**Without the `universe` feature** (prices-only plan) the same command reads
+Wikipedia's *List of S&P 500 companies* page instead — one HTTP request, no
+EODHD quota. It is deliberately incremental: new members on the roster get
+an open interval (dated from the page's "Date added" or the changes log),
+members that have left get their open interval closed, and the EODHD-sourced
+history back to ~2000 is left untouched. Share classes are normalised to the
+EODHD form (`BRK.B` → `BRK-B`) so symbols line up with the `bars` table. A
+roster that parses to fewer than 400 names is refused rather than merged,
+so a page-layout change can't silently close hundreds of live intervals.
 
 ### `stockscan refresh bars`
 

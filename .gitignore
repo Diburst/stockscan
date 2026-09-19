@@ -13,8 +13,8 @@ dist/
 .eggs/
 *.egg
 
-# uv
-uv.lock
+# uv — NOTE: uv.lock is deliberately COMMITTED (reproducible deploys; the
+# Docker build installs with --frozen against it). Do not re-ignore it.
 
 # Testing / coverage
 .pytest_cache/
@@ -37,6 +37,7 @@ Thumbs.db
 # Project
 .env
 .env.local
+docker-compose.override.yml
 *.secret
 infra/db_password.secret
 infra/pgdata/

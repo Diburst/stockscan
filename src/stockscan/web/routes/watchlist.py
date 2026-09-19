@@ -287,6 +287,9 @@ def watchlist_refresh_bars(
     insider_skipped_cooldown_h: float | None = None
     insider_symbols_refreshed = 0
     insider_transactions_upserted = 0
+    # Auxiliary phases the data plan excludes (EODHD_FEATURES). Skipped
+    # before any cooldown bookkeeping so nothing is marked "refreshed".
+    plan_skipped: list[str] = []
     try:
         with EODHDProvider(api_key=api_key) as provider:
             # ---- Phase 1: bulk S&P 500 + watchlist via the universe filter ----
@@ -321,7 +324,9 @@ def watchlist_refresh_bars(
             # ---- Phase 3: economic events (1 API call, US-only) ----
             # Daily cooldown: the macro calendar barely moves intraday, so
             # repeat refreshes within the window make no call.
-            if refresh_due("econ_events", cooldown_hours=_AUX_COOLDOWN_HOURS, session=s):
+            if not provider.supports("econ_events"):
+                plan_skipped.append("macro calendar")
+            elif refresh_due("econ_events", cooldown_hours=_AUX_COOLDOWN_HOURS, session=s):
                 try:
                     econ_result = refresh_economic_events(provider, session=s)
                     econ_upserted = econ_result.upserted
@@ -337,7 +342,9 @@ def watchlist_refresh_bars(
             # ---- Phase 4: earnings calendar + trends for watchlist names ----
             # Daily cooldown as well — estimate revisions update at most daily.
             watched_sorted = sorted(watched)
-            if watched_sorted and refresh_due(
+            if not provider.supports("calendar"):
+                plan_skipped.append("earnings")
+            elif watched_sorted and refresh_due(
                 "earnings", cooldown_hours=_AUX_COOLDOWN_HOURS, session=s
             ):
                 try:
@@ -364,7 +371,9 @@ def watchlist_refresh_bars(
                 ins_result = refresh_insider_for_watchlist(
                     provider, watched_sorted, session=s,
                 )
-                if ins_result.skipped:
+                if ins_result.skipped_reason:
+                    plan_skipped.append("insider")
+                elif ins_result.skipped:
                     insider_skipped_cooldown_h = (
                         (ins_result.cooldown_remaining_secs or 0) / 3600.0
                     )
@@ -404,6 +413,8 @@ def watchlist_refresh_bars(
             notes.append("macro/earnings on daily cooldown")
         if insider_skipped_cooldown_h is not None:
             notes.append(f"insider cooldown {insider_skipped_cooldown_h:.1f}h")
+        if plan_skipped:
+            notes.append(", ".join(plan_skipped) + " not on current data plan")
         suffix = (" (" + "; ".join(notes) + ")") if notes else ""
         return flash_redirect(
             "/analysis", "info", f"Already up to date — no API calls used{suffix}"
@@ -436,6 +447,8 @@ def watchlist_refresh_bars(
         msg_parts.append(
             f"insider: skipped (cooldown {insider_skipped_cooldown_h:.1f}h remaining)"
         )
+    if plan_skipped:
+        msg_parts.append(", ".join(plan_skipped) + " not on current data plan")
     if per_symbol_failures:
         msg_parts.append(
             f"{len(per_symbol_failures)} watchlist fetch(es) failed "

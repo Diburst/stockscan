@@ -46,6 +46,11 @@
           </span>
         {% endif %}
       </div>
+      {% if 'news' not in data_features() %}
+      <span class="text-xs text-ink-500 italic" title="Set EODHD_FEATURES to include 'news' after upgrading the data plan">
+        ○ News {{ DATA_PLAN_NOTE }}
+      </span>
+      {% else %}
       <form
         hx-post="/news/refresh"
         hx-target="#news-card"
@@ -67,6 +72,7 @@
           ⟳ Refresh
         </button>
       </form>
+      {% endif %}
     </div>
 
     {% if news_refresh_error %}

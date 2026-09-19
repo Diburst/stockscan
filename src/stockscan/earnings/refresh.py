@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from typing import TYPE_CHECKING
 
+from stockscan.data.providers.base import DISABLED_REASON
 from stockscan.earnings.calendar_store import upsert_earnings
 from stockscan.earnings.trends_store import upsert_trends
 
@@ -43,6 +44,7 @@ class EarningsRefreshResult:
     started_at: datetime
     finished_at: datetime
     error: str | None = None
+    skipped_reason: str | None = None  # set when the plan excludes the calendar
 
     @property
     def duration_seconds(self) -> float:
@@ -103,6 +105,15 @@ def refresh_earnings(
     """Run both ``refresh_earnings_calendar`` + ``refresh_earnings_trends``
     for ``symbols``. Aggregates per-call counts and any error."""
     started = datetime.now(UTC)
+    if not provider.supports("calendar"):
+        log.info("earnings refresh skipped: %s", DISABLED_REASON)
+        return EarningsRefreshResult(
+            calendar_upserted=0,
+            trends_upserted=0,
+            started_at=started,
+            finished_at=datetime.now(UTC),
+            skipped_reason=DISABLED_REASON,
+        )
     error: str | None = None
     try:
         cal = refresh_earnings_calendar(

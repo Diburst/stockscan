@@ -254,6 +254,15 @@ def health() -> None:
         else "[yellow]not set[/yellow]",
         "",
     )
+    from stockscan.data.providers.base import ALL_FEATURES
+
+    feats = settings.eodhd_feature_set
+    off = sorted(ALL_FEATURES - feats)
+    table.add_row(
+        "EODHD features",
+        "[green]all[/green]" if not off else f"[yellow]{len(feats)}/{len(ALL_FEATURES)}[/yellow]",
+        ", ".join(sorted(feats)) + (f"  (off: {', '.join(off)})" if off else ""),
+    )
     console.print(table)
 
 
@@ -327,8 +336,16 @@ def db_verify() -> None:
 # ----------------------------------------------------------------------
 @refresh_app.command("universe")
 def refresh_universe_cmd() -> None:
-    """Pull historical + current S&P 500 membership from the provider."""
+    """Pull historical + current S&P 500 membership from the provider.
+
+    Without the ``universe`` feature (EODHD_FEATURES on an EOD-only plan)
+    the roster comes from Wikipedia instead: new members are opened and
+    departed members closed in ``universe_history``; provider-sourced
+    history is left as is.
+    """
     with _provider_ctx() as p:
+        src = "EODHD" if p.supports("universe") else "Wikipedia (universe not on current data plan)"
+        console.print(f"[cyan]→[/cyan] universe source: {src}")
         n = refresh_universe(p)
     console.print(f"[green]✓[/green] universe refreshed: {n} membership rows upserted")
 
@@ -364,6 +381,8 @@ def refresh_fundamentals_cmd(
         console.print(f"[cyan]→[/cyan] refreshing fundamentals for {len(symbols)} symbols")
 
     with _provider_ctx() as p:
+        if _notice_if_disabled(p, "fundamentals"):
+            return
         results = refresh_fundamentals(p, symbols)
     ok = sum(1 for v in results.values() if v == "ok")
     missing = sum(1 for v in results.values() if v == "missing")
@@ -620,6 +639,8 @@ def refresh_news_cmd(
 
     console.print(f"[cyan]→[/cyan] refreshing news (last {days_back} days)")
     with EODHDProvider(api_key=api_key) as p:
+        if _notice_if_disabled(p, "news"):
+            return
         result = refresh_news(p, days_back=days_back, watchlist_symbols=watchlist_symbols())
 
     console.print(
@@ -1419,6 +1440,21 @@ def backtest_profile(
 # ----------------------------------------------------------------------
 from collections.abc import Iterator
 from contextlib import contextmanager
+
+
+def _notice_if_disabled(provider: DataProvider, feature: str) -> bool:
+    """Print the plan notice and return True when ``feature`` is off.
+
+    Commands exit 0 in that case on purpose: the Sunday fundamentals cron
+    and any scripted `refresh` calls keep working unchanged on a
+    downgraded plan — they just report "skipped" instead of failing.
+    """
+    if provider.supports(feature):
+        return False
+    from stockscan.data.providers.base import DISABLED_REASON
+
+    console.print(f"[yellow]○[/yellow] {feature}: {DISABLED_REASON} — skipped, nothing fetched")
+    return True
 
 
 @contextmanager

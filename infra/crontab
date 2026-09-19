@@ -13,4 +13,6 @@
 0 2 * * * /app/infra/scripts/db_backup_compose.sh
 
 # Weekly fundamentals refresh (most fields change quarterly). Sun 03:00 ET.
+# On a plan without fundamentals (EODHD_FEATURES) this exits 0 with a
+# 'skipped' notice — leave it scheduled so an upgrade needs no cron edit.
 0 3 * * 0 stockscan refresh fundamentals --current-only

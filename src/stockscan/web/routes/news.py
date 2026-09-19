@@ -20,6 +20,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy.orm import Session
 
 from stockscan.config import settings
+from stockscan.data.providers.base import DISABLED_REASON
 from stockscan.data.providers.eodhd import EODHDError, EODHDProvider
 from stockscan.news import (
     fetch_article_content,
@@ -99,11 +100,14 @@ def refresh_endpoint(
                     watchlist_symbols=watchlist_symbols(session=s),
                     session=s,
                 )
-            refresh_summary = {
-                "articles_upserted": result.articles_upserted,
-                "api_calls": result.api_calls,
-                "failures": result.failures,
-            }
+            if result.skipped_reason:
+                error = f"News is {result.skipped_reason}"
+            else:
+                refresh_summary = {
+                    "articles_upserted": result.articles_upserted,
+                    "api_calls": result.api_calls,
+                    "failures": result.failures,
+                }
         except EODHDError as exc:
             log.warning("news refresh: provider error: %s", exc)
             error = f"Provider error: {exc}"
@@ -126,6 +130,8 @@ def refresh_endpoint(
         news_refresh_error=error,
         news_refresh_summary=refresh_summary,
     )
+    if error and DISABLED_REASON in error:
+        return attach_hx_toast(response, "warn", "News not available on current data plan")
     if error:
         return attach_hx_toast(response, "error", "News refresh failed")
     if refresh_summary:

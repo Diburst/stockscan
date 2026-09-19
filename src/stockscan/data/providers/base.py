@@ -13,6 +13,42 @@ from datetime import date, datetime
 from decimal import Decimal
 
 
+# ----------------------------------------------------------------------
+# Provider feature families (subscription entitlements)
+# ----------------------------------------------------------------------
+# Each name is one endpoint family a data plan may or may not include.
+# ``DataProvider.supports(feature)`` answers "may I call this family?";
+# refresh entrypoints check it up front so a downgraded plan skips cleanly
+# instead of burning quota on 403s. Configured via EODHD_FEATURES.
+ALL_FEATURES: frozenset[str] = frozenset(
+    {
+        "eod",  # /eod/{symbol} per-symbol history
+        "bulk",  # /eod-bulk-last-day/{exchange}
+        "universe",  # /fundamentals/GSPC.INDX index components (Fundamentals plan!)
+        "fundamentals",  # /fundamentals/{symbol}
+        "news",  # /news
+        "calendar",  # /calendar/earnings, /calendar/trends
+        "insider",  # /insider-transactions
+        "econ_events",  # /economic-events
+    }
+)
+
+# One canonical human-readable reason, reused by CLI notices, refresh
+# results, MCP tool responses and UI cards so the wording never drifts.
+DISABLED_REASON = "not available on the current data plan (see EODHD_FEATURES)"
+
+
+class FeatureDisabled(RuntimeError):
+    """Raised when a provider method is called for a feature family the
+    current subscription does not include. Callers that gate with
+    ``provider.supports(...)`` never see it; it is the belt-and-braces
+    guard so no network call can slip through."""
+
+    def __init__(self, feature: str) -> None:
+        super().__init__(f"provider feature '{feature}' is {DISABLED_REASON}")
+        self.feature = feature
+
+
 @dataclass(frozen=True, slots=True)
 class BarRow:
     """A single OHLCV bar in our canonical form."""
@@ -69,6 +105,19 @@ class DataProvider(ABC):
     """
 
     name: str  # 'eodhd', 'polygon', 'stub', etc.
+
+    def supports(self, feature: str) -> bool:
+        """Whether this provider may call the given feature family.
+
+        Default: everything (the stub, and any provider without plan
+        tiers). EODHD overrides this from ``settings.eodhd_feature_set``.
+        """
+        return feature in ALL_FEATURES
+
+    def require(self, feature: str) -> None:
+        """Raise :class:`FeatureDisabled` unless ``supports(feature)``."""
+        if not self.supports(feature):
+            raise FeatureDisabled(feature)
 
     @abstractmethod
     def get_bars(

@@ -66,6 +66,22 @@ templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
 templates.env.globals["now_utc"] = lambda: datetime.now(UTC)
 
 
+def _data_features() -> frozenset[str]:
+    """Enabled EODHD endpoint families (EODHD_FEATURES) for templates.
+
+    Templates test ``'news' in data_features()`` to swap a refresh button
+    for a muted "not available on current data plan" note. Read live (not
+    cached) so a settings override in tests is honoured.
+    """
+    from stockscan.config import settings
+
+    return settings.eodhd_feature_set
+
+
+templates.env.globals["data_features"] = _data_features
+templates.env.globals["DATA_PLAN_NOTE"] = "not available on current data plan"
+
+
 # ----------------------------------------------------------------------
 # Tiny markdown-lite renderer for trusted in-app content (strategy manuals,
 # tooltips, etc.). NOT for user-supplied content — escaping is minimal.

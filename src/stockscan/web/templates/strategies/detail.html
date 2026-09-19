@@ -21,6 +21,21 @@
       {% for tag in strategy.tags %}{{ badge(tag, "neutral") }}{% endfor %}
     </div>
     <p class="text-xs text-ink-500 mt-3">Default risk per trade: {{ "{:.2%}".format(strategy.default_risk_pct) }}</p>
+    {% if data_inputs %}
+      {# Non-bar inputs and how fresh they are — matters on an EOD-only
+         data plan where e.g. the fundamentals snapshot is frozen. #}
+      <div class="text-xs text-ink-500 mt-2">
+        {% for d in data_inputs %}
+          <div>
+            Uses <span class="font-medium">{{ d.feature }}</span> snapshot
+            {% if d.as_of %}as of {{ d.as_of.strftime('%Y-%m-%d') }}{% else %}(none loaded){% endif %}
+            {% if not d.refreshing %}
+              — <span class="italic" title="Set EODHD_FEATURES to include '{{ d.feature }}' after upgrading the data plan">refresh {{ DATA_PLAN_NOTE }}; trading on the frozen snapshot</span>
+            {% endif %}
+          </div>
+        {% endfor %}
+      </div>
+    {% endif %}
   {% endcall %}
 
   {# Meta-label model panel — present whether or not a model has been

@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Iterable
 
-from stockscan.data.providers.base import DataProvider
+from stockscan.data.providers.base import DISABLED_REASON, DataProvider
 from stockscan.fundamentals.store import upsert_fundamentals
 
 log = logging.getLogger(__name__)
@@ -21,8 +21,14 @@ def refresh_fundamentals(
         'ok'           — fetched and persisted
         'missing'      — provider returned no data for this symbol
         'error'        — fetch or persist threw an exception (logged)
+        'skipped'      — provider plan does not include fundamentals
+                         (no call made; existing snapshot rows are kept)
     """
     out: dict[str, str] = {}
+    if not provider.supports("fundamentals"):
+        syms = list(symbols)
+        log.info("fundamentals refresh skipped for %d symbols: %s", len(syms), DISABLED_REASON)
+        return dict.fromkeys(syms, "skipped")
     for sym in symbols:
         try:
             payload = provider.get_fundamentals(sym)

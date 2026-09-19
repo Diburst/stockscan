@@ -58,7 +58,7 @@ docker compose logs migrate        # "applied N migrations"
 # 5. Seed data (first run only — same commands as the README, but in-container).
 docker compose exec web stockscan refresh universe
 docker compose exec web stockscan refresh bars          # ~15-45 min full universe
-docker compose exec web stockscan refresh fundamentals --current-only
+docker compose exec web stockscan refresh fundamentals --current-only   # skipped on a prices-only plan (EODHD_FEATURES)
 docker compose exec web stockscan refresh macro
 docker compose exec web stockscan health
 ```

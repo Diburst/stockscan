@@ -373,6 +373,23 @@ def upsert_fundamentals(
 # ---------------------------------------------------------------------
 # Queries
 # ---------------------------------------------------------------------
+def snapshot_as_of(*, session: Session | None = None) -> datetime | None:
+    """Most recent ``fetched_at`` across the snapshot table (None if empty).
+
+    "How stale is the market-cap filter?" for the strategy page — matters
+    once the data plan stops refreshing fundamentals.
+    """
+    sql = text("SELECT MAX(fetched_at) FROM fundamentals_snapshot")
+
+    def _run(s: Session) -> datetime | None:
+        return s.execute(sql).scalar()
+
+    if session is not None:
+        return _run(session)
+    with session_scope() as s:
+        return _run(s)
+
+
 def get_fundamentals(symbol: str, *, session: Session | None = None) -> Fundamentals | None:
     sql = text(
         """

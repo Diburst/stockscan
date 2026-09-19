@@ -109,6 +109,12 @@ class Strategy(ABC):
     # model) leave this as None and instantiate with no arguments.
     params_model: ClassVar[type[StrategyParams] | None] = None
     default_risk_pct: ClassVar[float] = 0.01
+    # Non-bar data the strategy reads from the DB (provider feature names,
+    # see stockscan.data.providers.base.ALL_FEATURES). Bars are implicit.
+    # Purely informational: the strategy page uses it to show "fundamentals
+    # snapshot as of <date>" and to flag when the data plan no longer
+    # refreshes that input. Empty = bars only.
+    data_dependencies: ClassVar[tuple[str, ...]] = ()
 
     # ----- Regime preferences (v2 — soft sizing) -----
     # ``regime_affinity`` maps regime label → weight in [0, 1]. The runner

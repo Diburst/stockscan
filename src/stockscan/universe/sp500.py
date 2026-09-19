@@ -21,7 +21,25 @@ log = logging.getLogger(__name__)
 
 
 def refresh_universe(provider: DataProvider, *, session: Session | None = None) -> int:
-    """Pull historical + current S&P 500 membership and persist."""
+    """Pull historical + current S&P 500 membership and persist.
+
+    Source selection:
+
+    * Provider supports ``universe`` (EODHD Fundamentals plan) → full
+      historical + current upsert from ``/fundamentals/GSPC.INDX``.
+    * Otherwise → :mod:`stockscan.universe.wikipedia`, which only maintains
+      the frontier (opens intervals for new members, closes them for
+      removals) and leaves the provider-sourced history untouched.
+
+    Returns the number of rows written either way, so callers that print
+    "N membership rows upserted" keep working.
+    """
+    if not provider.supports("universe"):
+        from stockscan.universe.wikipedia import refresh_universe_from_wikipedia
+
+        log.info("refresh_universe: provider lacks 'universe' — using Wikipedia fallback")
+        return refresh_universe_from_wikipedia(session=session).rows_touched
+
     historical = provider.get_sp500_historical_constituents()
     current = provider.get_sp500_constituents()
 

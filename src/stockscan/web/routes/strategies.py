@@ -6,6 +6,7 @@ from typing import Any
 
 from fastapi import APIRouter, Request
 
+from stockscan.config import settings
 from stockscan.ml import list_models, load_model
 from stockscan.strategies import STRATEGY_REGISTRY, discover_strategies
 from stockscan.web.deps import render, safe
@@ -68,6 +69,23 @@ def strategy_detail(name: str, request: Request):
             and isinstance(v, (int, float, str, bool))
         ]
 
+    # Freshness of non-bar inputs (e.g. the fundamentals snapshot behind
+    # largecap_rebound's market-cap filter). Only queried when declared.
+    data_inputs: list[dict[str, object]] = []
+    for feature in cls.data_dependencies:
+        as_of = None
+        if feature == "fundamentals":
+            from stockscan.fundamentals.store import snapshot_as_of
+
+            as_of = safe(snapshot_as_of, label="fundamentals.snapshot_as_of")
+        data_inputs.append(
+            {
+                "feature": feature,
+                "as_of": as_of,
+                "refreshing": feature in settings.eodhd_feature_set,
+            }
+        )
+
     return render(
         request,
         "strategies/detail.html",
@@ -75,4 +93,5 @@ def strategy_detail(name: str, request: Request):
         schema=cls.params_json_schema(),
         knobs=knobs,
         model=model_artifact,
+        data_inputs=data_inputs,
     )

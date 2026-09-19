@@ -18,6 +18,7 @@ from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any
 
+from stockscan.data.providers.base import DISABLED_REASON
 from stockscan.news.store import (
     NewsArticle,
     NewsFeedConfig,
@@ -55,6 +56,7 @@ class RefreshResult:
     started_at: datetime
     finished_at: datetime
     last_fetched_at: datetime | None  # AFTER the upserts
+    skipped_reason: str | None = None  # set when the plan excludes news
 
 
 def _parse_date(raw: str) -> datetime | None:
@@ -168,6 +170,17 @@ def refresh_news(
     counts and the post-refresh ``last_fetched_at`` for the dashboard.
     """
     started = datetime.now(UTC)
+    if not provider.supports("news"):
+        log.info("news refresh skipped: %s", DISABLED_REASON)
+        return RefreshResult(
+            articles_upserted=0,
+            api_calls=0,
+            failures=0,
+            started_at=started,
+            finished_at=datetime.now(UTC),
+            last_fetched_at=last_fetched_at(session=session),
+            skipped_reason=DISABLED_REASON,
+        )
     cfg = config if config is not None else get_feed_config(session=session)
     end = date.today()
     start = end - timedelta(days=days_back)
@@ -293,6 +306,9 @@ def fetch_article_content(
     render the missing case (we surface a "Couldn't load — view on
     source" link in the template).
     """
+    if not provider.supports("news"):
+        log.info("article content fetch skipped: %s", DISABLED_REASON)
+        return None
     if not article.link:
         return None
 

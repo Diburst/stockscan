@@ -100,6 +100,10 @@ class LargeCapRebound(Strategy):
         "by looking at positive technical momentum."
     )
     tags = ("mean_reversion", "long_only", "swing")
+    # Market-cap filter reads fundamentals_snapshot. On an EOD-only data
+    # plan that snapshot is frozen; cap ranks drift slowly so we keep
+    # trading on it, and the strategy page shows its as-of date.
+    data_dependencies = ("fundamentals",)
     params_model = LargeCapReboundParams
     default_risk_pct = 0.01
     # Largecap rebound buys quality names on weakness; needs a friendly tape

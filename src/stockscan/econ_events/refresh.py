@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
+from stockscan.data.providers.base import DISABLED_REASON
 from stockscan.econ_events.store import upsert_events
 
 if TYPE_CHECKING:
@@ -35,6 +36,7 @@ class EconEventsRefreshResult:
     started_at: datetime
     finished_at: datetime
     error: str | None = None
+    skipped_reason: str | None = None  # set when the plan excludes econ events
 
     @property
     def duration_seconds(self) -> float:
@@ -57,6 +59,14 @@ def refresh_economic_events(
     user flow.
     """
     started = datetime.now(UTC)
+    if not provider.supports("econ_events"):
+        log.info("econ events refresh skipped: %s", DISABLED_REASON)
+        return EconEventsRefreshResult(
+            upserted=0,
+            started_at=started,
+            finished_at=datetime.now(UTC),
+            skipped_reason=DISABLED_REASON,
+        )
     today = datetime.now(UTC).date()
     start = today - timedelta(days=days_back)
     end = today + timedelta(days=days_forward)

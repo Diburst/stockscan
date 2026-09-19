@@ -57,6 +57,16 @@ class Settings(BaseSettings):
     # ---- EODHD data provider ----
     eodhd_api_key: SecretStr = Field(SecretStr(""), alias="EODHD_API_KEY")
     eodhd_base_url: str = Field("https://eodhd.com/api", alias="EODHD_BASE_URL")
+    # Which EODHD endpoint families the current subscription entitles us to.
+    # Comma-separated subset of stockscan.data.providers.base.ALL_FEATURES:
+    #   eod, bulk, universe, fundamentals, news, calendar, insider, econ_events
+    # Default = everything (All-In-One). On the "EOD Historical Data — All
+    # World" plan set EODHD_FEATURES=eod,bulk — the refresh paths for the
+    # missing families then skip cleanly (no 403s, no burned quota) and the
+    # UI shows "not available on current data plan" instead of erroring.
+    # Note "universe" is /fundamentals/GSPC.INDX, i.e. a Fundamentals-plan
+    # endpoint; without it `refresh universe` falls back to Wikipedia.
+    eodhd_features: str = Field("all", alias="EODHD_FEATURES")
 
     # ---- FRED macro data (HY OAS, yield-curve spreads, etc.) ----
     fred_api_key: SecretStr = Field(SecretStr(""), alias="FRED_API_KEY")
@@ -110,6 +120,16 @@ class Settings(BaseSettings):
     mcp_path: str = Field("/mcp", alias="STOCKSCAN_MCP_PATH")
 
     @property
+    def eodhd_feature_set(self) -> frozenset[str]:
+        """Parsed ``EODHD_FEATURES``: ``"all"`` (or blank) means every family."""
+        raw = (self.eodhd_features or "").strip().lower()
+        if raw in ("", "all", "*"):
+            from stockscan.data.providers.base import ALL_FEATURES
+
+            return ALL_FEATURES
+        return frozenset(f.strip() for f in raw.split(",") if f.strip())
+
+    @property
     def resolved_log_dir(self) -> Path:
         """Log directory as a Path — explicit setting or <repo_root>/logs."""
         return Path(self.log_dir) if self.log_dir else PROJECT_ROOT / "logs"
@@ -148,6 +168,22 @@ def config_warnings() -> list[str]:
         out.append(
             "EODHD_API_KEY not set — data refresh falls back to StubProvider "
             "(synthetic bars; fine for dev, useless in prod)"
+        )
+    from stockscan.data.providers.base import ALL_FEATURES
+
+    feats = settings.eodhd_feature_set
+    unknown = sorted(feats - ALL_FEATURES)
+    if unknown:
+        out.append(
+            "EODHD_FEATURES contains unknown entries %s — valid: %s"
+            % (", ".join(unknown), ", ".join(sorted(ALL_FEATURES)))
+        )
+    missing = sorted(ALL_FEATURES - feats)
+    if missing:
+        out.append(
+            "EODHD_FEATURES excludes %s — those refresh paths are skipped and "
+            "the related UI cards show 'not available on current data plan'"
+            % ", ".join(missing)
         )
     if "CHANGE_ME" in settings.database_url:
         out.append("DATABASE_URL still contains the placeholder password")

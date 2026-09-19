@@ -1,0 +1,25 @@
+# Keep the build context lean — only what the Dockerfile actually copies.
+.git
+.venv
+__pycache__
+**/__pycache__
+*.pyc
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.DS_Store
+**/.DS_Store
+
+# Local state that must never bake into an image
+.env
+infra/db_password.secret
+infra/pgdata
+infra/migration_export
+logs
+backups
+models
+pytest-cache-files-*
+tsla1
+
+# Node artifacts (Tailwind builds in its own stage)
+node_modules

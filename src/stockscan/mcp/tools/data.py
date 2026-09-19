@@ -14,6 +14,7 @@ from datetime import date, timedelta
 from typing import Any
 
 from stockscan.data.backfill import backfill_symbol
+from stockscan.data.providers.base import DISABLED_REASON
 from stockscan.earnings.refresh import refresh_earnings as _refresh_earnings
 from stockscan.fundamentals.refresh import refresh_fundamentals as _refresh_fundamentals
 from stockscan.insider.refresh import refresh_insider_for_symbol, refresh_insider_for_watchlist
@@ -25,6 +26,21 @@ from stockscan.watchlist import watchlist_symbols
 
 _SPLIT = re.compile(r"[\s,;]+")
 _NO_KEY = {"error": "no_api_key", "detail": "EODHD_API_KEY is not set."}
+
+
+def _feature_off(provider: Any, feature: str) -> dict[str, Any] | None:
+    """Structured refusal when the data plan excludes ``feature``.
+
+    Returned instead of calling the provider so an MCP client (or the
+    weekly-options skill) can degrade gracefully rather than parse a 403.
+    """
+    if provider.supports(feature):
+        return None
+    return {
+        "error": "feature_disabled",
+        "feature": feature,
+        "detail": f"{feature} is {DISABLED_REASON}. Stored rows (if any) are still readable.",
+    }
 
 
 def _parse_symbols(raw: str | None) -> list[str]:
@@ -88,6 +104,8 @@ def refresh_fundamentals(symbols: str | None = None) -> dict[str, Any]:
         return {"error": "no_symbols", "detail": "No symbols given and watchlist is empty."}
     try:
         with provider_ctx() as provider:
+            if off := _feature_off(provider, "fundamentals"):
+                return off
             status = _refresh_fundamentals(provider, syms)
     except NoApiKeyError:
         return dict(_NO_KEY)
@@ -106,6 +124,8 @@ def refresh_news(days_back: int = 7) -> dict[str, Any]:
     syms = sorted(watchlist_symbols())
     try:
         with provider_ctx() as provider:
+            if off := _feature_off(provider, "news"):
+                return off
             result = _refresh_news(provider, days_back=days_back, watchlist_symbols=syms)
     except NoApiKeyError:
         return dict(_NO_KEY)
@@ -127,6 +147,8 @@ def refresh_earnings(symbols: str | None = None, days_forward: int = 30) -> dict
         return {"error": "no_symbols", "detail": "No symbols given and watchlist is empty."}
     try:
         with provider_ctx() as provider:
+            if off := _feature_off(provider, "calendar"):
+                return off
             result = _refresh_earnings(provider, syms, days_forward=days_forward)
     except NoApiKeyError:
         return dict(_NO_KEY)
@@ -144,6 +166,8 @@ def refresh_insider(symbol: str | None = None) -> dict[str, Any]:
     """
     try:
         with provider_ctx() as provider:
+            if off := _feature_off(provider, "insider"):
+                return off
             if symbol:
                 result = refresh_insider_for_symbol(provider, symbol)
             else:
@@ -161,7 +185,8 @@ def refresh_universe() -> dict[str, Any]:
     """
     try:
         with provider_ctx() as provider:
+            source = "eodhd" if provider.supports("universe") else "wikipedia"
             n = _refresh_universe(provider)
     except NoApiKeyError:
         return dict(_NO_KEY)
-    return {"ok": True, "rows": n}
+    return {"ok": True, "rows": n, "source": source}
