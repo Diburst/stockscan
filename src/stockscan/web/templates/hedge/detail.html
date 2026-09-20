@@ -1,7 +1,6 @@
 {% extends "base.html" %}
 {% block title %}Hedge · {{ pos.symbol }}{% endblock %}
-
-{% macro pnl(v) %}<span class="{{ 'text-ok-600' if v >= 0 else 'text-bad-600' }}">{{ "{:+,.2f}".format(v) }}</span>{% endmacro %}
+{% from "_macros.html" import money %}
 
 {% block content %}
 <div class="max-w-4xl mx-auto px-4 py-6">
@@ -27,16 +26,16 @@
   <div class="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-6">
     <div class="bg-white rounded-xl shadow-sm border border-ink-300/40 p-3">
       <div class="text-xs text-ink-500">Premium</div>
-      <div class="text-lg tabular-nums">{{ "{:,.0f}".format(pos.premium|float) }}</div>
+      <div class="text-lg">{{ money(pos.premium, signed=False) }}</div>
     </div>
     <div class="bg-white rounded-xl shadow-sm border border-ink-300/40 p-3">
       <div class="text-xs text-ink-500">Option open P&L</div>
-      <div class="text-lg tabular-nums">{{ pnl(pnl_data.option_open_pnl) }}</div>
-      <div class="text-xs text-ink-400">mark {{ "{:,.0f}".format(pnl_data.option_value) }}</div>
+      <div class="text-lg tabular-nums">{{ money(pnl_data.option_open_pnl, decimals=2) }}</div>
+      <div class="text-xs text-ink-400">mark {{ money(pnl_data.option_value, signed=False) }}</div>
     </div>
     <div class="bg-white rounded-xl shadow-sm border border-ink-300/40 p-3">
       <div class="text-xs text-ink-500">Hedge P&L</div>
-      <div class="text-lg tabular-nums">{{ pnl(pnl_data.realized_hedge_pnl + pnl_data.hedge_unrealized_pnl) }}</div>
+      <div class="text-lg tabular-nums">{{ money(pnl_data.realized_hedge_pnl + pnl_data.hedge_unrealized_pnl, decimals=2) }}</div>
       <div class="text-xs text-ink-400">held {{ pos.held_shares }} @ {{ '%.2f'|format(pos.avg_cost|float) }}</div>
     </div>
     <div class="bg-ink-900 text-white rounded-xl shadow-sm p-3">
@@ -98,7 +97,7 @@
           <td class="text-right p-2 tabular-nums">{{ "{:.0f}".format(a.option_delta|float) if a.option_delta is not none else '—' }}</td>
           <td class="text-right p-2 tabular-nums">{{ a.target_shares if a.target_shares is not none else '—' }}</td>
           <td class="text-right p-2 tabular-nums">{{ a.held_after }}</td>
-          <td class="text-right p-2 tabular-nums">{{ pnl(a.realized_pnl_delta|float) if a.realized_pnl_delta is not none else '—' }}</td>
+          <td class="text-right p-2 tabular-nums">{{ money(a.realized_pnl_delta, decimals=2) }}</td>
           <td class="p-2 text-ink-500">{{ a.reason }}</td>
         </tr>
         {% endfor %}

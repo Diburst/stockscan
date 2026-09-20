@@ -1,34 +1,33 @@
 """Live / backdated scanner runner.
 
-Bridges the strategy plugin system, the data store, the risk engine, and
-persistence. Reuses the SAME `Strategy.signals()` and `FilterChain` code
-the backtester uses — no separate code path.
+Bridges the strategy plugin system, the data store, the regime layer, the
+risk engine, and persistence. Reuses the SAME ``Strategy.signals()``,
+``size_for_strategy`` and ``FilterChain`` code the backtester uses — one
+code path, two callers.
 
 Workflow per run:
-  1. Resolve `as_of` (default = today). Determine universe via historical
-     S&P 500 membership.
-  2. Look up the strategy's active config (creates a default config if the
-     strategy is brand new — strategy_versions row is also created).
-  3. Build a PortfolioContext from current DB state (positions, equity,
-     earnings calendar, etc.).
-  4. For each symbol with sufficient history: run strategy.signals().
-  5. Size each raw signal via the risk module.
-  6. Run the filter chain. Passing signals get status='new'; failing signals
-     get status='rejected' with `rejected_reason`.
-  7. Persist a strategy_runs row + one signals row per emitted candidate
-     (passing AND rejected, so the UI can show both).
+  1. Resolve ``as_of`` (default = today). Determine the universe via
+     point-in-time S&P 500 membership.
+  2. Ensure the strategy's version row exists and instantiate it.
+  3. Read the day's market regime (trend gate, vol scalar, credit stress).
+  4. Build a PortfolioContext from DB state: equity, open positions,
+     sector map and exposure, the earnings calendar, 20-day dollar volume.
+  5. For each symbol with sufficient history: run ``strategy.signals()``,
+     size each signal (strategy rule × vol scalar), refuse new longs while
+     the regime blocks them.
+  6. Run the filter chain over the survivors, best score first.
+  7. Persist a strategy_runs row + one signals row per candidate (passing
+     AND rejected, so the UI can show both).
 """
 
 from __future__ import annotations
 
-import dataclasses
 import json
 import logging
 import time
 from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal
-from typing import Any
 
 import pandas as pd
 from sqlalchemy import text
@@ -37,10 +36,10 @@ from sqlalchemy.orm import Session
 from stockscan.config import settings
 from stockscan.data.store import get_bars
 from stockscan.db import session_scope
-from stockscan.ml.predict import score_signal as ml_score_signal
-from stockscan.regime import detect_regime
+from stockscan.regime import MarketRegime, detect_regime
 from stockscan.risk.filters import FilterChain, PortfolioContext
-from stockscan.risk.sizer import position_size
+from stockscan.risk.sizer import size_for_strategy
+from stockscan.sectors.store import sector_map
 from stockscan.strategies import (
     STRATEGY_REGISTRY,
     RawSignal,
@@ -52,81 +51,37 @@ from stockscan.universe import current_constituents, members_as_of
 
 log = logging.getLogger(__name__)
 
-
-@dataclass(frozen=True, slots=True)
-class _RegimeShim:
-    """Duck-typed stand-in for ``MarketRegime`` used by the meta-label
-    feature builder.
-
-    The full ``MarketRegime`` row carries a dozen percentile-rank
-    columns that ``build_features`` doesn't read. Rather than
-    round-trip the DB inside the scoring loop, we forward the three
-    attributes the feature block actually consumes (regime label,
-    composite score, credit-stress flag) using the same attribute
-    names. The feature builder uses ``getattr(..., default)`` so any
-    extra attributes a real ``MarketRegime`` would have stay dormant.
-    """
-
-    regime: str
-    composite_score: float | None
-    credit_stress_flag: bool
-
-
-@dataclass(frozen=True, slots=True)
-class RegimeFactor:
-    """Soft-sizing inputs derived from the current market regime.
-
-    Replaces the v1 ``regime_skipped`` hard gate. Computed once per scan
-    invocation and applied to every signal's base qty:
-
-        final_qty = round(base_qty * multiplier)
-
-    ``multiplier`` is the product of three terms:
-      * The strategy's affinity for the current discrete regime label.
-      * The composite-score health multiplier (``0.5 + 0.5 * composite``,
-        per the research doc's conservative recommendation — never zeros
-        out exposure entirely on the composite alone).
-      * A 0.5x credit-stress override (research doc §Tier 0(b)) when the
-        circuit-breaker fires.
-
-    ``block_new_longs`` short-circuits long entries under credit stress
-    regardless of the multiplier — sized-down longs would still bleed in
-    a rolling drawdown.
-    """
-
-    multiplier: float
-    label: str | None  # None when regime data unavailable
-    composite_score: float | None
-    credit_stress_flag: bool
-    block_new_longs: bool
+ADV_WINDOW = 20
 
 
 @dataclass(frozen=True, slots=True)
 class ScanSummary:
-    run_id: int  # always >= 0 under soft sizing; -1 only on hard data outage
+    run_id: int
     strategy_name: str
     strategy_version: str
     as_of_date: date
     universe_size: int
     signals_emitted: int
     rejected_count: int
-    # Kept for back-compat with v1 dashboards. With soft sizing nothing
-    # is skipped on regime grounds, so the field stays but always reports
-    # False — callers that surface it should migrate to ``regime_multiplier``.
-    regime_skipped: bool = False
-    # Effective regime multiplier applied to base sizing (1.0 = neutral,
-    # 0.0 = no exposure on regime grounds).
-    regime_multiplier: float = 1.0
+    regime_label: str | None
+    vol_scalar: float
+
+
+def avg_dollar_volume(bars: pd.DataFrame, window: int = ADV_WINDOW) -> Decimal | None:
+    """Mean of close × volume over the last ``window`` bars, or None if short."""
+    if len(bars) < window:
+        return None
+    tail = bars.iloc[-window:]
+    value = float((tail["close"].astype(float) * tail["volume"].astype(float)).mean())
+    return Decimal(str(round(value, 2)))
 
 
 class ScanRunner:
     """One scanner invocation. Stateful per-instance for clarity."""
 
     def __init__(self, session: Session | None = None) -> None:
-        self._owns_session = session is None
         self._session = session
 
-    # ------------------------------------------------------------------
     def run(
         self,
         strategy_name: str,
@@ -143,7 +98,6 @@ class ScanRunner:
         with session_scope() as s:
             return self._run_in_session(s, strategy_cls, as_of, symbols)
 
-    # ------------------------------------------------------------------
     def _run_in_session(
         self,
         s: Session,
@@ -151,35 +105,26 @@ class ScanRunner:
         as_of: date,
         symbols: list[str] | None,
     ) -> ScanSummary:
-        # 1. Ensure the strategy's version row exists, then instantiate it.
-        #    Knobs come from the strategy file itself — no DB-shadowed
-        #    strategy_configs row (retired in migration 0016). For strategies
-        #    that still declare a params_model, the file defaults are used.
         ensure_strategy_version(strategy_cls, session=s)
-        params = strategy_cls.params_model() if strategy_cls.params_model is not None else None
-        strategy = strategy_cls(params)
+        strategy = strategy_cls()
 
-        # 1b. Resolve the regime soft-sizing multiplier. Replaces the v1
-        #     hard gate: instead of skipping the strategy when the regime
-        #     doesn't match, we compute a multiplier (0.0..1.0+) that scales
-        #     each signal's base qty. ``block_new_longs`` short-circuits
-        #     long entries when credit stress fires.
-        regime_factor = self._resolve_regime_factor(s, strategy_cls, as_of)
+        regime = self._regime(s, as_of)
+        vol_scalar = regime.vol_multiplier if regime is not None else 1.0
+        block_reason = _block_reason(regime)
 
-        # 2. Resolve universe.
         if symbols is None:
             symbols = members_as_of(as_of, session=s) or current_constituents(session=s)
         scan_started = time.perf_counter()
         log.info(
-            "scanning %s v%s on %d symbols as of %s (regime mult=%.3f)",
+            "scanning %s v%s on %d symbols as of %s (regime=%s, vol scalar=%.2f)",
             strategy_cls.name,
             strategy_cls.version,
             len(symbols),
             as_of,
-            regime_factor.multiplier,
+            regime.regime if regime is not None else "unavailable",
+            vol_scalar,
         )
 
-        # 3. Build portfolio context (positions, equity, earnings).
         ctx = self._portfolio_context(s, as_of)
         chain = FilterChain.default(
             max_positions=settings.max_positions,
@@ -187,33 +132,14 @@ class ScanRunner:
             max_sector_pct=settings.max_sector_pct,
             max_adv_pct=settings.max_adv_pct,
             max_drawdown=settings.drawdown_circuit_breaker,
+            strategy_max_positions=strategy_cls.max_open_positions,
         )
 
-        # 4. Run signals + sizer + filters per symbol.
-        # We cache bars per symbol so the technical-score step can reuse them
-        # without a second DB roundtrip per signal.
-        #
-        # Two passes by design:
-        #
-        #   Pass A — generate + size: for each symbol, generate signals
-        #     and apply the cheap, signal-local checks (pre-reject from
-        #     strategy metadata, qty_zero, credit_stress_long_block,
-        #     regime_zero_size). Anything killed at this stage is
-        #     specific to one signal and doesn't depend on what other
-        #     candidates exist, so order doesn't matter here.
-        #
-        #   Pass B — filter chain: sort the surviving (sig, qty) list
-        #     by sig.score DESCENDING, then run the FilterChain. The
-        #     chain enforces portfolio-level caps (max_positions,
-        #     max_sector_pct, etc.) where contention exists between
-        #     candidates — and the strongest-scoring candidates should
-        #     win the slot, not the alphabetically-first ones. Stable
-        #     sort keeps ties deterministic.
-        bars_cache: dict[str, pd.DataFrame] = {}
+        # Pass A — generate + size. Signal-local checks only, so order does
+        # not matter. Pass B — filter chain over the survivors, strongest
+        # score first, so the best candidates claim contended slots.
         passing: list[tuple[RawSignal, int]] = []
         rejected: list[tuple[RawSignal, int, str]] = []
-        # Eligible-for-filter-chain queue, populated in Pass A and
-        # sorted before Pass B.
         chain_eligible: list[tuple[RawSignal, int]] = []
         for symbol in symbols:
             try:
@@ -223,14 +149,10 @@ class ScanRunner:
                 continue
             if bars.empty or len(bars) < strategy.required_history():
                 continue
-            # Stamp the symbol so strategy.signals() can extract it.
             bars.attrs["symbol"] = symbol
-            bars_cache[symbol] = bars
             try:
                 raw_sigs = strategy.signals(bars, as_of)
             except Exception:
-                # One symbol's bad data must not abort the whole scan —
-                # log with full traceback + symbol context, move on.
                 log.exception(
                     "scan %s: signals() raised on %s as of %s — symbol skipped",
                     strategy_cls.name,
@@ -238,47 +160,28 @@ class ScanRunner:
                     as_of,
                 )
                 continue
+            if not raw_sigs:
+                continue
+            adv = avg_dollar_volume(bars)
+            if adv is not None:
+                ctx.avg_dollar_volume_20d[symbol] = adv
             for sig in raw_sigs:
-                # Strategy-emitted pre-rejection. Strategies that need
-                # to surface a contextual rejection reason (e.g., the
-                # Turtle 1L skip-after-winner filter, which depends on
-                # PRIOR signal outcomes the FilterChain can't see)
-                # populate ``metadata['_strategy_reject_reason']`` on the
-                # emitted signal. We route those straight to the
-                # rejected list so they appear in the dashboard's
-                # Rejected Signals card with the strategy's own reason.
-                pre_reject = (sig.metadata or {}).get("_strategy_reject_reason")
-                if pre_reject:
-                    rejected.append((sig, 0, str(pre_reject)))
+                if block_reason is not None and sig.side == "long":
+                    rejected.append((sig, 0, block_reason))
                     continue
-
-                base_qty = self._size(sig)
-                if base_qty <= 0:
-                    rejected.append((sig, 0, "qty_zero"))
+                sizing = size_for_strategy(
+                    strategy_cls,
+                    ctx.equity,
+                    sig.suggested_entry,
+                    sig.suggested_stop,
+                    vol_scalar=vol_scalar,
+                    max_position_pct=Decimal(str(settings.max_position_pct)),
+                )
+                if sizing.qty <= 0:
+                    rejected.append((sig, 0, sizing.rejected_reason or "qty_zero"))
                     continue
+                chain_eligible.append((sig, sizing.qty))
 
-                # Credit-stress override: hard-block new long entries
-                # regardless of the multiplier (research doc §Tier 0(b)).
-                if regime_factor.block_new_longs and sig.side == "long":
-                    rejected.append((sig, base_qty, "credit_stress_long_block"))
-                    continue
-
-                # Soft sizing: scale base qty by the regime multiplier.
-                # round() with one arg already returns int in Py3.
-                qty = max(0, round(base_qty * regime_factor.multiplier))
-                if qty <= 0:
-                    rejected.append((sig, 0, "regime_zero_size"))
-                    continue
-
-                # Pass-A survivor — defer filter-chain evaluation to
-                # the sorted Pass B below.
-                chain_eligible.append((sig, qty))
-
-        # ---- Pass B: score-sort, then filter-chain. ----
-        # Highest-scoring candidates first. ``None`` scores sink to
-        # the bottom (treated as -inf). Ties fall back to insertion
-        # order (alphabetical from the universe iteration), keeping
-        # behavior deterministic.
         chain_eligible.sort(
             key=lambda pair: (
                 float(pair[0].score) if pair[0].score is not None else float("-inf")
@@ -289,41 +192,26 @@ class ScanRunner:
             result = chain.evaluate(sig, qty, ctx)
             if result.passed:
                 passing.append((sig, qty))
+                # A passing candidate counts against the caps for the rest
+                # of the pass, so the chain sees the book it is building.
+                ctx.open_positions[sig.symbol] = {
+                    "qty": Decimal(qty),
+                    "notional": sig.suggested_entry * qty,
+                    "strategy": strategy_cls.name,
+                }
+                sector = ctx.sectors.get(sig.symbol)
+                if sector:
+                    ctx.sector_exposure[sector] = (
+                        ctx.sector_exposure.get(sector, Decimal(0)) + sig.suggested_entry * qty
+                    )
             else:
                 rejected.append((sig, qty, result.reason or "filter_rejected"))
 
-        # 4b. Meta-label scoring pass (advisory only — never rejects).
-        #     Loads the trained XGBoost model for this strategy (None
-        #     if none exists yet), scores each passing signal, and
-        #     attaches the probability into ``signal.metadata`` under
-        #     ``meta_label_proba``. RawSignal is frozen so we rebuild
-        #     each entry via ``dataclasses.replace`` rather than mutate.
-        #
-        #     Soft-fails per signal: a model exception logs at warning
-        #     level and the signal is persisted without a score. The
-        #     score-only integration mode means we never block a trade
-        #     on a missing or low score — operators decide based on
-        #     accumulated data once they're ready to flip on hard
-        #     filtering (TODO: meta-label rejection threshold).
-        passing = self._meta_score_pass(passing, bars_cache, as_of, strategy_cls, regime_factor)
-
-        # 5. Persist signals. The strategy owns its own score (and, if it uses
-        #    a composite, the per-input breakdown stashed in metadata) — the
-        #    runner no longer computes a parallel "technical score" annotation.
-        run_id = self._persist_run(
-            s,
-            strategy_cls,
-            as_of,
-            len(symbols),
-            len(passing),
-            len(rejected),
-        )
+        run_id = self._persist_run(s, strategy_cls, as_of, len(symbols), len(passing), len(rejected))
         for sig, qty in passing:
             self._persist_signal(s, run_id, strategy_cls, as_of, sig, qty, "new", None)
         for sig, qty, reason in rejected:
-            self._persist_signal(
-                s, run_id, strategy_cls, as_of, sig, qty, "rejected", reason
-            )
+            self._persist_signal(s, run_id, strategy_cls, as_of, sig, qty, "rejected", reason)
 
         log.info(
             "scan done: %s v%s | %d passing / %d rejected | run_id=%d | %.1fs",
@@ -334,7 +222,6 @@ class ScanRunner:
             run_id,
             time.perf_counter() - scan_started,
         )
-
         return ScanSummary(
             run_id=run_id,
             strategy_name=strategy_cls.name,
@@ -343,26 +230,28 @@ class ScanRunner:
             universe_size=len(symbols),
             signals_emitted=len(passing),
             rejected_count=len(rejected),
-            regime_multiplier=regime_factor.multiplier,
+            regime_label=regime.regime if regime is not None else None,
+            vol_scalar=vol_scalar,
         )
 
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
-
-    def _size(self, signal: RawSignal) -> int:
-        # Quick pass through the sizer using config defaults.
-        sizing = position_size(
-            equity=Decimal("1000000"),  # placeholder; live equity wired in via context
-            entry_price=signal.suggested_entry,
-            stop_price=signal.suggested_stop,
-            risk_pct=Decimal(str(settings.default_risk_pct)),
-            max_position_pct=Decimal(str(settings.max_position_pct)),
-        )
-        return sizing.qty
+    @staticmethod
+    def _regime(s: Session, as_of: date) -> MarketRegime | None:
+        """Today's regime row, or None (neutral sizing, no entry block) when
+        the benchmark data is missing — a data outage must not silently
+        stop the scanner."""
+        try:
+            regime = detect_regime(as_of, session=s)
+        except Exception as exc:
+            log.warning("regime detection failed — sizing neutrally: %s", exc)
+            return None
+        if regime is None:
+            log.warning("regime: no row for %s — sizing neutrally", as_of)
+        return regime
 
     def _portfolio_context(self, s: Session, as_of: date) -> PortfolioContext:
-        # Latest NAV
         eq_row = s.execute(
             text(
                 """
@@ -375,28 +264,36 @@ class ScanRunner:
             ),
             {"d": as_of},
         ).first()
-        equity = Decimal(str(eq_row.total_equity)) if eq_row else Decimal("1000000")
-        hwm = Decimal(str(eq_row.high_water_mark)) if eq_row else equity
-
-        # Open positions
-        pos_rows = s.execute(
-            text(
-                """
-                SELECT symbol, strategy, qty, avg_cost
-                FROM positions
-                """
+        if eq_row is not None:
+            equity = Decimal(str(eq_row.total_equity))
+            hwm = Decimal(str(eq_row.high_water_mark))
+        else:
+            equity = Decimal(str(settings.starting_equity))
+            hwm = equity
+            log.warning(
+                "no equity_history row on or before %s — sizing against "
+                "STOCKSCAN_STARTING_EQUITY=%s",
+                as_of,
+                equity,
             )
-        ).all()
-        open_positions = {
-            r.symbol: {
+
+        sectors = sector_map(session=s)
+        pos_rows = s.execute(text("SELECT symbol, strategy, qty, avg_cost FROM positions")).all()
+        open_positions: dict[str, dict[str, Decimal]] = {}
+        sector_exposure: dict[str, Decimal] = {}
+        for r in pos_rows:
+            notional = Decimal(str(r.qty)) * Decimal(str(r.avg_cost))
+            open_positions[r.symbol] = {
                 "qty": Decimal(r.qty),
-                "notional": Decimal(str(r.qty)) * Decimal(str(r.avg_cost)),
+                "notional": notional,
                 "strategy": r.strategy,
             }
-            for r in pos_rows
-        }
+            sector = sectors.get(r.symbol)
+            if sector:
+                sector_exposure[sector] = sector_exposure.get(sector, Decimal(0)) + notional
 
-        # Earnings within 5 trading days (calendar approximation = 7 calendar days)
+        # Earnings within 5 trading days (calendar approximation = 7 days).
+        # Empty when the data plan does not refresh the calendar.
         earnings_rows = s.execute(
             text(
                 """
@@ -406,172 +303,15 @@ class ScanRunner:
             ),
             {"d": as_of},
         ).all()
-        earnings = {r.symbol for r in earnings_rows}
 
         return PortfolioContext(
             as_of=as_of,
             equity=equity,
             high_water_mark=hwm,
             open_positions=open_positions,
-            earnings_within_5d=earnings,
-        )
-
-    def _meta_score_pass(
-        self,
-        passing: list[tuple[RawSignal, int]],
-        bars_cache: dict[str, pd.DataFrame],
-        as_of: date,
-        strategy_cls: type[Strategy],
-        regime_factor: RegimeFactor,
-    ) -> list[tuple[RawSignal, int]]:
-        """Attach meta-label probability to each passing signal's metadata.
-
-        Score-only integration: never rejects, never alters qty. The
-        probability is round-tripped through ``signal.metadata`` so the
-        downstream persistence layer stores it under the JSONB
-        ``metadata.meta_label_proba`` key for inspection in the
-        Signals UI and for later threshold tuning.
-
-        We piggy-back on the regime row already fetched in
-        ``_resolve_regime_factor`` rather than re-querying — see
-        :meth:`_regime_for_scoring`. If the model isn't trained yet
-        :func:`ml_score_signal` returns ``None`` and we skip the
-        metadata patch entirely, leaving the signal unchanged.
-        """
-        if not passing:
-            return passing
-        regime = self._regime_for_scoring(as_of, regime_factor)
-        out: list[tuple[RawSignal, int]] = []
-        scored = 0
-        for sig, qty in passing:
-            bars = bars_cache.get(sig.symbol)
-            if bars is None or bars.empty:
-                out.append((sig, qty))
-                continue
-            try:
-                proba = ml_score_signal(
-                    strategy_name=strategy_cls.name,
-                    bars=bars,
-                    as_of=as_of,
-                    signal_metadata=sig.metadata,
-                    signal_score=float(sig.score) if sig.score is not None else None,
-                    regime=regime,
-                )
-            except Exception as exc:  # never break a scan on ML
-                log.warning(
-                    "meta-score: %s/%s scoring raised: %s",
-                    strategy_cls.name,
-                    sig.symbol,
-                    exc,
-                )
-                out.append((sig, qty))
-                continue
-            if proba is None:
-                out.append((sig, qty))
-                continue
-            new_md = {**sig.metadata, "meta_label_proba": round(proba, 4)}
-            new_sig = dataclasses.replace(sig, metadata=new_md)
-            out.append((new_sig, qty))
-            scored += 1
-        if scored:
-            log.info(
-                "meta-score: %s — %d/%d signals scored",
-                strategy_cls.name,
-                scored,
-                len(passing),
-            )
-        return out
-
-    @staticmethod
-    def _regime_for_scoring(_as_of: date, factor: RegimeFactor) -> Any:
-        """Return a MarketRegime-shaped object for the meta-label features.
-
-        ``RegimeFactor`` carries the multiplier and label/composite/
-        credit-stress fields that the feature builder needs. We pack
-        them into a duck-typed shim with the attribute names the
-        feature builder expects (``regime``, ``composite_score``,
-        ``credit_stress_flag``) so we don't have to round-trip the
-        DB. The shim doesn't claim to be a full ``MarketRegime`` and
-        :func:`build_features` only reads the attributes it cares about.
-
-        ``_as_of`` is intentionally accepted but unused for now — when
-        we promote scoring to read the per-day regime row from the DB
-        rather than reusing the once-per-scan ``RegimeFactor``, this
-        argument carries the lookup key.
-        """
-        return _RegimeShim(
-            regime=factor.label or "",
-            composite_score=factor.composite_score,
-            credit_stress_flag=factor.credit_stress_flag,
-        )
-
-    def _resolve_regime_factor(
-        self,
-        s: Session,
-        strategy_cls: type[Strategy],
-        as_of: date,
-    ) -> RegimeFactor:
-        """Compute the soft-sizing multiplier for this strategy.
-
-        Replaces the v1 ``_check_regime`` hard gate. Multiplier is the
-        product of:
-
-          * ``strategy_cls.affinity_for(label)`` — strategy's preference
-            for the current discrete regime label.
-          * ``0.5 + 0.5 * composite_score`` — continuous health
-            multiplier (research doc §6.1's conservative form; never
-            zeros out exposure on the composite alone).
-          * ``0.5`` if ``credit_stress_flag`` is set, else ``1.0``
-            (research doc §Tier 0(b)).
-
-        Soft-fails to a neutral 1.0 multiplier on any failure path so
-        a regime-data outage doesn't block the strategy from running.
-        """
-        # Default = neutral. Used when regime detection is degraded or fails.
-        neutral = RegimeFactor(
-            multiplier=1.0,
-            label=None,
-            composite_score=None,
-            credit_stress_flag=False,
-            block_new_longs=False,
-        )
-
-        try:
-            regime_obj = detect_regime(as_of, session=s)
-        except Exception as exc:
-            log.warning("regime detection failed — using neutral multiplier: %s", exc)
-            return neutral
-
-        if regime_obj is None:
-            log.info("regime: no row for %s — using neutral multiplier", as_of)
-            return neutral
-
-        label = regime_obj.regime
-        affinity = strategy_cls.affinity_for(label)
-        composite_dec = regime_obj.composite_score
-        composite = float(composite_dec) if composite_dec is not None else None
-        composite_mult = 0.5 + 0.5 * composite if composite is not None else 1.0
-        stress = bool(regime_obj.credit_stress_flag)
-        stress_mult = 0.5 if stress else 1.0
-
-        multiplier = affinity * composite_mult * stress_mult
-        log.info(
-            "regime sizing: %s @ %s | affinity=%.2f composite_mult=%.2f stress_mult=%.2f -> %.3f%s",
-            strategy_cls.name,
-            label,
-            affinity,
-            composite_mult,
-            stress_mult,
-            multiplier,
-            " [block_new_longs]" if stress else "",
-        )
-
-        return RegimeFactor(
-            multiplier=multiplier,
-            label=label,
-            composite_score=composite,
-            credit_stress_flag=stress,
-            block_new_longs=stress,
+            sector_exposure=sector_exposure,
+            earnings_within_5d={r.symbol for r in earnings_rows},
+            sectors=sectors,
         )
 
     def _persist_run(
@@ -615,11 +355,8 @@ class ScanRunner:
         status: str,
         rejected_reason: str | None,
     ) -> None:
-        # ON CONFLICT on the natural key (symbol, strategy_name,
-        # strategy_version, as_of_date) so re-running the same
-        # strategy for the same date updates the existing row
-        # rather than creating a duplicate. The latest run always
-        # wins — score, sizing, metadata, and status are refreshed.
+        # ON CONFLICT on the natural key so re-running the same strategy for
+        # the same date refreshes the row instead of duplicating it.
         s.execute(
             text(
                 """
@@ -663,3 +400,14 @@ class ScanRunner:
                 "status": status,
             },
         )
+
+
+def _block_reason(regime: MarketRegime | None) -> str | None:
+    """Why new longs are refused today, or None when they are allowed."""
+    if regime is None:
+        return None
+    if regime.credit_stress_flag:
+        return "credit_stress_long_block"
+    if not regime.trend_gate_open:
+        return "trend_gate_closed"
+    return None

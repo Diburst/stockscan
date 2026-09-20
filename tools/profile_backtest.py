@@ -12,8 +12,8 @@ and is exposed as the ``stockscan backtest profile`` typer subcommand
 Every flag passed to this script is forwarded verbatim to the typer
 command, so the two invocations are interchangeable:
 
-    python tools/profile_backtest.py reversal_swing --from 2023-01-01
-    stockscan backtest profile reversal_swing --from 2023-01-01
+    python tools/profile_backtest.py momentum_52w_high --from 2023-01-01
+    stockscan backtest profile momentum_52w_high --from 2023-01-01
 
 Run ``--help`` against either for the full flag list.
 """

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import date
+from decimal import Decimal
 from types import SimpleNamespace
 
 import pytest
@@ -10,6 +11,7 @@ import pytest
 from stockscan.proposals._models import SELL_CALL, SELL_PUT
 from stockscan.proposals.engine import propose_candidates
 from stockscan.proposals.portfolio import build_book, regime_size_multiplier
+from stockscan.regime import MarketRegime, regime_label
 
 
 def _leg(strike=100.0, pct_otm=10.0, vol_pct=90.0, confluences=(), price=2.0, delta=0.15):
@@ -21,8 +23,7 @@ def _leg(strike=100.0, pct_otm=10.0, vol_pct=90.0, confluences=(), price=2.0, de
 
 def _mk(
     symbol="TST", day_move=-3.0, trend="up", dte=6, days_to_earnings=None,
-    pct_to_support=8.0, pct_to_resistance=8.0, last_volume=50e6,
-    call=None, put=None,
+    last_volume=50e6, call=None, put=None,
 ):
     prev = 100.0
     last = prev * (1 + day_move / 100.0)
@@ -33,7 +34,6 @@ def _mk(
     )
     oc = SimpleNamespace(
         available=True, strike_sets=[sset], days_to_earnings=days_to_earnings,
-        pct_to_support=pct_to_support, pct_to_resistance=pct_to_resistance,
     )
     return SimpleNamespace(
         symbol=symbol, available=True, last_volume=last_volume,
@@ -49,19 +49,21 @@ def test_red_day_uptrend_sells_put():
     assert p.score_breakdown["trend_align"] == 1.0  # with-trend dip = best
 
 
-def test_green_day_at_resistance_downtrend_sells_call():
-    [p] = propose_candidates([_mk(day_move=3.0, trend="down", pct_to_resistance=2.0)])
+def test_green_day_downtrend_sells_call():
+    [p] = propose_candidates([_mk(day_move=3.0, trend="down")])
     assert p.side == SELL_CALL
+    assert p.score_breakdown["trend_align"] == 1.0  # with-trend bounce = best
+
+
+def test_green_day_uptrend_call_is_penalized():
+    [p] = propose_candidates([_mk(day_move=3.0, trend="up")])
+    assert p.side == SELL_CALL
+    assert p.score_breakdown["trend_align"] < 0.5
 
 
 def test_green_day_breakout_is_skipped():
-    # strong_up momentum into resistance -> do NOT sell a call into a breakout
-    assert propose_candidates([_mk(day_move=3.0, trend="strong_up", pct_to_resistance=2.0)]) == []
-
-
-def test_green_day_open_space_is_skipped():
-    # green but not near resistance -> no qualifying call sale
-    assert propose_candidates([_mk(day_move=3.0, trend="down", pct_to_resistance=12.0)]) == []
+    # strong_up momentum -> do NOT sell a call into a breakout
+    assert propose_candidates([_mk(day_move=3.0, trend="strong_up")]) == []
 
 
 def test_small_move_no_trigger():
@@ -82,44 +84,58 @@ def test_low_iv_dropped():
     assert propose_candidates([low]) == []
 
 
-def test_price_at_level_flag_is_context_only():
-    # Price sitting ON support (red day) -> flagged; far from support -> not.
-    [at] = propose_candidates([_mk(day_move=-3.0, trend="up", pct_to_support=1.5)])
-    [far] = propose_candidates([_mk(day_move=-3.0, trend="up", pct_to_support=8.0)])
-    assert at.price_at_level is True
-    assert far.price_at_level is False
-    # It must NOT change the score (context flag only) — same inputs otherwise,
-    # so the score is driven by 'room' (pct_to_threat), which differs here; the
-    # flag itself isn't a score input.
-    assert "price_at_level" not in at.score_breakdown
+def test_ema_confluence_raises_score():
+    plain = _mk(day_move=-3.0, trend="up")
+    on_ema = _mk(
+        day_move=-3.0, trend="up",
+        put=_leg(strike=90, pct_otm=-10, confluences=("50 EMA $90.10 (0.1% away)",)),
+    )
+    [p0] = propose_candidates([plain])
+    [p1] = propose_candidates([on_ema])
+    assert p1.confluence_count == 1 and p0.confluence_count == 0
+    assert p1.score > p0.score
 
 
 def test_score_is_bounded_and_has_breakdown():
     [p] = propose_candidates([_mk(day_move=-3.0, trend="up")])
     assert 0.0 <= p.score <= 1.0
-    assert {"premium", "room", "confluence", "trend_align", "daycolor", "score"} <= set(
+    assert {"premium", "confluence", "trend_align", "daycolor", "score"} <= set(
         p.score_breakdown
     )
 
 
 # ---- portfolio sizing + diversification -----------------------------------
-def _regime(composite=0.68, stress=False, breadth=0.27):
-    return SimpleNamespace(
-        composite_score=composite, credit_stress_flag=stress, breadth_score=breadth
+def _regime(vol_scalar=0.8, stress=False, gate_open=True):
+    return MarketRegime(
+        as_of_date=date(2026, 6, 15),
+        regime=regime_label(trend_gate_open=gate_open, credit_stress_flag=stress),
+        trend_gate_open=gate_open,
+        days_on_side=12,
+        spy_close=Decimal("500"),
+        spy_sma200=Decimal("480"),
+        spy_sma200_slope_20d=Decimal("0.01"),
+        realized_vol_20d=Decimal("0.20"),
+        realized_vol_pct_rank=Decimal("0.90"),
+        vol_scalar=Decimal(str(vol_scalar)) if vol_scalar is not None else None,
+        hy_oas_level=Decimal("3.5"),
+        hy_oas_pct_rank=Decimal("0.40"),
+        credit_stress_flag=stress,
     )
 
 
 def test_regime_size_multiplier():
     assert regime_size_multiplier(None) == 1.0
-    assert regime_size_multiplier(_regime(0.68)) == pytest.approx(0.84)  # 0.5 + 0.5*0.68
-    assert regime_size_multiplier(_regime(0.68, stress=True)) == pytest.approx(0.42)  # ×0.5
+    assert regime_size_multiplier(_regime(0.8)) == pytest.approx(0.8)
+    assert regime_size_multiplier(_regime(0.8, stress=True)) == pytest.approx(0.4)  # ×0.5
+    assert regime_size_multiplier(_regime(vol_scalar=None)) == 1.0  # neutral when uncomputed
 
 
-def test_short_call_haircut_in_weak_breadth():
-    call_cand = propose_candidates([_mk(day_move=3.0, trend="down", pct_to_resistance=2.0)])
-    book = build_book(call_cand, _regime(breadth=0.27))
-    # 0.84 regime × 0.70 short-call breadth haircut
-    assert book[0].size_weight == round(0.84 * 0.70, 3)
+def test_closed_trend_gate_does_not_block_the_options_book():
+    # The book is short premium: it sizes down under stress, never blocks.
+    call_cand = propose_candidates([_mk(day_move=3.0, trend="down")])
+    book = build_book(call_cand, _regime(0.8, stress=True, gate_open=False))
+    assert len(book) == 1
+    assert book[0].size_weight == round(0.8 * 0.5, 3)
 
 
 def test_cluster_cap_limits_correlated_names():

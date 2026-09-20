@@ -5,8 +5,9 @@
 #
 # Edit + `docker compose restart scheduler` to apply changes.
 
-# Nightly: refresh bars -> sector composites -> scan all strategies ->
-# watchlist alerts -> regime -> summary notification. M-F 20:00 ET.
+# Nightly: refresh bars -> FRED macro (HY OAS) -> regime (forced recompute)
+# -> sector composites -> scan all strategies -> watchlist alerts ->
+# summary notification. M-F 20:00 ET.
 0 20 * * 1-5 stockscan jobs nightly-scan
 
 # Daily logical DB backup (pg_dump, rotated). 02:00 ET.

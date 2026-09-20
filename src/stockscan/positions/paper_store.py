@@ -30,12 +30,11 @@ class PaperTrade:
     symbol: str
     side: str
     entry_price: Decimal
-    stop_price: Decimal
+    stop_price: Decimal | None
     target_price: Decimal | None
     qty: int
     opened_at: datetime
     entry_signal_metadata: dict[str, Any] | None
-    entry_tech_score: dict[str, Any] | None
     entry_regime: dict[str, Any] | None
     entry_strategy_params: dict[str, Any] | None
     current_price: Decimal | None
@@ -52,7 +51,6 @@ class PaperTrade:
     realized_pnl_pct: Decimal | None
     holding_days: int | None
     exit_signal_metadata: dict[str, Any] | None
-    exit_tech_score: dict[str, Any] | None
     exit_regime: dict[str, Any] | None
     exit_strategy_params: dict[str, Any] | None
     auto_close_rules: dict[str, Any] | None
@@ -61,12 +59,12 @@ class PaperTrade:
 _SELECT_COLS = """
     paper_trade_id, signal_id, strategy_name, strategy_version,
     symbol, side, entry_price, stop_price, target_price, qty, opened_at,
-    entry_signal_metadata, entry_tech_score, entry_regime, entry_strategy_params,
+    entry_signal_metadata, entry_regime, entry_strategy_params,
     current_price, unrealised_pnl, unrealised_pnl_pct,
     max_favorable_excursion, max_adverse_excursion, last_mark_at,
     status, closed_at, exit_price, exit_reason,
     realized_pnl, realized_pnl_pct, holding_days,
-    exit_signal_metadata, exit_tech_score, exit_regime, exit_strategy_params,
+    exit_signal_metadata, exit_regime, exit_strategy_params,
     auto_close_rules
 """
 
@@ -86,12 +84,11 @@ def _row_to_paper_trade(r: Any) -> PaperTrade:
         symbol=r.symbol,
         side=r.side,
         entry_price=Decimal(str(r.entry_price)),
-        stop_price=Decimal(str(r.stop_price)),
+        stop_price=_dec(r.stop_price),
         target_price=_dec(r.target_price),
         qty=int(r.qty),
         opened_at=r.opened_at,
         entry_signal_metadata=r.entry_signal_metadata,
-        entry_tech_score=r.entry_tech_score,
         entry_regime=r.entry_regime,
         entry_strategy_params=r.entry_strategy_params,
         current_price=_dec(r.current_price),
@@ -108,7 +105,6 @@ def _row_to_paper_trade(r: Any) -> PaperTrade:
         realized_pnl_pct=_dec(r.realized_pnl_pct),
         holding_days=int(r.holding_days) if r.holding_days is not None else None,
         exit_signal_metadata=r.exit_signal_metadata,
-        exit_tech_score=r.exit_tech_score,
         exit_regime=r.exit_regime,
         exit_strategy_params=r.exit_strategy_params,
         auto_close_rules=r.auto_close_rules,
@@ -126,11 +122,10 @@ def open_paper_trade(
     symbol: str,
     side: str,
     entry_price: Decimal,
-    stop_price: Decimal,
+    stop_price: Decimal | None,
     target_price: Decimal | None,
     qty: int,
     entry_signal_metadata: dict[str, Any] | None = None,
-    entry_tech_score: dict[str, Any] | None = None,
     entry_regime: dict[str, Any] | None = None,
     entry_strategy_params: dict[str, Any] | None = None,
     auto_close_rules: dict[str, Any] | None = None,
@@ -144,13 +139,13 @@ def open_paper_trade(
         INSERT INTO paper_trades (
             signal_id, strategy_name, strategy_version, symbol, side,
             entry_price, stop_price, target_price, qty,
-            entry_signal_metadata, entry_tech_score, entry_regime,
+            entry_signal_metadata, entry_regime,
             entry_strategy_params, auto_close_rules,
             current_price, unrealised_pnl, unrealised_pnl_pct
         ) VALUES (
             :signal_id, :strategy_name, :strategy_version, :symbol, :side,
             :entry_price, :stop_price, :target_price, :qty,
-            :entry_signal_metadata, :entry_tech_score, :entry_regime,
+            :entry_signal_metadata, :entry_regime,
             :entry_strategy_params, :auto_close_rules,
             :entry_price, 0, 0
         ) RETURNING paper_trade_id
@@ -167,7 +162,6 @@ def open_paper_trade(
         "target_price": target_price,
         "qty": qty,
         "entry_signal_metadata": json.dumps(entry_signal_metadata) if entry_signal_metadata else None,
-        "entry_tech_score": json.dumps(entry_tech_score) if entry_tech_score else None,
         "entry_regime": json.dumps(entry_regime) if entry_regime else None,
         "entry_strategy_params": json.dumps(entry_strategy_params) if entry_strategy_params else None,
         "auto_close_rules": json.dumps(auto_close_rules) if auto_close_rules else None,
@@ -246,7 +240,6 @@ def close_paper_trade(
     exit_price: Decimal,
     exit_reason: str,
     exit_signal_metadata: dict[str, Any] | None = None,
-    exit_tech_score: dict[str, Any] | None = None,
     exit_regime: dict[str, Any] | None = None,
     exit_strategy_params: dict[str, Any] | None = None,
     session: Session | None = None,
@@ -271,7 +264,6 @@ def close_paper_trade(
             END,
             holding_days = EXTRACT(DAY FROM NOW() - opened_at)::integer,
             exit_signal_metadata = :exit_signal_metadata,
-            exit_tech_score = :exit_tech_score,
             exit_regime = :exit_regime,
             exit_strategy_params = :exit_strategy_params
         WHERE paper_trade_id = :pid AND status = 'open'
@@ -282,7 +274,6 @@ def close_paper_trade(
         "exit_price": exit_price,
         "exit_reason": exit_reason,
         "exit_signal_metadata": json.dumps(exit_signal_metadata) if exit_signal_metadata else None,
-        "exit_tech_score": json.dumps(exit_tech_score) if exit_tech_score else None,
         "exit_regime": json.dumps(exit_regime) if exit_regime else None,
         "exit_strategy_params": json.dumps(exit_strategy_params) if exit_strategy_params else None,
     }
@@ -357,7 +348,8 @@ def check_auto_close(*, session: Session | None = None) -> list[int]:
     any that meet exit criteria.
 
     Checks:
-      - stop_hit: current_price <= stop_price (long) or >= stop_price (short)
+      - stop_hit: current_price <= stop_price (long) or >= stop_price (short);
+        skipped for trades opened without a stop
       - target_hit: current_price >= target_price (long) or <= target_price (short)
       - time_stop: holding days >= auto_close_rules.time_stop_days
 
@@ -374,12 +366,13 @@ def check_auto_close(*, session: Session | None = None) -> list[int]:
         exit_price = pt.current_price
 
         # Stop loss check
-        if pt.side == "long" and pt.current_price <= pt.stop_price:
-            exit_reason = "stop_hit"
-            exit_price = pt.stop_price
-        elif pt.side == "short" and pt.current_price >= pt.stop_price:
-            exit_reason = "stop_hit"
-            exit_price = pt.stop_price
+        if pt.stop_price is not None:
+            if pt.side == "long" and pt.current_price <= pt.stop_price:
+                exit_reason = "stop_hit"
+                exit_price = pt.stop_price
+            elif pt.side == "short" and pt.current_price >= pt.stop_price:
+                exit_reason = "stop_hit"
+                exit_price = pt.stop_price
 
         # Target check
         if exit_reason is None and pt.target_price is not None:

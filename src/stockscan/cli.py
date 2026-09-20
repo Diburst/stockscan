@@ -22,7 +22,7 @@ Data refresh (provider → local store):
 
 Strategies:
   stockscan strategies list              — registered strategy names
-  stockscan strategies show NAME         — strategy metadata + Pydantic params schema
+  stockscan strategies show NAME         — strategy metadata, sizing rule and knobs
 
 Scanning + signals (live signal generation, persistence, version-aware admin):
   stockscan scan run STRATEGY [--all]    — run a single strategy or every registered one
@@ -34,15 +34,8 @@ Scanning + signals (live signal generation, persistence, version-aware admin):
                                             (strategy, version). Optional --start/--end
                                             date range. Confirms unless --yes.
 
-Meta-labeling (XGBoost classifier scoring P(profit-take) per signal):
-  stockscan ml train STRATEGY            — fit + pickle the model under ./models/. Filters
-                                            training data to the CURRENT strategy_version
-                                            by default; pass --strategy-version X.Y.Z to
-                                            override (re-train on historical-version data).
-  stockscan ml status                    — list trained models with holdout AUC
-
 Version semantics:
-  After a strategy version bump, web tools (Dashboard, /signals) AND ml train all default
+  After a strategy version bump, web tools (Dashboard, /signals) default
   to the new version. Older-version signals are preserved in the database but inert on
   the live UI. Use ``stockscan signals delete`` with explicit --version to clean up
   prior-version data when desired.
@@ -59,17 +52,14 @@ Backtesting (shared shape: positional STRATEGY first, then options):
                                                    historical S&P 500.
   stockscan backtest list                       — saved backtest runs (--strategy
                                                    to filter).
-  stockscan backtest debug STRATEGY SYMBOL      — per-day reversal-score breakdown
-                                                   for one symbol: why entries /
-                                                   exits (don't) fire. Recomputes
-                                                   the same score the backtest sees,
-                                                   flags ENTER days, top-exit days,
-                                                   per-indicator sub-scores. --all
-                                                   prints every day; --out PATH writes
-                                                   the full breakdown to CSV.
+  stockscan backtest debug STRATEGY SYMBOL      — per-day signal replay for one
+                                                   symbol: runs strategy.signals()
+                                                   on every trading day and tabulates
+                                                   fired / score / each metadata key.
+                                                   --all prints every day; --out PATH
+                                                   writes the full table to CSV.
   stockscan backtest export RUN_ID              — dump one run to JSON (trades +
-                                                   score breakdowns + equity +
-                                                   per-day recompute + regime
+                                                   entry metadata + equity + regime
                                                    overlay) — review-ready file.
   stockscan backtest profile STRATEGY           — wrap BacktestEngine.run() in
                                                    cProfile and dump the top-N
@@ -155,13 +145,12 @@ backtest_app = typer.Typer(help="Run and inspect backtests.", no_args_is_help=Tr
 scan_app = typer.Typer(help="Run live or backdated scans.", no_args_is_help=True)
 jobs_app = typer.Typer(help="Scheduled job orchestration.", no_args_is_help=True)
 watchlist_app = typer.Typer(help="Manage the watchlist.", no_args_is_help=True)
-ml_app = typer.Typer(help="Meta-labeling: train + inspect XGBoost models.", no_args_is_help=True)
 signals_app = typer.Typer(
     help="Signal-table operations (e.g., backfill historical scans).",
     no_args_is_help=True,
 )
 analysis_app = typer.Typer(
-    help="Per-symbol technical analysis: levels, trend, vol, options context.",
+    help="Per-symbol technical analysis: trend, volatility, options context.",
     no_args_is_help=True,
 )
 composites_app = typer.Typer(
@@ -187,7 +176,6 @@ app.add_typer(backtest_app, name="backtest")
 app.add_typer(scan_app, name="scan")
 app.add_typer(jobs_app, name="jobs")
 app.add_typer(watchlist_app, name="watchlist")
-app.add_typer(ml_app, name="ml")
 app.add_typer(signals_app, name="signals")
 app.add_typer(analysis_app, name="analysis")
 app.add_typer(composites_app, name="composites")
@@ -551,24 +539,22 @@ def refresh_macro_cmd(
 ) -> None:
     """Pull macro time series from FRED into the ``macro_series`` table.
 
-    Default series is ``BAMLH0A0HYM2`` (ICE BofA US High Yield OAS) — the
-    credit component of the v2 regime composite. The detector needs at
-    least 252 trailing observations (~1 year) to compute the percentile
-    rank, so the default 2007-01-01 start gives ample warmup history.
+    Default series: ``BAMLH0A0HYM2`` (ICE BofA US High Yield OAS — the
+    regime layer's credit-stress flag) plus the 1M/3M Treasury yields the
+    options analysis uses as its risk-free rate. The nightly job refreshes
+    the same set; this command is for the initial backfill (252 trailing
+    observations are needed before the flag can fire).
 
     Examples:
         stockscan refresh macro                       # HY OAS, 2007-today
         stockscan refresh macro BAMLH0A0HYM2 BAMLC0A0CMEY  # HY + IG OAS
         stockscan refresh macro --start 2020-01-01    # shorter window
     """
-    from stockscan.data.macro_store import upsert_macro_series
-    from stockscan.data.providers.fred import FredError, FredProvider
+    from stockscan.data.macro_refresh import DEFAULT_MACRO_SERIES, refresh_macro
+    from stockscan.data.providers.fred import FredProvider
 
     if not series:
-        # HY OAS (regime credit component) + 1-month and 3-month constant-
-        # maturity Treasury yields (the risk-free rate for the options
-        # analysis Black-Scholes strikes — see analysis/options_context.py).
-        series = ["BAMLH0A0HYM2", "DGS1MO", "DGS3MO"]
+        series = list(DEFAULT_MACRO_SERIES)
 
     start_d = date.fromisoformat(start)
     end_d = date.fromisoformat(end) if end else date.today()
@@ -586,17 +572,15 @@ def refresh_macro_cmd(
         f"[cyan]→[/cyan] refreshing {len(series)} series from FRED ({start_d} to {end_d})"
     )
 
+    with FredProvider(api_key=fred_key) as p:
+        results = refresh_macro(p, series, start_d, end_d)
     total = 0
     failed: list[str] = []
-    with FredProvider(api_key=fred_key) as p:
-        for code in series:
-            try:
-                rows = p.get_macro_series(code, start_d, end_d)
-            except FredError as exc:
-                console.print(f"  [red]✗[/red] {code}: {exc}")
-                failed.append(code)
-                continue
-            n = upsert_macro_series(rows)
+    for code, n in results.items():
+        if n is None:
+            console.print(f"  [red]✗[/red] {code}: fetch failed")
+            failed.append(code)
+        else:
             console.print(f"  [green]✓[/green] {code}: {n:,} observations")
             total += n
 
@@ -682,7 +666,7 @@ def strategies_list() -> None:
 
 @strat_app.command("show")
 def strategies_show(name: str) -> None:
-    """Show metadata + JSON schema for a strategy's params."""
+    """Show a strategy's metadata, sizing rule and tunable knobs."""
     discover_strategies()
     cls = STRATEGY_REGISTRY.get(name)
     console.print(f"[bold]{cls.display_name}[/bold]  ({cls.name} v{cls.version})")
@@ -690,10 +674,20 @@ def strategies_show(name: str) -> None:
         console.print(f"\n{cls.description}\n")
     if cls.tags:
         console.print(f"Tags: {', '.join(cls.tags)}")
-    console.print(f"Default risk per trade: {cls.default_risk_pct:.2%}")
-    console.print(f"Required history: {cls.required_history.__doc__ or 'see source'}")
-    console.print("\n[bold]Params JSON Schema:[/bold]")
-    console.print_json(json.dumps(cls.params_json_schema()))
+    if cls.position_pct is not None:
+        console.print(f"Sizing: fixed {cls.position_pct:.0%} of equity per position (no price stop)")
+    else:
+        console.print(f"Sizing: risk {cls.default_risk_pct:.2%} of equity against the stop")
+    if cls.max_open_positions is not None:
+        console.print(f"Max open positions: {cls.max_open_positions}")
+    console.print(f"Vol scalar applies: {'yes' if cls.sizes_down_in_high_vol else 'no'}")
+    knobs = {
+        k: v for k, v in vars(cls).items()
+        if not k.startswith("_") and isinstance(v, (int, float, str, bool))
+        and k not in ("name", "version", "display_name", "description", "manual")
+    }
+    console.print("\n[bold]Knobs (edit the strategy file and bump version):[/bold]")
+    console.print_json(json.dumps(knobs))
 
 
 # ----------------------------------------------------------------------
@@ -913,7 +907,7 @@ def scan_run(
 @backtest_app.command("run")
 def backtest_run(
     # Positional: the thing the command operates on.
-    strategy: str = typer.Argument(..., help="Registered strategy name (e.g. reversal_swing)"),
+    strategy: str = typer.Argument(..., help="Registered strategy name (e.g. momentum_52w_high)"),
     # Universe selection.
     universe: list[str] | None = typer.Option(
         None, "--symbol", "-s",
@@ -930,8 +924,7 @@ def backtest_run(
         None, "--to", help="ISO end date. Default: today.",
     ),
     # Execution / sizing parameters.
-    capital: float = typer.Option(1_000_000.0, "--capital"),
-    risk_pct: float = typer.Option(0.01, "--risk-pct"),
+    capital: float = typer.Option(100_000.0, "--capital"),
     slippage_bps: float = typer.Option(5.0, "--slippage-bps"),
     commission: float = typer.Option(0.0, "--commission"),
     # Output / persistence.
@@ -954,11 +947,9 @@ def backtest_run(
     start_d = _date.fromisoformat(start) if start else end_d - _timedelta(days=5 * 365)
     cfg = BacktestConfig(
         strategy_cls=cls,
-        params=cls.params_model() if cls.params_model is not None else None,
         start_date=start_d,
         end_date=end_d,
         starting_capital=_Dec(str(capital)),
-        risk_pct=_Dec(str(risk_pct)),
         commission_per_trade=_Dec(str(commission)),
         slippage=FixedBpsSlippage(bps=_Dec(str(slippage_bps))),
         universe=universe,
@@ -1040,7 +1031,7 @@ def backtest_debug(
     # Positional order: strategy first (the lens), then symbol (the subject).
     # Matches `backtest run STRATEGY` and `backtest profile STRATEGY` so the
     # mental model is "every backtest verb starts with the strategy."
-    strategy: str = typer.Argument(..., help="Registered strategy name (e.g. reversal_swing)."),
+    strategy: str = typer.Argument(..., help="Registered strategy name (e.g. momentum_52w_high)."),
     symbol: str = typer.Argument(..., help="Ticker to inspect (e.g. TSLA)."),
     # Date range — same shape as `run`. None defaults resolve in the body.
     start: str | None = typer.Option(
@@ -1052,30 +1043,24 @@ def backtest_debug(
     # Output.
     out_path: str | None = typer.Option(
         None, "--out", "-o",
-        help="Write the full per-day breakdown to this CSV path.",
+        help="Write the full per-day table to this CSV path.",
     ),
     # Command-specific.
     show_all: bool = typer.Option(
         False, "--all",
-        help="Print every trading day, not just signal / near-threshold days.",
-    ),
-    band: float = typer.Option(
-        0.10, "--band",
-        help="'Near a threshold' = score within this of entry/exit threshold.",
+        help="Print every trading day, not just the days a signal fired.",
     ),
 ) -> None:
-    """Per-day reversal-score breakdown for ONE symbol — why entries/exits (don't) fire.
+    """Per-day signal replay for ONE symbol — which days fire, and what the
+    strategy saw on each.
 
-    Recomputes the *same* signed reversal score the backtester sees, on the same
-    sliced + tailed window, for every trading day in the range. For each day it
-    shows the composite score, its directional core ``D`` and confirmation factor
-    ``C``, every contributing indicator's sub-score, and whether the strategy
-    would ENTER (``signals()`` fires) or is at a top (score ≤ −exit_threshold).
-
-    Use it to localize a surprising backtest: too few entries, never exiting, one
-    indicator dominating, or two signals that never line up on the same day. The
-    summary panel reports score percentiles, per-indicator coverage, and a
-    bottom-signal co-occurrence check (the turn vs. the level firing together).
+    Calls ``strategy.signals(view, day)`` on every trading day in the range,
+    exactly as the backtester does, and tabulates one row per day: the date,
+    close, whether a signal fired, its score, and every key the strategy wrote
+    into the signal's metadata as its own column. Days without a signal show
+    the close only. Use it to localize a surprising backtest: too few entries,
+    a filter that never passes, or an input that looks wrong on the days that
+    did fire.
     """
     from datetime import date as _date, timedelta as _timedelta
 
@@ -1091,22 +1076,13 @@ def backtest_debug(
         raise typer.Exit(1)
 
     strat = cls()  # uses file defaults for both pydantic + ClassVar-knob strategies
-    if not hasattr(strat, "reversal_score"):
-        console.print(
-            f"[red]{cls.name} does not expose a reversal_score(view, as_of) method.[/red]\n"
-            "[dim]`backtest debug` requires a strategy with a public reversal_score(view, as_of) "
-            "method (currently only reversal_swing).[/dim]"
-        )
-        raise typer.Exit(1)
-    entry_th = float(getattr(strat, "entry_threshold", 0.35))
-    exit_th = float(getattr(strat, "exit_threshold", 0.35))
     req = strat.required_history()
 
     end_d = _date.fromisoformat(end) if end else _date.today()
     start_d = _date.fromisoformat(start) if start else end_d - _timedelta(days=5 * 365)
 
     # Same generous warmup window the backtest engine pulls (req + buffer), so the
-    # earliest in-range day already has enough history for the 200-day terms.
+    # earliest in-range day already has enough history for the slowest lookback.
     warmup = max(250, req) + 30
     bars = get_bars(symbol, start_d - _timedelta(days=warmup * 2), end_d)
     if bars is None or bars.empty:
@@ -1116,7 +1092,7 @@ def backtest_debug(
         )
         raise typer.Exit(1)
     bars = bars.sort_index()
-    bars.attrs["symbol"] = symbol  # sector_rs reads this
+    bars.attrs["symbol"] = symbol  # sector relative-strength reads this
 
     trading_days = [d for d in sorted({ts.date() for ts in bars.index}) if start_d <= d <= end_d]
     if not trading_days:
@@ -1125,140 +1101,90 @@ def backtest_debug(
 
     console.print(
         f"[cyan]Debugging {cls.display_name} {cls.version} on {symbol}[/cyan]  "
-        f"{trading_days[0]} → {trading_days[-1]}  "
-        f"(entry ≥ {entry_th:+.2f}, top ≤ {-exit_th:+.2f})"
+        f"{trading_days[0]} → {trading_days[-1]}"
     )
 
     rows: list[dict] = []
+    meta_keys: list[str] = []
+    n_warmup = 0
     for as_of in trading_days:
         view = bars[bars.index.date <= as_of]
         view.attrs["symbol"] = symbol
-        if len(view) < req:
-            rows.append({"date": as_of, "close": float(view["close"].iloc[-1]) if len(view) else None,
-                         "score": None, "decision": "warmup"})
-            continue
-        view_tail = view.tail(req + 5)
-        view_tail.attrs["symbol"] = symbol
-        sc = strat.reversal_score(view_tail, as_of)
-        fired = bool(strat.signals(view, as_of))  # authoritative ENTER (incl. ATR guard)
-
-        b = sc.breakdown if sc else {}
-        meta = b.get("_meta", {})
-        score = sc.score if sc else None
-        row = {
+        row: dict = {
             "date": as_of,
             "close": round(float(view["close"].iloc[-1]), 2),
-            "score": None if score is None else round(score, 4),
-            "D": meta.get("D"),
-            "C": meta.get("C"),
-            "reversal_trigger": b.get("reversal_trigger", {}).get("score"),
-            "pivot_proximity": b.get("pivot_proximity", {}).get("score"),
-            "sector_rs": b.get("sector_rs", {}).get("score"),
-            "trend_location": b.get("trend_location", {}).get("score"),
-            "volume_confirm": b.get("volume_confirm", {}).get("multiplier"),
+            "fired": False,
+            "score": None,
         }
-        if fired:
-            row["decision"] = "ENTER"
-        elif score is not None and score <= -exit_th:
-            row["decision"] = "top"
+        if len(view) < req:
+            n_warmup += 1
         else:
-            row["decision"] = ""
+            sigs = strat.signals(view, as_of)
+            if sigs:
+                sig = sigs[0]
+                row["fired"] = True
+                row["score"] = round(float(sig.score), 4)
+                for k, v in sig.metadata.items():
+                    if k not in meta_keys:
+                        meta_keys.append(k)
+                    row[k] = v
         rows.append(row)
 
-    df = _pd.DataFrame(rows)
+    columns = ["date", "close", "fired", "score", *meta_keys]
+    df = _pd.DataFrame(rows, columns=columns)
 
-    # ---- per-day table (filtered unless --all) ----
-    def _near(s) -> bool:
-        if s is None:
-            return False
-        return (s >= entry_th - band) or (s <= -exit_th + band)
-
-    if show_all:
-        shown = rows
-    else:
-        shown = [r for r in rows if r.get("decision") in ("ENTER", "top") or _near(r.get("score"))]
-
-    table = Table(title=f"{symbol} — per-day reversal score", show_lines=False)
-    for col in ("date", "close", "score", "D", "C", "trig", "pivot", "sec_rs", "trend", "vol×", ""):
-        table.add_column(col, justify="right" if col not in ("date", "") else "left")
+    shown = rows if show_all else [r for r in rows if r["fired"]]
+    n_fired = sum(1 for r in rows if r["fired"])
 
     def _f(x):
-        return f"{x:+.3f}" if isinstance(x, (int, float)) else "·"
+        if x is None or (isinstance(x, float) and _pd.isna(x)):
+            return "·"
+        if isinstance(x, bool):
+            return "yes" if x else "no"
+        if isinstance(x, (int, float)):
+            return f"{x:+.4f}"
+        return str(x)
 
     if not shown:
         console.print(
-            "[yellow]No ENTER, top, or near-threshold days to show.[/yellow] "
+            f"[yellow]No signal days for {symbol} in {trading_days[0]}..{trading_days[-1]}.[/yellow] "
             "Use [cyan]--all[/cyan] to print every day."
         )
     else:
+        table = Table(title=f"{symbol} — per-day signal replay", show_lines=False)
+        for col in columns:
+            table.add_column(col, justify="left" if col == "date" else "right")
         for r in shown[:400]:
-            dec = r.get("decision", "")
-            dec_str = (
-                "[green]ENTER[/green]" if dec == "ENTER"
-                else "[red]top[/red]" if dec == "top"
-                else dec
-            )
+            fired_str = "[green]yes[/green]" if r["fired"] else "no"
             table.add_row(
                 str(r["date"]),
-                f"{r['close']:.2f}" if r.get("close") is not None else "·",
-                _f(r.get("score")), _f(r.get("D")), _f(r.get("C")),
-                _f(r.get("reversal_trigger")), _f(r.get("pivot_proximity")),
-                _f(r.get("sector_rs")), _f(r.get("trend_location")),
-                _f(r.get("volume_confirm")), dec_str,
+                f"{r['close']:.2f}",
+                fired_str,
+                _f(r["score"]),
+                *[_f(r.get(k)) for k in meta_keys],
             )
         console.print(table)
         if len(shown) > 400:
-            console.print(f"[dim]… {len(shown) - 400} more rows (use --csv to export all).[/dim]")
-
-    # ---- summary ----
-    scored = df[df["score"].notna()] if "score" in df else df.iloc[0:0]
-    n_days = len(df)
-    n_warmup = int((df.get("decision") == "warmup").sum()) if "decision" in df else 0
-    n_none = int(df["score"].isna().sum()) - n_warmup if "score" in df else 0
-    n_enter = int((df.get("decision") == "ENTER").sum()) if "decision" in df else 0
-    n_top = int((df.get("decision") == "top").sum()) if "decision" in df else 0
+            console.print(f"[dim]… {len(shown) - 400} more rows (use --out to export all).[/dim]")
 
     summary = Table(title="summary", show_header=False)
     summary.add_column("k")
     summary.add_column("v", justify="right")
-    summary.add_row("trading days", str(n_days))
+    summary.add_row("trading days", str(len(rows)))
     summary.add_row("warmup (too little history)", str(n_warmup))
-    summary.add_row("score = None (all directional abstained)", str(n_none))
-    if len(scored):
-        s = scored["score"].astype(float)
-        summary.add_row("score min / median / max", f"{s.min():+.3f} / {s.median():+.3f} / {s.max():+.3f}")
-        summary.add_row("score p25 / p75", f"{s.quantile(.25):+.3f} / {s.quantile(.75):+.3f}")
-    summary.add_row(f"ENTER days (score ≥ {entry_th:+.2f}, ATR ok)", f"[green]{n_enter}[/green]")
-    summary.add_row(f"top days (score ≤ {-exit_th:+.2f})", f"[red]{n_top}[/red]")
-
-    # Per-indicator coverage + mean signed contribution (helps spot a dead/dominant signal).
-    for ind in ("reversal_trigger", "pivot_proximity", "sector_rs", "trend_location", "volume_confirm"):
-        if ind not in df:
-            continue
-        col = df[ind].dropna().astype(float)
-        if len(col) == 0:
-            summary.add_row(f"  {ind}", "[dim]never contributed[/dim]")
-        else:
-            cover = 100.0 * len(col) / max(n_days, 1)
-            summary.add_row(f"  {ind}", f"{cover:.0f}% of days, mean {col.mean():+.3f}")
-
-    # Bottom-signal co-occurrence: the turn (reversal_trigger) vs. the level
-    # (pivot_proximity). If each fires often alone but rarely together, the core
-    # never gets large enough to clear the entry threshold — the classic reason a
-    # reversal entry "almost" triggers but doesn't.
-    if {"reversal_trigger", "pivot_proximity"} <= set(df.columns):
-        rt = df["reversal_trigger"].fillna(0.0).astype(float)
-        pv = df["pivot_proximity"].fillna(0.0).astype(float)
-        turn = rt >= 0.5
-        level = pv >= 0.3
-        summary.add_row("turn (trig ≥ .50) days", str(int(turn.sum())))
-        summary.add_row("at-a-level (pivot ≥ .30) days", str(int(level.sum())))
-        summary.add_row("[bold]both same day[/bold]", f"[bold]{int((turn & level).sum())}[/bold]")
+    summary.add_row("signal days", f"[green]{n_fired}[/green]")
+    if n_fired:
+        sc = df["score"].dropna().astype(float)
+        summary.add_row("score min / median / max", f"{sc.min():+.4f} / {sc.median():+.4f} / {sc.max():+.4f}")
+        for k in meta_keys:
+            col = _pd.to_numeric(df[k], errors="coerce").dropna()
+            if len(col):
+                summary.add_row(f"  {k} (mean on signal days)", f"{col.mean():+.4f}")
     console.print(summary)
 
     if out_path:
         df.to_csv(out_path, index=False)
-        console.print(f"[green]✓[/green] wrote per-day breakdown → {out_path}")
+        console.print(f"[green]✓[/green] wrote per-day table → {out_path}")
 
 
 @backtest_app.command("export")
@@ -1267,12 +1193,6 @@ def backtest_export(
     output: str = typer.Option(
         None, "--out", "-o",
         help="Output path. Default: ./bt<run_id>.json in the current directory.",
-    ),
-    include_per_day: bool = typer.Option(
-        True, "--per-day/--no-per-day",
-        help="Include per-symbol per-day reversal-score recompute over the run "
-             "window. Slow but lets a reviewer see near-miss days and which "
-             "inputs were trending. Disable for a faster trade-only export.",
     ),
     include_regime: bool = typer.Option(
         True, "--regime/--no-regime",
@@ -1287,11 +1207,9 @@ def backtest_export(
 
     The export bundles: the backtest_runs row + expanded metrics, derived
     summary statistics (win rate, R-multiple distribution, exit-reason mix,
-    per-input contribution averages on winners vs losers), every trade with
-    its strategy-supplied entry_metadata (which carries the per-input score
-    breakdown for composite strategies), the equity curve, the per-day
-    reversal-score recompute per traded symbol, and the daily market regime
-    overlay.
+    per-metadata-key averages on winners vs losers), every trade with its
+    strategy-supplied entry_metadata, the equity curve, and the daily market
+    regime overlay.
 
     Hand the resulting file to a reviewer (or paste-up to a Claude session)
     and they have full context to evaluate decisions and propose tuning. The
@@ -1302,7 +1220,7 @@ def backtest_export(
 
       stockscan backtest export 20
       stockscan backtest export 20 --out /tmp/bt20.json
-      stockscan backtest export 20 --no-per-day      # faster trade-only export
+      stockscan backtest export 20 --no-regime
     """
     import json as _json
     from pathlib import Path as _Path
@@ -1312,11 +1230,7 @@ def backtest_export(
     out_path = _Path(output) if output else _Path(f"bt{run_id}.json")
 
     try:
-        payload = export_run(
-            run_id,
-            include_per_day=include_per_day,
-            include_regime=include_regime,
-        )
+        payload = export_run(run_id, include_regime=include_regime)
     except LookupError as exc:
         console.print(f"[red]{exc}[/red]")
         raise typer.Exit(1)
@@ -1331,8 +1245,6 @@ def backtest_export(
     n_trades = len(payload.get("trades") or [])
     n_eq     = len(payload.get("equity_curve") or [])
     n_regime = len(payload.get("regime_overlay") or []) if include_regime else 0
-    pds      = payload.get("per_day_scores") or {}
-    n_syms   = len((pds.get("symbols") or {})) if include_per_day else 0
     size_kb  = out_path.stat().st_size // 1024
 
     console.print(
@@ -1340,8 +1252,6 @@ def backtest_export(
         f"[cyan]{out_path}[/cyan] ({size_kb:,} KB)"
     )
     bits = [f"{n_trades} trades", f"{n_eq} equity points"]
-    if include_per_day:
-        bits.append(f"{n_syms} symbols × per-day scores")
     if include_regime:
         bits.append(f"{n_regime} regime days")
     console.print(f"  [dim]{' · '.join(bits)}[/dim]")
@@ -1351,7 +1261,7 @@ def backtest_export(
 def backtest_profile(
     # Same positional + option shape as `run` so the two are interchangeable.
     # Profile-specific flags (--top / --sort / --callers / --out) come last.
-    strategy: str = typer.Argument(..., help="Registered strategy name (e.g. reversal_swing)."),
+    strategy: str = typer.Argument(..., help="Registered strategy name (e.g. momentum_52w_high)."),
     # Universe selection — `profile` defaults to a small liquid set so iterative
     # profiling stays fast; full S&P 500 under cProfile takes ~40 min. Pass
     # explicit --symbol values or --sp500 to override.
@@ -1371,8 +1281,7 @@ def backtest_profile(
         None, "--to", help="ISO end date. Default: today.",
     ),
     # Execution parameters (same defaults as `run`).
-    capital: float = typer.Option(1_000_000.0, "--capital"),
-    risk_pct: float = typer.Option(0.01, "--risk-pct"),
+    capital: float = typer.Option(100_000.0, "--capital"),
     slippage_bps: float = typer.Option(5.0, "--slippage-bps"),
     # Profile-specific knobs.
     top: int = typer.Option(30, "--top", help="How many ranked lines to print."),
@@ -1401,9 +1310,9 @@ def backtest_profile(
 
     Examples:
 
-      stockscan backtest profile reversal_swing
-      stockscan backtest profile reversal_swing --from 2023-01-01 --top 40
-      stockscan backtest profile reversal_swing --sp500 --out backtest.prof
+      stockscan backtest profile momentum_52w_high
+      stockscan backtest profile momentum_52w_high --from 2023-01-01 --top 40
+      stockscan backtest profile momentum_52w_high --sp500 --out backtest.prof
     """
     from datetime import date as _date, timedelta as _timedelta
     from decimal import Decimal as _Dec
@@ -1426,8 +1335,7 @@ def backtest_profile(
             symbols=universe,
             sp500=sp500,
             capital=_Dec(str(capital)),
-            risk_pct=_Dec(str(risk_pct)),
-            slippage_bps=_Dec(str(slippage_bps)),
+                slippage_bps=_Dec(str(slippage_bps)),
         )
     except ValueError as exc:
         console.print(f"[red]{exc}[/red]")
@@ -1466,164 +1374,6 @@ def _provider_ctx() -> Iterator[DataProvider]:
         close = getattr(p, "close", None)
         if callable(close):
             close()
-
-
-# ----------------------------------------------------------------------
-# Meta-labeling (ml) commands
-# ----------------------------------------------------------------------
-@ml_app.command("train")
-def ml_train_cmd(
-    strategy: str = typer.Argument(..., help="Strategy name to train a model for"),
-    holding_days: int = typer.Option(
-        20, "--holding-days", help="Triple-barrier max holding window (trading days)"
-    ),
-    profit_take_atr_mult: float = typer.Option(
-        2.0, "--pt-atr", help="Profit-take barrier in ATR multiples"
-    ),
-    holdout_fraction: float = typer.Option(
-        0.2, "--holdout", help="Newest fraction reserved as holdout"
-    ),
-    min_rows: int = typer.Option(
-        100, "--min-rows", help="Minimum labeled rows required to fit"
-    ),
-    model_version: str = typer.Option(
-        "1.0.0",
-        "--model-version",
-        help="Tag stamped into the model artifact. Bump when feature schema changes.",
-    ),
-    strategy_version: str | None = typer.Option(
-        None,
-        "--strategy-version",
-        help=(
-            "Filter training data to this strategy version. Default = current "
-            "registered version (so re-training after a strategy upgrade ignores "
-            "older-version signals automatically). Pass an explicit version to "
-            "re-fit a model on historical-version signals."
-        ),
-    ),
-) -> None:
-    """Train (or re-train) the XGBoost meta-labeling classifier for a strategy.
-
-    Pulls every persisted signal for the strategy, builds features from the
-    bars store, applies the triple-barrier label, and fits XGBoost. The
-    pickled artifact lands in ``./models/<strategy>/`` and is picked up
-    automatically by the next scan run.
-
-    Requires the ``[ml]`` extra: ``uv sync --extra ml``.
-    """
-    from stockscan.ml import train_model
-    from stockscan.ml.predict import clear_cache
-
-    discover_strategies()
-    if strategy not in STRATEGY_REGISTRY.names():
-        console.print(
-            f"[red]✗[/red] Unknown strategy {strategy!r}. "
-            f"Registered: {', '.join(STRATEGY_REGISTRY.names())}"
-        )
-        raise typer.Exit(1)
-
-    resolved_strategy_v = (
-        strategy_version
-        if strategy_version is not None
-        else STRATEGY_REGISTRY.get(strategy).version
-    )
-    console.print(
-        f"[cyan]→[/cyan] training meta-label model for "
-        f"[bold]{strategy}[/bold] v{resolved_strategy_v}…"
-    )
-    try:
-        result = train_model(
-            strategy,
-            model_version=model_version,
-            strategy_version=strategy_version,
-            holding_days=holding_days,
-            profit_take_atr_mult=profit_take_atr_mult,
-            holdout_fraction=holdout_fraction,
-            min_rows=min_rows,
-        )
-    except RuntimeError as exc:
-        msg = str(exc)
-        console.print(f"[red]✗[/red] {msg}")
-        # Specific actionable hint for the most common failure: not
-        # enough labeled rows. We guide the user straight at the
-        # backfill command rather than leaving them to figure it out.
-        if "usable rows" in msg or "No historical signals" in msg:
-            console.print(
-                f"\n[cyan]→[/cyan] To populate historical signals, run:\n"
-                f"    [bold]stockscan signals backfill {strategy}[/bold]\n"
-                f"  (default: 1 year of daily scans, resumable, ~250 runs)\n"
-            )
-        raise typer.Exit(1) from exc
-
-    # Drop any cached model in the predict layer so the next call sees the
-    # freshly-saved artifact without an app restart.
-    clear_cache()
-
-    table = Table(title=f"Meta-label trained: {strategy}")
-    table.add_column("Metric", style="cyan")
-    table.add_column("Value", justify="right")
-    table.add_row("Signals seen", f"{result.n_signals_seen:,}")
-    table.add_row("Train rows", f"{result.n_train_rows:,}")
-    table.add_row("Holdout rows", f"{result.n_holdout_rows:,}")
-    table.add_row("Base rate (winners)", f"{result.base_rate:.1%}")
-    table.add_row(
-        "Train AUC", f"[bold]{result.train_auc:.3f}[/bold]"
-    )
-    holdout_color = "green" if result.usable else "yellow"
-    table.add_row(
-        "Holdout AUC",
-        f"[bold {holdout_color}]{result.holdout_auc:.3f}[/bold {holdout_color}]",
-    )
-    table.add_row("Artifact", result.artifact_path)
-    console.print(table)
-
-    if not result.usable:
-        console.print(
-            "[yellow]⚠ Holdout AUC ≤ 0.55 — the model has limited statistical "
-            "power. Consider widening the backtest window before relying on "
-            "the meta-label score.[/yellow]"
-        )
-
-
-@ml_app.command("status")
-def ml_status_cmd() -> None:
-    """List trained meta-label models with timestamps and metrics."""
-    from stockscan.ml import list_models
-
-    models = list_models()
-    if not models:
-        console.print(
-            "[yellow]No trained models found.[/yellow] "
-            "Run `stockscan ml train <strategy>` to fit one."
-        )
-        return
-
-    table = Table(title="Meta-label models")
-    table.add_column("Strategy", style="cyan")
-    table.add_column("Version")
-    table.add_column("Fit at", style="dim")
-    table.add_column("Train rows", justify="right")
-    table.add_column("Base rate", justify="right")
-    table.add_column("Holdout AUC", justify="right")
-    for a in models:
-        holdout_auc = a.holdout_metrics.get("auc")
-        auc_str = f"{holdout_auc:.3f}" if holdout_auc is not None else "—"
-        # Color holdout AUC as a quick eyeball signal.
-        if holdout_auc is None or holdout_auc < 0.50:
-            auc_str = f"[red]{auc_str}[/red]"
-        elif holdout_auc < 0.55:
-            auc_str = f"[yellow]{auc_str}[/yellow]"
-        else:
-            auc_str = f"[green]{auc_str}[/green]"
-        table.add_row(
-            a.strategy_name,
-            a.model_version,
-            a.fit_at.strftime("%Y-%m-%d %H:%M UTC"),
-            f"{a.n_train_rows:,}",
-            f"{a.base_rate:.1%}",
-            auc_str,
-        )
-    console.print(table)
 
 
 # ----------------------------------------------------------------------
@@ -1670,12 +1420,10 @@ def signals_backfill_cmd(
 
     Default range is one calendar year ending today. With ~250 weekdays
     per year and a ~5-30s per-symbol scan run, expect 30-90 minutes
-    per strategy on first invocation. The `signals` table is the input
-    to ``stockscan ml train``, so backfilling is a prerequisite for
-    fitting a meta-label model on a brand-new strategy.
+    per strategy on first invocation.
 
     Examples:
-        stockscan signals backfill donchian_trend
+        stockscan signals backfill momentum_52w_high
         stockscan signals backfill all --start 2024-01-01
         stockscan signals backfill rsi2_meanrev --every 5    # weekly Wed scans
     """
@@ -1849,7 +1597,7 @@ def signals_delete_cmd(
 
     Use this to clean up data from a prior strategy version after a
     backfill under the new version. The signal-detail page, signals
-    list, dashboard, and meta-label trainer all default to the
+    list and dashboard all default to the
     current registered version, so older-version signals are inert
     once the strategy has been bumped — but they still occupy space
     and can complicate ad-hoc analytics queries. This command is the
@@ -1860,8 +1608,8 @@ def signals_delete_cmd(
     are reported.
 
     Examples:
-        stockscan signals delete --strategy donchian_trend --version 1.0.0
-        stockscan signals delete -s donchian_trend -v 1.0.0 --start 2020-01-01 --end 2024-12-31
+        stockscan signals delete --strategy rsi2_meanrev --version 1.0.0
+        stockscan signals delete -s rsi2_meanrev -v 1.0.0 --start 2020-01-01 --end 2024-12-31
         stockscan signals delete -s rsi2_meanrev -v 1.0.0 --yes      # script-friendly
     """
     from datetime import date as _date
@@ -2031,23 +1779,6 @@ def analysis_run_cmd(
                     "30-day ±1σ",
                     f"${er.low:.2f}–${er.high:.2f} (±{er.sigma_pct:.1f}%)",
                 )
-        if a.momentum.available:
-            if a.momentum.rsi_14 is not None:
-                table.add_row("RSI(14)", f"{a.momentum.rsi_14:.1f} ({a.momentum.rsi_label})")
-            if a.momentum.macd_line is not None:
-                table.add_row("MACD state", a.momentum.macd_label)
-        if a.options_context.nearest_support:
-            ns = a.options_context.nearest_support
-            table.add_row(
-                "Nearest support",
-                f"${ns.price:.2f} ({a.options_context.pct_to_support:.2f}% below)",
-            )
-        if a.options_context.nearest_resistance:
-            nr = a.options_context.nearest_resistance
-            table.add_row(
-                "Nearest resistance",
-                f"${nr.price:.2f} ({a.options_context.pct_to_resistance:.2f}% above)",
-            )
         if a.options_context.days_to_earnings is not None:
             table.add_row(
                 "Days to earnings",
@@ -2230,14 +1961,12 @@ def options_propose(
     table.add_column("IV%", justify="right")
     table.add_column("Score", justify="right")
     table.add_column("Size", justify="right")
-    table.add_column("@Level")
     for i, p in enumerate(run.book, start=1):
         side = "[rose]call[/rose]" if p.side == "sell_call" else "[green]put[/green]"
-        at_level = "[cyan]● at level[/cyan]" if p.price_at_level else ""
         table.add_row(
             str(i), p.symbol, side, f"{p.strike:g}", f"{p.pct_otm:+.0f}",
             str(p.days_to_expiry), f"{p.iv_pct:.0f}", f"{p.score:.2f}",
-            f"{p.size_weight:.2f}", at_level,
+            f"{p.size_weight:.2f}",
         )
     console.print(table)
     if save:

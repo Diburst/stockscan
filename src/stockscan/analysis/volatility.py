@@ -6,7 +6,6 @@ Computes:
     via x √252. Industry standard "HV" computation.
   * **ATR(14)** in dollars + as % of current price - gives a more
     intraday-flavored volatility read than close-to-close vol.
-  * **Bollinger band width** - (upper - lower) / middle, in %.
   * **HV percentile** - current 21-day realized vol's rank in its
     own trailing 252-day distribution. 0% = vol is at a 1-year low;
     100% = at a 1-year high. Substitutes for the IV-percentile
@@ -31,7 +30,6 @@ import numpy as np
 from stockscan.analysis.state import ExpectedRange, VolatilityState
 from stockscan.indicators import (
     atr,
-    bollinger_bands,
     yang_zhang_volatility,
     yang_zhang_volatility_ewm,
 )
@@ -140,17 +138,6 @@ def compute_volatility(bars: pd.DataFrame) -> VolatilityState:
 
     atr_pct = (atr14 / last_close * 100) if (atr14 is not None and last_close > 0) else None
 
-    # ---- Bollinger band width ----
-    bb_width_pct: float | None = None
-    if len(close) >= 21:
-        bands = bollinger_bands(close, period=20, stddev=2.0)
-        if not bands.empty:
-            upper = bands["upper"].iloc[-1]
-            lower = bands["lower"].iloc[-1]
-            middle = bands["middle"].iloc[-1]
-            if _is_finite(upper) and _is_finite(lower) and _is_finite(middle) and float(middle) > 0:
-                bb_width_pct = float((upper - lower) / middle * 100)
-
     # ---- HV percentile ----
     # Rank today's 21-day Yang-Zhang HV against its own trailing year.
     hv_pct: float | None = None
@@ -204,7 +191,6 @@ def compute_volatility(bars: pd.DataFrame) -> VolatilityState:
         realized_vol_63d_pct=round(rv_63, 4) if rv_63 is not None else None,
         atr_14=round(atr14, 4) if atr14 is not None else None,
         atr_pct_of_price=round(atr_pct, 4) if atr_pct is not None else None,
-        bb_width_pct=round(bb_width_pct, 4) if bb_width_pct is not None else None,
         hv_percentile=round(hv_pct, 2) if hv_pct is not None else None,
         expected_7d=expected_7d,
         expected_30d=expected_30d,

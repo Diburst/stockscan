@@ -81,7 +81,7 @@
         {% endfor %}
       {{ mobile_list_close() }}
     {% else %}
-      {{ empty("No open paper trades. Open one from the Signals page.", "📝") }}
+      {{ empty("No open paper trades. Open one from the Signals page.") }}
     {% endif %}
   {% endcall %}
 
@@ -102,7 +102,7 @@
         {% endfor %}
       </ul>
     {% else %}
-      {{ empty("No open positions.", "💼") }}
+      {{ empty("No open positions.") }}
     {% endif %}
   {% endcall %}
 
@@ -210,7 +210,7 @@
         {% endfor %}
       {{ mobile_list_close() }}
     {% else %}
-      {{ empty("No closed trades yet.", "📭") }}
+      {{ empty("No closed trades yet.") }}
     {% endif %}
   {% endcall %}
 

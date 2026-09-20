@@ -13,7 +13,6 @@ Nine indicators arranged in two tiers per the design discussion:
     * Santa Claus rally window
     * January Barometer
     * Decennial cycle
-    * Breadth: % of S&P 500 above SMA(200)
 
 All Tier 1 'live' stats are computed from local SPY bars (so the
 window matches whatever history you have stored). Two indicators

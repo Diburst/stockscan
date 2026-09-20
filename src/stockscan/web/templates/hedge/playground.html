@@ -9,8 +9,6 @@
 </label>
 {% endmacro %}
 
-{% macro money(v) %}<span class="{{ 'text-ok-600' if v >= 0 else 'text-bad-600' }}">{{ "{:+,.0f}".format(v) }}</span>{% endmacro %}
-
 {% block content %}
 <div class="max-w-6xl mx-auto px-4 py-6">
   <div class="flex items-baseline justify-between mb-1">

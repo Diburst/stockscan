@@ -1,371 +1,195 @@
-"""52-Week-High Momentum (George & Hwang, 2004; recent extensions 2024).
+"""52-week-high momentum — the book's one trend strategy.
 
-The cleanest pure-technical momentum signal in the academic literature.
-Where vanilla 12/1 cross-sectional momentum (Jegadeesh-Titman) crashes
-hard during reversals, 52-week-high momentum stays positive — and when
-you neutralize a vanilla momentum book against the 52-week-high
-signal, the procyclical drawdown disappears.
+  Eligible: adj close > SMA(200) and SMA(50) > SMA(200)   Stage-2 uptrend
+            no single-day move beyond ±15% in the last 90 bars
+                                                          gap screen (Alpha Architect)
+            1-year realized vol ≤ 60%                     skip the wildest names
+            close ≥ 90% of its 252-day high               George & Hwang (2004)
+  Rank:     closeness to the 52-week high
+            + Clenow slope quality (90-day log-price regression slope × R²)
+            + residual tilt (12-month return minus the sector composite's)
+            Highest score first; the position caps take the top of the list.
+  Review:   new entries only on the weekly review day (Wednesday close,
+            filled Thursday open) — momentum is a monthly-to-quarterly
+            effect and daily re-ranking only adds turnover.
+  Exit:     close ≤ entry × 0.85          15% stop (Han, Zhou & Zhu)
+            close < SMA(100)              trend break (Clenow)
+            close < 85% of 252-day high   fell out of the near-high set
+  Sizing:   risk 0.75% of equity against the 15% stop (≈5% of equity per
+            position), at most 10 open positions, and the regime layer's
+            vol scalar shrinks size in high-vol markets — that is where
+            momentum crashes (Daniel & Moskowitz 2016).
 
-Reference:
-  - George, T. J., & Hwang, C.-Y. (2004). The 52-Week High and
-    Momentum Investing. Journal of Finance, 59(5), 2145-2176.
-  - "Momentum on Historical High" (2024), which extends the signal
-    to all-time highs and reports ~6.2% annual alpha.
-
-Implementation choices for this codebase:
-
-  * **Score = closeness to 52-week high**, not raw return. Specifically
-    ``score = close / max(close_252)`` clipped into [0, 1]. A reading
-    of 1.00 means today is a fresh 52-week high; 0.95 means within 5%
-    of it; lower means meaningfully below.
-  * **Filter: only emit signals for stocks within 5% of their 52w
-    high** (configurable). This is the "near-ATH" alpha pocket — the
-    further below the high a stock is, the closer the strategy looks
-    to plain momentum and the more crash risk it picks up.
-  * **Tie-break with regression-slope quality** — borrowed from
-    Clenow's "Stocks on the Move." The annualised log-return slope of
-    the past 90 days, weighted by R², gets folded into the score so
-    smooth uptrends rank ahead of jagged ones at the same closeness
-    band. This kills the false-positive failure mode where a stock
-    tags its 52-week high after a single news pop.
-  * **ATR-based stop**, consistent with Donchian. Initial stop at
-    entry - 2 x ATR(20).
-  * **Ratcheting ATR stop** — every 14 trading bars, the stop is
-    recomputed from the current price (close - 2×ATR). The engine
-    only moves the stop UP, so winning trades gradually lock in
-    profit without being forced out by an arbitrary time limit.
-
-The strategy is long-only. Regime affinity favours trending markets;
-in choppy regimes the position size is cut to 40% (mostly to dampen
-the false-breakout concentration risk noted above).
+Knobs are the class constants below — edit and bump ``version``.
 """
 
 from __future__ import annotations
 
 import math
+from datetime import date
 from decimal import Decimal
-from typing import TYPE_CHECKING, ClassVar
+from typing import ClassVar
 
 import numpy as np
 import pandas as pd
-from pydantic import Field
 
-from stockscan.indicators import atr
-from stockscan.strategies import (
-    ExitDecision,
-    PositionSnapshot,
-    RawSignal,
-    Strategy,
-    StrategyParams,
-)
-
-if TYPE_CHECKING:
-    from datetime import date
+from stockscan.indicators import sector_relative_return, sma
+from stockscan.strategies import ExitDecision, PositionSnapshot, RawSignal, Strategy
 
 
-class Momentum52WParams(StrategyParams):
-    high_window: int = Field(
-        252, ge=126, le=504, description="Bars to look back for the high"
-    )
-    closeness_min: float = Field(
-        0.95,
-        ge=0.80,
-        le=1.00,
-        description="Minimum close / 52w-high ratio to emit a signal",
-    )
-    slope_window: int = Field(
-        90, ge=30, le=252, description="Days for the regression-slope tiebreak"
-    )
-    slope_weight: float = Field(
-        0.30,
-        ge=0.0,
-        le=1.0,
-        description="How much the regression-slope tiebreak feeds into the score",
-    )
-    atr_period: int = Field(20, ge=10, le=40)
-    atr_stop_mult: float = Field(2.0, ge=1.0, le=4.0)
-    ratchet_interval: int = Field(
-        14,
-        ge=5,
-        le=60,
-        description=(
-            "Every N trading bars, recompute the ATR-based stop from "
-            "the current price. The engine only ratchets UP (never "
-            "lowers the stop), so winning trades gradually lock in "
-            "profit without being forced out by an arbitrary time limit."
-        ),
-    )
-
-
-class Momentum52WHigh(Strategy):
+class Momentum52WeekHigh(Strategy):
     name = "momentum_52w_high"
-    version = "1.0.0"
+    version = "2.0.0"
     display_name = "52-Week-High Momentum"
     description = (
-        "Buys the highest-quality uptrends — stocks already trading "
-        "within a few percent of their 52-week high — and holds them "
-        "for ~12 weeks. The single highest-Sharpe pure-technical signal "
-        "in recent academic literature, and one that historically avoids "
-        "the momentum-crash drawdowns that plague plain 12/1 momentum."
+        "Ranks stocks in a confirmed uptrend by how close they sit to their "
+        "52-week high and how smooth the climb has been, buys the top of the "
+        "list once a week, and holds until a 15% stop, a break of the 100-day "
+        "average, or a 15% slide from the high."
     )
-    tags = ("momentum", "trend_following", "long_only", "swing")
-    params_model = Momentum52WParams
+    tags = ("momentum", "trend_following", "long_only", "position")
+    data_dependencies = ("sector_composites",)
+
+    # ---- Sizing -----------------------------------------------------------
     default_risk_pct = 0.0075
-    # Affinities chosen to: (1) fully size in trending_up, (2) skip
-    # trending_down (long-only by design), (3) cut hard in choppy
-    # because near-ATH stocks fail spectacularly on whipsaws,
-    # (4) reduce in transitioning to manage drawdown timing risk.
-    regime_affinity: ClassVar[dict[str, float]] = {
-        "trending_up": 1.0,
-        "trending_down": 0.0,
-        "choppy": 0.4,
-        "transitioning": 0.7,
-    }
+    max_open_positions = 10
+    sizes_down_in_high_vol = True
+
+    # ---- Tunable knobs ----------------------------------------------------
+    high_lookback: ClassVar[int] = 252
+    min_closeness: ClassVar[float] = 0.90
+    exit_closeness: ClassVar[float] = 0.85
+    stop_pct: ClassVar[float] = 0.15
+    trend_sma_period: ClassVar[int] = 200
+    fast_sma_period: ClassVar[int] = 50
+    exit_sma_period: ClassVar[int] = 100
+    slope_window: ClassVar[int] = 90
+    gap_lookback: ClassVar[int] = 90
+    max_gap: ClassVar[float] = 0.15
+    max_realized_vol: ClassVar[float] = 0.60
+    residual_lookback: ClassVar[int] = 252
+    residual_tilt_cap: ClassVar[float] = 0.25
+    review_weekday: ClassVar[int] = 2  # Monday = 0
 
     manual = """\
 ## What this strategy is trying to do
 
-This is the "buy the strongest names" strategy — the academic-literature
-version of the Wall Street adage *"don't buy what's down 30%, buy what's
-already going up."* Specifically, it looks for stocks trading within a
-few percent of their 52-week high and adds them to the book, then holds
-for about three months.
+Own the strongest stocks in the index while they stay strong. Stocks near
+their 52-week high keep outperforming for months — the effect George and
+Hwang documented in 2004 dominates plain past-return momentum in large caps
+and, unlike it, does not reverse later. We rank the eligible names once a
+week, buy the top of the list as position slots free up, and hold until the
+trend breaks.
 
-## Why this works (the empirical claim)
+## The rules, one by one
 
-Two papers establish the result:
+**Uptrend.** Adjusted close above the 200-day SMA with the 50-day above
+the 200-day. This keeps us out of names that are near a high only because
+they collapsed a year ago.
 
-  - **George & Hwang (2004)**, *Journal of Finance*. Stocks ranked
-    closest to their 52-week high earn ~6.2% per year alpha — *more*
-    than vanilla cross-sectional momentum. The kicker: this signal
-    *subsumes* standard momentum. Once you control for proximity to
-    the 52-week high, the rest of the momentum effect mostly vanishes.
+**No recent blow-up.** Any single-day move beyond ±15% in the last 90 bars
+disqualifies the name. Gaps that size mean an event, not a trend, and
+Alpha Architect's screens drop them for the same reason.
 
-  - **"Momentum on Historical High" (2024)**, Finance Research Letters.
-    Extends the signal to all-time highs and confirms the alpha
-    persists, including in international markets and crypto.
+**Not the wildest names.** One-year realized volatility above 60% is out.
+Momentum's crashes concentrate in the highest-beta names.
 
-The intuition: traders anchor on the 52-week high as a psychological
-reference price. A stock that has just printed a fresh high, or is
-trading right next to one, has cleared all overhead supply — there's
-no one underwater waiting to sell at break-even. So buying pressure is
-asymmetric. It's also a Schelling point for index-driven flows (52w-
-high lists are widely tracked).
+**Near the high.** Close at least 90% of its 252-day high. That is the
+entry gate; the ranking decides who among the eligible gets bought.
 
-The really attractive property: this signal does NOT crash the way
-plain 12/1 momentum does. Because the criterion is "close to a recent
-high" rather than "outperformed peers", the worst-performing names
-during a momentum reversal *do not* qualify — they fall off the list
-naturally as their highs roll out of the window.
+**The rank.** Three terms, each roughly 0–1, added:
+- *closeness* — close ÷ 252-day high;
+- *slope quality* — Clenow's 90-day regression of log price, annualized
+  slope × R², squashed to 0–1, so steep *and* smooth beats steep and jagged;
+- *residual tilt* — the stock's 12-month return minus its sector
+  composite's, capped at ±25%, so we lean toward names climbing on their
+  own merits rather than riding a sector wave (idiosyncratic momentum is the
+  part that does not crash).
 
-## The components, explained
+**Weekly review.** New entries only on Wednesday's close, filled Thursday's
+open. Exits run every day.
 
-### Closeness ratio
+**Exits.** A 15% stop from entry — the one stop with published evidence for
+momentum, where it roughly doubles Sharpe by cutting crash months. A close
+below the 100-day SMA, Clenow's trend-break exit. Or a close more than 15%
+below the 52-week high, which means the name has left the set we buy.
 
-The core signal is just:
+## Sizing and the regime layer
 
-    closeness = today's close / (max close over last 252 days)
+Risk 0.75% of equity against the 15% stop, which works out to about 5% of
+equity per position, at most ten positions. New entries stop while the
+index is below its 200-day (the regime trend gate). In the top tercile of
+market volatility the regime layer's vol scalar shrinks each new position —
+momentum's worst months come in high-vol rebounds, and volatility scaling
+is the best-evidenced fix.
 
-A value of 1.00 means today is a new 52-week high. 0.95 means within
-5% of it. 0.80 means there's been a 20% drawdown since the high — at
-which point this isn't a near-ATH name anymore.
+## Sources
 
-We **only emit signals** for names with closeness ≥ 0.95 by default.
-That's the "near-ATH" alpha pocket; further below, the strategy
-collapses into plain momentum and picks up its crash risk.
-
-### Regression-slope tiebreak (Clenow flavor)
-
-A potential failure mode: two stocks both at closeness = 0.97, but one
-got there with a smooth 90-day uptrend, the other through a sudden
-news-driven gap. The smooth uptrend is more likely to continue.
-
-Borrowing from Clenow's *Stocks on the Move*, we compute the
-annualised slope of `log(close)` regressed on time over the past 90
-days, weighted by R² to penalize jaggedness. That gets blended into
-the score with a 30% weight. The closeness ratio is still the dominant
-term; the slope just breaks ties between names that look identical on
-the closeness measure alone.
-
-### ATR-based stop
-
-Initial stop = entry - 2 x ATR(20). Same as Donchian. ATR-scaled stops
-sized to "two typical days of movement" survive normal volatility and
-exit decisively when the regime really turns.
-
-### Ratcheting ATR stop
-
-Every 14 trading bars, the stop is recomputed: ``close - 2 × ATR(20)``.
-The engine only accepts the new level if it's *higher* than the current
-stop — so the stop ratchets upward as the trade wins, gradually locking
-in profit. A flat or declining stock sees no stop ratchet (the new
-level is below the existing one), and will eventually be stopped out at
-the original or a previously ratcheted level.
-
-This replaces the earlier fixed-60-day exit. The time-based rule
-exited winners and losers alike; the ratcheting stop lets winners run
-while tightening risk on trades that stall.
-
-## The rules in plain English
-
-**Setup filter**:
-
-  - Stock's `close / 52-week-max-close` is ≥ 0.95 (i.e., within 5% of
-    its 52-week high).
-
-**Entry signal** (today, after the close):
-
-  - Compute closeness ratio and regression-slope quality. Score blends
-    them: `score = closeness x (1 - w) + slope_quality x w`, default
-    `w = 0.30`. Higher score = stronger setup.
-  - **We buy at tomorrow's market open** at today's close.
-
-**Initial stop-loss**:
-
-  - Stop = entry - 2 x ATR(20).
-
-**Exit** (ratcheting stop, evaluated by the engine):
-
-  - Every 14 trading bars, the ATR-based stop is recomputed from the
-    current price and only ratcheted upward. The position closes when
-    today's low breaches the (ratcheted) stop level.
-
-## What to expect when running this
-
-  - **Modest trade frequency.** Maybe 5-15 entries per month per
-    quartile of the universe in normal markets, fewer in heavy
-    drawdowns when nothing is near its high.
-  - **Variable hold lengths.** Strong trends can be held for months;
-    stalling positions are stopped out quickly as the ratchet tightens.
-  - **Higher win rate than Donchian.** Historically ~50-55% in the
-    backtest range, vs. Donchian's 35-45%. The trade-off: smaller
-    asymmetry between wins and losses.
-  - **Fewer ulcer-grade drawdowns.** This is the strategy's main
-    selling point. Maximum drawdowns historically ~15% smaller than
-    plain cross-sectional momentum on equivalent universes.
-
-## Where this strategy struggles
-
-  - **Late-cycle momentum reversals.** The strategy stops generating
-    signals in deep bear markets (nothing is near a 52-week high), so
-    it sits in cash. That's fine. But the *transition* — when broad-
-    based 52w highs are rolling over — is where it gives back the most.
-  - **Sector concentration.** Whatever sector is currently leading the
-    market will dominate the signal list. Without sector caps the book
-    can become 70% one sector very quickly. The portfolio-level
-    `max_sector_pct` filter handles this.
-  - **Reversal stocks.** A stock tagging its 52-week high *after* a
-    long downtrend (i.e., the high is very recent) is a different beast
-    than one tagging it from a long uptrend. The slope tiebreak helps
-    but doesn't fully resolve this.
-
-## Why we run this alongside Donchian
-
-Both are trend-following, but the entry conditions are very different.
-Donchian fires on the EVENT of a 20-day breakout — a single-day
-trigger. This strategy fires on a STATE — being already near a 1-year
-high — which is more persistent and produces a different mix of names.
-Donchian catches early movers; 52-week-high captures the names that
-have been trending for a while. The two together form a more complete
-trend sleeve than either alone.
-
-## Default parameters and why
-
-  - `high_window = 252` — one trading year. The canonical "52-week"
-    window. The 2024 follow-up paper extends to all-time highs;
-    increasing this parameter approximates that.
-  - `closeness_min = 0.95` — within 5% of the high. Tightening this to
-    0.97 cuts the trade count by ~50% and slightly improves Sharpe at
-    the cost of fewer opportunities.
-  - `slope_window = 90`, `slope_weight = 0.30` — Clenow-style
-    regression slope blended in to break ties between names at
-    similar closeness.
-  - `atr_period = 20`, `atr_stop_mult = 2.0` — ATR-based initial stop
-    matched to Donchian for cross-strategy consistency.
-  - `ratchet_interval = 14` — recompute the ATR stop every 14 trading
-    bars. Balances between tightening fast enough to lock in profit
-    and giving the trade enough room to breathe between resets.
-
-## Source
-
-George, T. J., & Hwang, C.-Y. (2004). "The 52-Week High and Momentum
-Investing." *Journal of Finance* 59(5): 2145-2176.
-
-Updated 2024: "Momentum on Historical High." *Finance Research
-Letters*.
+George & Hwang (2004); Jeon & Byun (2023) on the 52-week high and momentum
+crashes; Clenow, *Stocks on the Move* (2015); Gray & Vogel, *Quantitative
+Momentum*; Han, Zhou & Zhu on the 15% stop; Daniel & Moskowitz (2016) and
+Barroso & Santa-Clara (2015) on volatility scaling; Blitz, Huij & Martens
+(2011) on residual momentum.
 """
 
-    # ------------------------------------------------------------------
     def required_history(self) -> int:
-        return (
-            max(
-                self.params.high_window,
-                self.params.slope_window,
-                self.params.atr_period,
-            )
-            + 5
-        )
+        return max(self.high_lookback, self.trend_sma_period, self.residual_lookback) + 5
 
     # ------------------------------------------------------------------
     def signals(self, bars: pd.DataFrame, as_of: date) -> list[RawSignal]:
-        view = self._slice(bars, as_of)
+        if as_of.weekday() != self.review_weekday:
+            return []
+        view = bars[bars.index.date <= as_of]
         if len(view) < self.required_history():
             return []
 
-        high = view["high"]
-        low = view["low"]
-        close = view["close"]
-        symbol = self._symbol(view)
-        last_close = float(close.iloc[-1])
-
-        # Closeness ratio: today's close vs trailing N-day max close.
-        # Use a closed-on-the-right rolling window — today IS allowed
-        # to be the high. (Different from Donchian, which compares
-        # to the *prior* window deliberately to detect the breakout
-        # event. Here we're measuring the STATE.)
-        max_close = close.rolling(self.params.high_window).max().iloc[-1]
-        if pd.isna(max_close) or float(max_close) <= 0:
+        price = view["adj_close"].astype(float)
+        sma_slow = sma(price, self.trend_sma_period).iloc[-1]
+        sma_fast = sma(price, self.fast_sma_period).iloc[-1]
+        if pd.isna(sma_slow) or pd.isna(sma_fast):
             return []
-        closeness = last_close / float(max_close)
-        if closeness < self.params.closeness_min:
+        if price.iloc[-1] <= sma_slow or sma_fast <= sma_slow:
             return []
 
-        # Slope quality (Clenow-style): annualised log-return slope on
-        # the past N days, weighted by R². Higher = smoother uptrend.
-        # Normalise into roughly [0, 1] — annualised slopes above
-        # ~0.50 (50% per year) saturate to 1.0; below 0 floors at 0.
-        slope_q = self._slope_quality(close.iloc[-self.params.slope_window :])
-        if math.isnan(slope_q):
-            slope_q = 0.0
-
-        # Composite score: closeness dominant, slope as tiebreak.
-        w = self.params.slope_weight
-        score_value = (1.0 - w) * closeness + w * slope_q
-        score_value = max(0.0, min(1.0, score_value))
-
-        atr_v = atr(high, low, close, self.params.atr_period).iloc[-1]
-        if pd.isna(atr_v) or float(atr_v) <= 0:
+        daily = price.pct_change().iloc[-self.gap_lookback :]
+        if daily.abs().max() > self.max_gap:
+            return []
+        realized_vol = float(daily.std(ddof=0) * math.sqrt(252)) if len(daily) else 0.0
+        if realized_vol > self.max_realized_vol:
             return []
 
-        entry = Decimal(str(round(last_close, 4)))
-        stop = Decimal(str(round(last_close - self.params.atr_stop_mult * float(atr_v), 4)))
-        score = Decimal(str(round(score_value, 4)))
+        high_52w = float(price.iloc[-self.high_lookback :].max())
+        closeness = float(price.iloc[-1]) / high_52w
+        if closeness < self.min_closeness:
+            return []
 
+        slope_quality = self._slope_quality(price.iloc[-self.slope_window :])
+        residual = sector_relative_return(view, as_of, lookback=self.residual_lookback)
+        residual_tilt = (
+            max(-self.residual_tilt_cap, min(self.residual_tilt_cap, residual))
+            if residual is not None
+            else 0.0
+        )
+        score = closeness + slope_quality + residual_tilt
+
+        last_close = float(view["close"].iloc[-1])
         return [
             RawSignal(
                 strategy_name=self.name,
                 strategy_version=self.version,
-                symbol=symbol,
+                symbol=str(view.attrs.get("symbol", "UNKNOWN")),
                 side="long",
-                score=score,
-                suggested_entry=entry,
-                suggested_stop=stop,
+                score=Decimal(str(round(score, 4))),
+                suggested_entry=Decimal(str(round(last_close, 4))),
+                suggested_stop=Decimal(str(round(last_close * (1.0 - self.stop_pct), 4))),
                 metadata={
                     "closeness_52w": round(closeness, 4),
-                    "slope_quality": round(slope_q, 4),
-                    "max_close_52w": round(float(max_close), 4),
-                    "atr": round(float(atr_v), 4),
-                    "ratchet_interval": self.params.ratchet_interval,
+                    "slope_quality": round(slope_quality, 4),
+                    "residual_return_12m": round(residual, 4) if residual is not None else None,
+                    "residual_tilt": round(residual_tilt, 4),
+                    "realized_vol_1y": round(realized_vol, 4),
+                    "sma_50": round(float(sma_fast), 4),
+                    "sma_200": round(float(sma_slow), 4),
                 },
             )
         ]
@@ -377,96 +201,33 @@ Letters*.
         bars: pd.DataFrame,
         as_of: date,
     ) -> ExitDecision | None:
-        # No strategy-level exits — the stop-loss (initial + ratcheted)
-        # is enforced by the engine. The ratcheting stop gradually
-        # tightens as the trade moves in our favour, removing the need
-        # for an arbitrary time-based exit.
+        view = bars[bars.index.date <= as_of]
+        if len(view) < self.high_lookback:
+            return None
+        last_close = float(view["close"].iloc[-1])
+        if last_close <= float(position.avg_cost) * (1.0 - self.stop_pct):
+            return ExitDecision(reason="stop_loss", qty=position.qty)
+
+        price = view["adj_close"].astype(float)
+        sma_exit = sma(price, self.exit_sma_period).iloc[-1]
+        if not pd.isna(sma_exit) and price.iloc[-1] < sma_exit:
+            return ExitDecision(reason="below_sma100", qty=position.qty)
+        if price.iloc[-1] < self.exit_closeness * float(price.iloc[-self.high_lookback :].max()):
+            return ExitDecision(reason="left_near_high_set", qty=position.qty)
         return None
-
-    # ------------------------------------------------------------------
-    def ratchet_stop(
-        self,
-        position: PositionSnapshot,
-        bars: pd.DataFrame,
-        as_of: date,
-    ) -> Decimal | None:
-        """Every ``ratchet_interval`` bars, recompute the ATR-based stop.
-
-        Returns the new stop level (current_close - mult × ATR). The
-        engine only accepts it if it's higher than the current stop, so
-        the stop ratchets upward as the trade wins — locking in profit
-        without forcing an exit on a winning trend.
-
-        Returns None on non-ratchet bars and when data is insufficient.
-        """
-        if position.opened_at is None:
-            return None
-
-        view = self._slice(bars, as_of)
-        if len(view) < self.params.atr_period + 5:
-            return None
-
-        # Count actual trading bars since entry.
-        entry_date = position.opened_at.date()
-        bars_since = view[view.index.date > entry_date]
-        n_bars = len(bars_since)
-        if n_bars == 0 or n_bars % self.params.ratchet_interval != 0:
-            return None
-
-        high = view["high"]
-        low = view["low"]
-        close = view["close"]
-        last_close = float(close.iloc[-1])
-
-        atr_v = atr(high, low, close, self.params.atr_period).iloc[-1]
-        if pd.isna(atr_v) or float(atr_v) <= 0:
-            return None
-
-        new_stop = round(last_close - self.params.atr_stop_mult * float(atr_v), 4)
-        return Decimal(str(new_stop))
 
     # ------------------------------------------------------------------
     @staticmethod
     def _slope_quality(closes: pd.Series) -> float:
-        """Clenow-style regression-slope quality on log-prices.
-
-        Fits ``log(close) ~ alpha + beta * t`` over the window.
-        Returns ``annualised_slope * R²``, then sigmoid-normalised
-        into roughly [0, 1] so very steep + very smooth = ~1.0,
-        flat = ~0.5, downtrend = ~0.0.
-        """
-        if len(closes) < 2:
-            return float("nan")
+        """Clenow's ranking metric: annualized regression slope of log price
+        × R², squashed to (0, 1). A smooth 50%/yr climb lands near 0.85,
+        flat near 0.5, a downtrend near 0."""
         log_p = np.log(closes.to_numpy(dtype=float))
-        if not np.all(np.isfinite(log_p)):
-            return float("nan")
         x = np.arange(len(log_p), dtype=float)
-        # Linear regression: slope, intercept, R².
-        # Using numpy.polyfit with deg=1 + manual R² for transparency.
         slope, intercept = np.polyfit(x, log_p, 1)
         fitted = slope * x + intercept
         ss_res = float(np.sum((log_p - fitted) ** 2))
         ss_tot = float(np.sum((log_p - log_p.mean()) ** 2))
         r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else 0.0
-        # Annualise. ``slope`` is the daily log-return; x252 gives
-        # the annualised continuous return. Multiply by R² to penalise
-        # jagged trends.
-        annualised = slope * 252.0 * max(0.0, r2)
-        # Squash to [0, 1] with a sigmoid centred on 0 — a 50%/yr
-        # smooth uptrend lands around 0.85; flat → ~0.5; deep
-        # downtrend → near 0.0.
-        return 1.0 / (1.0 + math.exp(-3.0 * annualised))
-
-    @staticmethod
-    def _slice(bars: pd.DataFrame, as_of: date) -> pd.DataFrame:
-        idx_dates = bars.index.date if hasattr(bars.index, "date") else None
-        if idx_dates is None:
-            return bars
-        mask = idx_dates <= as_of
-        return bars[mask]
-
-    @staticmethod
-    def _symbol(view: pd.DataFrame) -> str:
-        if "symbol" in view.columns:
-            return str(view["symbol"].iloc[-1])
-        return view.attrs.get("symbol", "UNKNOWN")
+        annualized = slope * 252.0 * max(0.0, r2)
+        return 1.0 / (1.0 + math.exp(-3.0 * annualized))

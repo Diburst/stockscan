@@ -4,22 +4,23 @@ These don't measure speed — they prove the fast paths produce identical result
 to the slow ones they replaced:
 
   1. engine._bars searchsorted slice == the old `index.date <= as_of` mask.
-  2. ReversalSwing.reversal_score on a tail window == on the full history
-     (the basis for reversal_swing bounding its indicator compute).
-  3. relative_strength caches the sector map + composite bars (one fetch each per run).
+  2. `_wilder_smoothing` on a NumPy array == the textbook pandas recursion.
+  3. relative_strength caches the sector map + composite closes (one fetch
+     each per run) and its searchsorted slice matches a date mask.
 """
 
 from __future__ import annotations
 
 from datetime import date
-from decimal import Decimal
 
 import numpy as np
 import pandas as pd
+import pytest
 
 import stockscan.indicators.relative_strength as srs
 from stockscan.backtest.engine import BacktestConfig, BacktestEngine
-from stockscan.strategies.reversal_swing import ReversalSwing
+from stockscan.indicators.ta import _wilder_smoothing
+from stockscan.strategies.rsi2_meanrev import RSI2MeanReversion
 
 
 def _frame(n: int, start: str = "2022-01-03") -> pd.DataFrame:
@@ -33,7 +34,6 @@ def _frame(n: int, start: str = "2022-01-03") -> pd.DataFrame:
             "close": closes,
             "adj_close": closes,
             "volume": [1_000_000] * n,
-            "symbol": ["X"] * n,
         },
         index=idx,
     )
@@ -49,8 +49,7 @@ def test_bars_searchsorted_matches_date_mask():
         return frame
 
     cfg = BacktestConfig(
-        strategy_cls=ReversalSwing,
-        params=None,
+        strategy_cls=RSI2MeanReversion,
         start_date=date(2022, 6, 1),
         end_date=date(2023, 6, 1),
         universe=["X"],
@@ -64,49 +63,36 @@ def test_bars_searchsorted_matches_date_mask():
 
 
 # ======================================================================
-# 2. tail invariance of the composite score
+# 2. Wilder smoothing: ndarray loop == reference pandas recursion
 # ======================================================================
-def _bottom_frame(n: int = 420) -> pd.DataFrame:
-    up = list(np.linspace(70, 100, n - 23))
-    # v1.4.0 pivot floor gate requires a confirmed swing low BELOW the
-    # eventual hook close inside the trailing 60-bar lookback. Insert a 7-bar
-    # V into the up-trend at a fixed offset before the dip — well within the
-    # pivot lookback regardless of n.
-    v_idx = len(up) - 21  # ~17 bars before the shelf starts
-    up[v_idx:v_idx + 7] = [98.0, 96.0, 95.0, 94.0, 95.0, 96.0, 98.0]
-    shelf = [100, 102, 100, 102, 99, 101, 100, 102, 99, 101, 100, 102]
-    dip = [99, 97, 95, 94]
-    hook = [96.5]
-    closes = up + shelf + dip + hook
-    idx = pd.date_range("2021-01-04", periods=len(closes), freq="B", tz="UTC")
-    df = pd.DataFrame(
-        {
-            "open": closes,
-            "high": [c + 1 for c in closes],
-            "low": [c - 1 for c in closes],
-            "close": closes,
-            "adj_close": closes,
-            "volume": [1_000_000] * len(closes),
-            "symbol": ["X"] * len(closes),
-        },
-        index=idx,
-    )
-    df.attrs["symbol"] = "X"
-    return df
+def _reference_wilder(series: pd.Series, period: int) -> pd.Series:
+    out = pd.Series(np.nan, index=series.index, dtype=float)
+    if len(series) < period:
+        return out
+    out.iloc[period - 1] = series.iloc[:period].mean()
+    for i in range(period, len(series)):
+        out.iloc[i] = out.iloc[i - 1] + (series.iloc[i] - out.iloc[i - 1]) / period
+    return out
 
 
-def test_compute_score_is_tail_invariant():
-    full = _bottom_frame(420)
-    as_of = full.index[-1].date()
-    strat = ReversalSwing()
-    s_full = strat.reversal_score(full, as_of)
-    s_tail = strat.reversal_score(full.tail(240), as_of)
-    assert s_full is not None and s_tail is not None
-    assert s_tail.score == s_full.score  # identical: trailing-window indicators
+@pytest.mark.parametrize("period", [2, 14])
+def test_wilder_smoothing_matches_reference(period):
+    s = _frame(300)["close"].diff().clip(lower=0.0)
+    fast = _wilder_smoothing(s, period)
+    slow = _reference_wilder(s, period)
+    assert fast.index.equals(s.index)
+    assert fast.isna().sum() == period - 1
+    pd.testing.assert_series_equal(fast, slow, check_names=False)
+
+
+def test_wilder_smoothing_short_series_is_all_nan():
+    s = pd.Series([1.0, 2.0, 3.0])
+    out = _wilder_smoothing(s, 5)
+    assert out.isna().all() and len(out) == 3
 
 
 # ======================================================================
-# 3. sector_rs run-scoped caching
+# 3. sector_rs run-scoped caching + slice equivalence
 # ======================================================================
 def test_sector_rs_caches_map_and_composite(monkeypatch):
     srs.clear_cache()
@@ -119,15 +105,11 @@ def test_sector_rs_caches_map_and_composite(monkeypatch):
         calls["map"] += 1
         return {"AAPL": "Technology"}
 
-    def fake_composite_symbol(sector, **_):
-        return f"$EWSECTOR:{sector.upper()}"
-
     def fake_get_bars(symbol, start=None, end=None, **_):
         calls["bars"] += 1
         return comp_df
 
     monkeypatch.setattr("stockscan.sectors.store.sector_map", fake_sector_map)
-    monkeypatch.setattr("stockscan.sectors.composite.composite_symbol", fake_composite_symbol)
     monkeypatch.setattr("stockscan.data.store.get_bars", fake_get_bars)
 
     # Many (symbol, day) lookups — the inner-loop pattern.
@@ -136,6 +118,10 @@ def test_sector_rs_caches_map_and_composite(monkeypatch):
         assert comp == "$EWSECTOR:TECHNOLOGY"
         out = srs._composite_closes(comp, d.date())
         assert out is not None and not out.empty
+        # searchsorted slice == date mask on the tz-naive normalised index
+        expected = comp_df["close"][comp_df.index.date <= d.date()]
+        assert len(out) == len(expected)
+        assert out.index[-1].date() == expected.index[-1].date()
 
     assert calls["map"] == 1, "sector map should be fetched once per run"
     assert calls["bars"] == 1, "each composite should be fetched once per run"

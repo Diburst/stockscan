@@ -22,7 +22,7 @@ def base_rates_for_signal(
     s: Session = Depends(get_session),
 ):
     """Historical base-rates report for the signal's strategy/symbol pair,
-    computed on the fly with the strategy file's default params. An unknown
+    computed on the fly with the strategy file's knobs. An unknown
     signal renders the empty-state page; a compute failure surfaces as an
     error message instead of a report."""
     discover_strategies()
@@ -38,15 +38,11 @@ def base_rates_for_signal(
     if sig is None:
         return render(request, "base_rates/show.html", signal=None, report=None)
 
-    # File defaults — strategy_configs is retired; the strategy file is the
-    # source of truth for params. Strategies without a params_model are
-    # instantiated with no args.
     cls = STRATEGY_REGISTRY.get(sig.strategy_name)
-    params = cls.params_model() if cls.params_model is not None else None
     as_of: date = sig.as_of_date
 
     try:
-        report = compute_base_rates(cls, params, sig.symbol, as_of)
+        report = compute_base_rates(cls, sig.symbol, as_of)
     except Exception as exc:  # noqa: BLE001
         report = None
         error = str(exc)

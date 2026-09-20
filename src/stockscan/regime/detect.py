@@ -1,355 +1,141 @@
-"""Market-regime detector — DESIGN §regime (v2 composite).
+"""Compute and cache the day's market regime from SPY bars and HY OAS.
 
-The detector produces two layers of output that get persisted in the
-same row of ``market_regime``:
+:func:`detect_regime` is the one entry point. It pulls two years of SPY
+closes (enough warmup for the 200-day SMA and the 252-day vol rank) and
+the HY OAS series, evaluates :func:`stockscan.regime.rules.regime_frame`,
+and persists the last row. Rows are cached by date; rows written under
+an older ``methodology_version`` are recomputed on first touch.
 
-  * **Legacy label** (``trending_up`` / ``trending_down`` / ``choppy`` /
-    ``transitioning``), classified from SPY ADX(14) + SMA(200). Kept for
-    the dashboard banner and for back-compat with v1 callers.
-  * **v2 composite** — four component scores in [0, 1] (vol, trend,
-    breadth, credit), a credit-stress flag, and the underlying levels
-    we pulled to compute them. Combined into a single composite score
-    per the research doc weights (vol 0.40, trend 0.25, breadth 0.20,
-    credit 0.15).
-
-Failure modes are intentionally fine-grained — each v2 component fetches
-and computes independently. If FRED is down, ``credit_score`` comes
-back ``None`` but ``vol_score`` and ``trend_score`` still populate; the
-composite is renormalized over what's available. The legacy label is
-the only "hard" requirement: if SPY bars are missing or insufficient,
-the function returns ``None`` and callers skip regime-aware sizing
-rather than crashing.
-
-Cache discipline: v2 rows are cached by ``as_of`` and reused on
-subsequent calls. v1 cached rows (``methodology_version < 2``) are
-treated as stale and re-detected so the upgrade path lands cleanly the
-first time the new code runs.
+SPY bars are the one hard requirement — without them the function returns
+``None`` and callers size neutrally. HY OAS is optional: when the FRED
+series is missing the credit-stress flag is simply ``False``.
 """
 
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING
+from datetime import date
 
 import pandas as pd
+from sqlalchemy.orm import Session
 
 from stockscan.data.macro_store import get_macro_series
 from stockscan.data.store import get_bars
-from stockscan.indicators import adx as compute_adx
-from stockscan.indicators import sma
-from stockscan.regime.composite import (
-    BREADTH_LONG_WINDOW,
-    BREADTH_SHORT_WINDOW,
-    DEFAULT_WINDOW,
-    TREND_SLOPE_WINDOW,
-    breadth_score,
-    composite_score,
-    credit_score,
-    credit_stress_flag,
-    hy_oas_zscore,
-    trend_score,
-    vol_score,
+from stockscan.regime.rules import (
+    CREDIT_RANK_WINDOW,
+    TREND_SMA_WINDOW,
+    VOL_RANK_WINDOW,
+    VOL_WINDOW,
+    regime_frame,
 )
 from stockscan.regime.store import (
+    METHODOLOGY_VERSION,
     MarketRegime,
-    RegimeLabel,
     get_regime,
     upsert_regime,
 )
 
-if TYPE_CHECKING:
-    from datetime import date
-
-    from sqlalchemy.orm import Session
-
 log = logging.getLogger(__name__)
 
-# SPY is the S&P 500 proxy for the legacy label. Always required.
-_BENCHMARK = "SPY"
+BENCHMARK = "SPY"
+HY_OAS_SERIES = "BAMLH0A0HYM2"  # ICE BofA US High Yield OAS, via FRED
 
-# v2 instruments
-_VIX_SYMBOL = "VIX"  # bars hypertable, fetched via EODHD .INDX
-_RSP_SYMBOL = "RSP"  # bars hypertable, EODHD .US
-HY_OAS_SERIES = "BAMLH0A0HYM2"  # macro_series, fetched via FRED
-
-# ADX thresholds (canonical Wilder definitions).
-_ADX_TREND_THRESHOLD = 25.0
-_ADX_CHOP_THRESHOLD = 18.0
-
-# Minimum SPY bars to compute the legacy label. SMA(200) dominates; add
-# 2x ADX period for Wilder warmup + buffer.
-_MIN_LEGACY_BARS = 230
-
-# Lookback window for fetching all v2 inputs. The component math wants
-# DEFAULT_WINDOW (252) trailing observations; we pull a 2-year window
-# (≈ 504 trading days) to give the rolling functions warmup headroom.
+# Bars needed before every column of the regime frame is defined.
+MIN_BENCHMARK_BARS = VOL_RANK_WINDOW + VOL_WINDOW
 _LOOKBACK_YEARS = 2
 
-_METHODOLOGY_VERSION = 2
 
-
-def classify_regime(adx_val: float, spy_close: float, spy_sma200: float) -> RegimeLabel:
-    """Pure classification — no I/O. Useful for testing and backtest replay."""
-    if adx_val > _ADX_TREND_THRESHOLD:
-        return "trending_up" if spy_close > spy_sma200 else "trending_down"
-    if adx_val < _ADX_CHOP_THRESHOLD:
-        return "choppy"
-    return "transitioning"
-
-
-# ----------------------------------------------------------------------
-# Helpers — each soft-fails to (None, ...) on missing/short data
-# ----------------------------------------------------------------------
-def _safe_last(series: pd.Series) -> float | None:
-    """Return the last value of a Series as a float, or None if NaN/empty."""
-    if series is None or series.empty:
-        return None
-    last = series.iloc[-1]
-    if pd.isna(last):
-        return None
-    return float(last)
-
-
-def _fetch_spy_bars(as_of: date, session: Session | None) -> pd.DataFrame | None:
-    """SPY bars are mandatory for the legacy label; failure -> None."""
+def _fetch_spy_close(as_of: date, session: Session | None) -> pd.Series | None:
     start = as_of.replace(year=as_of.year - _LOOKBACK_YEARS)
     try:
-        bars = get_bars(_BENCHMARK, start, as_of, session=session)
+        bars = get_bars(BENCHMARK, start, as_of, session=session)
     except Exception as exc:
-        log.warning("regime: could not fetch %s bars: %s", _BENCHMARK, exc)
+        log.warning("regime: could not fetch %s bars: %s", BENCHMARK, exc)
         return None
     if bars is None or bars.empty:
-        log.warning("regime: no %s bars in DB — run `stockscan refresh bars` first", _BENCHMARK)
+        log.warning("regime: no %s bars in DB — run `stockscan refresh bars %s` first", BENCHMARK, BENCHMARK)
         return None
-    if hasattr(bars.index, "date"):
-        bars = bars[bars.index.date <= as_of]
-    if len(bars) < _MIN_LEGACY_BARS:
+    bars = bars[bars.index.date <= as_of]
+    if len(bars) < max(MIN_BENCHMARK_BARS, TREND_SMA_WINDOW):
         log.warning(
             "regime: only %d %s bars available (need %d) — skipping",
             len(bars),
-            _BENCHMARK,
-            _MIN_LEGACY_BARS,
-        )
-        return None
-    return bars
-
-
-def _fetch_vix_close(as_of: date, session: Session | None) -> pd.Series | None:
-    """Pull VIX close as a date-indexed Series, or None on any failure.
-
-    VIX is stored in the bars hypertable under symbol="VIX" (fetched via
-    EODHD's ``/eod/VIX.INDX`` endpoint). Missing data is non-fatal — the
-    v2 composite can still be computed without ``vol_score``.
-    """
-    start = as_of.replace(year=as_of.year - _LOOKBACK_YEARS)
-    try:
-        bars = get_bars(_VIX_SYMBOL, start, as_of, session=session)
-    except Exception as exc:
-        log.warning("regime: VIX bars unavailable — vol_score skipped: %s", exc)
-        return None
-    if bars is None or bars.empty:
-        log.warning("regime: no VIX bars stored — vol_score skipped")
-        return None
-    if hasattr(bars.index, "date"):
-        bars = bars[bars.index.date <= as_of]
-    if len(bars) < DEFAULT_WINDOW:
-        log.warning(
-            "regime: only %d VIX bars (need %d for percentile) — vol_score skipped",
-            len(bars),
-            DEFAULT_WINDOW,
+            BENCHMARK,
+            MIN_BENCHMARK_BARS,
         )
         return None
     return bars["close"].astype(float)
 
 
-def _fetch_rsp_close(as_of: date, session: Session | None) -> pd.Series | None:
-    """Pull RSP close. Used for the breadth proxy (RSP/SPY ratio)."""
+def _fetch_hy_oas(as_of: date, session: Session | None) -> pd.Series | None:
     start = as_of.replace(year=as_of.year - _LOOKBACK_YEARS)
     try:
-        bars = get_bars(_RSP_SYMBOL, start, as_of, session=session)
+        series = get_macro_series(HY_OAS_SERIES, start, as_of, session=session)
     except Exception as exc:
-        log.warning("regime: RSP bars unavailable — breadth_score skipped: %s", exc)
+        log.warning("regime: HY OAS unavailable — credit-stress flag off: %s", exc)
         return None
-    if bars is None or bars.empty:
-        log.warning("regime: no RSP bars stored — breadth_score skipped")
-        return None
-    if hasattr(bars.index, "date"):
-        bars = bars[bars.index.date <= as_of]
-    if len(bars) < BREADTH_LONG_WINDOW:
+    if series is None or series.empty or len(series) < CREDIT_RANK_WINDOW:
         log.warning(
-            "regime: only %d RSP bars (need %d for SMA) — breadth_score skipped",
-            len(bars),
-            BREADTH_LONG_WINDOW,
+            "regime: %d HY OAS observations (need %d) — credit-stress flag off; "
+            "run `stockscan refresh macro`",
+            0 if series is None else len(series),
+            CREDIT_RANK_WINDOW,
         )
         return None
-    return bars["close"].astype(float)
+    return series
 
 
-def _fetch_hy_oas_series(as_of: date, session: Session | None) -> pd.Series | None:
-    """Pull HY OAS from ``macro_series``. None on any failure / insufficient history."""
-    start = as_of.replace(year=as_of.year - _LOOKBACK_YEARS)
-    try:
-        s = get_macro_series(HY_OAS_SERIES, start, as_of, session=session)
-    except Exception as exc:
-        log.warning("regime: HY OAS unavailable — credit_score skipped: %s", exc)
-        return None
-    if s is None or s.empty:
-        log.warning("regime: no HY OAS rows in macro_series — credit_score skipped")
-        return None
-    if len(s) < DEFAULT_WINDOW:
-        log.warning(
-            "regime: only %d HY OAS observations (need %d) — credit_score skipped",
-            len(s),
-            DEFAULT_WINDOW,
-        )
-        return None
-    return s
+def _last_float(series: pd.Series) -> float | None:
+    value = series.iloc[-1]
+    return None if pd.isna(value) else float(value)
 
 
-# ----------------------------------------------------------------------
-# Public API
-# ----------------------------------------------------------------------
 def detect_regime(
     as_of: date,
     *,
     session: Session | None = None,
     force_recompute: bool = False,
 ) -> MarketRegime | None:
-    """Return the v2 market regime for ``as_of``, computing and caching.
+    """The market regime for ``as_of``, computed and cached.
 
-    Returns ``None`` only when SPY bars are missing or insufficient — the
-    legacy label is the one hard prerequisite. Callers should skip
-    regime-aware sizing in that case rather than blocking.
-
-    A cached v2 row is reused as-is. A cached v1 row (rows persisted
-    before migration 0010) is treated as stale and re-detected so the
-    composite columns get backfilled the first time we see that date.
-    Pass ``force_recompute=True`` to bypass the cache entirely (useful
-    for backtest replay over historical dates whose underlying data has
-    been refreshed).
+    ``force_recompute`` bypasses the cache (after a bar or macro refresh).
     """
     if not force_recompute:
         cached = get_regime(as_of, session=session)
-        if cached is not None and cached.methodology_version >= _METHODOLOGY_VERSION:
+        if cached is not None and cached.methodology_version >= METHODOLOGY_VERSION:
             return cached
 
-    # ---- Legacy label (mandatory) ----
-    spy_bars = _fetch_spy_bars(as_of, session=session)
-    if spy_bars is None:
+    spy_close = _fetch_spy_close(as_of, session)
+    if spy_close is None:
+        return None
+    frame = regime_frame(spy_close, _fetch_hy_oas(as_of, session))
+    today = frame.iloc[-1]
+    if pd.isna(today["sma200"]):
+        log.warning("regime: SMA(%d) undefined for %s as of %s", TREND_SMA_WINDOW, BENCHMARK, as_of)
         return None
 
-    spy_close = spy_bars["close"].astype(float)
-    spy_high = spy_bars["high"].astype(float)
-    spy_low = spy_bars["low"].astype(float)
-
-    adx_series = compute_adx(spy_high, spy_low, spy_close, period=14)
-    sma200_series = sma(spy_close, 200)
-
-    adx_val = _safe_last(adx_series)
-    sma200_val = _safe_last(sma200_series)
-    close_val = _safe_last(spy_close)
-    if adx_val is None or sma200_val is None or close_val is None:
-        log.warning("regime: ADX or SMA(200) NaN for %s as of %s", _BENCHMARK, as_of)
-        return None
-
-    label = classify_regime(adx_val, close_val, sma200_val)
-
-    # ---- v2 components (each may be None) ----
-
-    # Trend score from SPY (always available since legacy succeeded).
-    trend_val = _safe_last(trend_score(spy_close, sma200_series))
-    # Intermediate signal: relative SMA(200) slope over the last 20 bars.
-    # Persisted alongside the score so the dashboard can show "what we
-    # actually computed" — feeds into trend_score via clip(slope/0.02, -1, 1).
-    sma200_lagged = sma200_series.shift(TREND_SLOPE_WINDOW)
-    sma200_slope_series = (sma200_series - sma200_lagged) / sma200_lagged
-    sma200_slope_val = _safe_last(sma200_slope_series)
-
-    # Vol score from VIX bars.
-    vol_val: float | None = None
-    vix_level_val: float | None = None
-    vix_pct_rank_val: float | None = None
-    vix_close = _fetch_vix_close(as_of, session=session)
-    if vix_close is not None:
-        vol_val = _safe_last(vol_score(vix_close))
-        vix_level_val = _safe_last(vix_close)
-        # vol_score = 1 - rank, so rank = 1 - vol when vol is computed.
-        vix_pct_rank_val = 1.0 - vol_val if vol_val is not None else None
-
-    # Breadth score from RSP/SPY ratio.
-    breadth_val: float | None = None
-    rsp_spy_ratio_val: float | None = None
-    breadth_rel_gap_val: float | None = None
-    rsp_close = _fetch_rsp_close(as_of, session=session)
-    if rsp_close is not None:
-        # Inner-join on date so the ratio is computed only on shared bars.
-        merged = pd.concat([rsp_close.rename("rsp"), spy_close.rename("spy")], axis=1).dropna()
-        if len(merged) >= BREADTH_LONG_WINDOW:
-            breadth_val = _safe_last(breadth_score(merged["rsp"], merged["spy"]))
-            # Intermediate signals: today's spot ratio + the relative gap
-            # between its 20d and 200d SMAs (which is what feeds the score
-            # after band saturation).
-            ratio = merged["rsp"] / merged["spy"]
-            rsp_spy_ratio_val = _safe_last(ratio)
-            ratio_short = ratio.rolling(
-                BREADTH_SHORT_WINDOW, min_periods=BREADTH_SHORT_WINDOW
-            ).mean()
-            ratio_long = ratio.rolling(BREADTH_LONG_WINDOW, min_periods=BREADTH_LONG_WINDOW).mean()
-            breadth_rel_gap_val = _safe_last((ratio_short - ratio_long) / ratio_long)
-
-    # Credit components from HY OAS.
-    credit_val: float | None = None
-    hy_oas_level_val: float | None = None
-    hy_oas_pct_rank_val: float | None = None
-    hy_oas_zscore_val: float | None = None
-    stress_flag = False
-    hy_series = _fetch_hy_oas_series(as_of, session=session)
-    if hy_series is not None:
-        credit_val = _safe_last(credit_score(hy_series))
-        hy_oas_level_val = _safe_last(hy_series)
-        hy_oas_pct_rank_val = 1.0 - credit_val if credit_val is not None else None
-        hy_oas_zscore_val = _safe_last(hy_oas_zscore(hy_series))
-        stress_series = credit_stress_flag(hy_series)
-        if not stress_series.empty:
-            stress_flag = bool(stress_series.iloc[-1])
-
-    # Composite (renormalizes weights over non-None components).
-    composite = composite_score(vol_val, trend_val, breadth_val, credit_val)
-
-    log.info(
-        "regime v2: %s as of %s | label=%s composite=%s "
-        "vol=%s trend=%s breadth=%s credit=%s stress=%s",
-        _BENCHMARK,
+    row = upsert_regime(
         as_of,
-        label,
-        f"{composite:.3f}" if composite is not None else "—",
-        f"{vol_val:.3f}" if vol_val is not None else "—",
-        f"{trend_val:.3f}" if trend_val is not None else "—",
-        f"{breadth_val:.3f}" if breadth_val is not None else "—",
-        f"{credit_val:.3f}" if credit_val is not None else "—",
-        stress_flag,
-    )
-
-    return upsert_regime(
-        as_of,
-        label,
-        adx=adx_val,
-        spy_close=close_val,
-        spy_sma200=sma200_val,
-        composite_score=composite,
-        vol_score=vol_val,
-        trend_score=trend_val,
-        breadth_score=breadth_val,
-        credit_score=credit_val,
-        vix_level=vix_level_val,
-        vix_pct_rank=vix_pct_rank_val,
-        hy_oas_level=hy_oas_level_val,
-        hy_oas_pct_rank=hy_oas_pct_rank_val,
-        hy_oas_zscore=hy_oas_zscore_val,
-        spy_sma200_slope_20d=sma200_slope_val,
-        rsp_spy_ratio=rsp_spy_ratio_val,
-        breadth_rel_gap=breadth_rel_gap_val,
-        credit_stress_flag=stress_flag,
-        methodology_version=_METHODOLOGY_VERSION,
+        trend_gate_open=bool(today["trend_gate_open"]),
+        days_on_side=int(today["days_on_side"]),
+        spy_close=float(spy_close.iloc[-1]),
+        spy_sma200=float(today["sma200"]),
+        spy_sma200_slope_20d=_last_float(frame["sma200_slope_20d"]),
+        realized_vol_20d=_last_float(frame["realized_vol"]),
+        realized_vol_pct_rank=_last_float(frame["vol_pct_rank"]),
+        vol_scalar=_last_float(frame["vol_scalar"]),
+        hy_oas_level=_last_float(frame["hy_oas"]),
+        hy_oas_pct_rank=_last_float(frame["hy_oas_pct_rank"]),
+        credit_stress_flag=bool(today["credit_stress_flag"]),
         session=session,
     )
+    log.info(
+        "regime: %s | gate %s (%d days on side) | vol scalar %s (rank %s) | stress %s",
+        as_of,
+        "open" if row.trend_gate_open else "closed",
+        row.days_on_side,
+        f"{row.vol_multiplier:.2f}",
+        f"{float(row.realized_vol_pct_rank):.2f}" if row.realized_vol_pct_rank is not None else "—",
+        row.credit_stress_flag,
+    )
+    return row

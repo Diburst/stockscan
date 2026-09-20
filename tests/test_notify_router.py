@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock
 
 from stockscan.notify import notify
 from stockscan.notify.base import NotificationChannel

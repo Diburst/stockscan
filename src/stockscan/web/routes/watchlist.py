@@ -15,13 +15,12 @@ from datetime import date as _date, timedelta as _timedelta
 from stockscan.config import settings
 from stockscan.data.backfill import backfill_symbol
 from stockscan.data.providers.eodhd import EODHDError, EODHDProvider
-from stockscan.data.store import get_bars, latest_bar_date, latest_daily_bar_date
-from stockscan.earnings import days_until, next_earnings, refresh_earnings, revision_summary
+from stockscan.data.store import latest_bar_date, latest_daily_bar_date
+from stockscan.earnings import refresh_earnings
 from stockscan.econ_events import refresh_economic_events
-from stockscan.insider import net_buys_90d, refresh_insider_for_watchlist
+from stockscan.insider import refresh_insider_for_watchlist
 from stockscan.refresh_log import mark_refreshed, refresh_due
 from stockscan.scan import refresh_signals
-from stockscan.strategies.reversal_swing import ReversalSwing
 from stockscan.watchlist.composite import (
     composite_payload,
     member_series,
@@ -56,16 +55,9 @@ from stockscan.web.deps import (
 
 log = logging.getLogger(__name__)
 
-# Render-time memo for the per-symbol reversal score shown in the "Tech"
-# column. Keyed (symbol, last-bar-timestamp, date): a bars refresh changes
-# the last-bar key, a new day clears the whole memo (see watchlist_list).
-# Process-local — same single-worker deployment assumption as refresh_job.
-_SCORE_MEMO: dict[tuple[str, str, _date], float | None] = {}
-
 # ~1140 calendar days ≈ 3 years of trading bars. EOD history is a single
 # provider call regardless of range, so we pull the full window the charts can
-# display (the Analysis 3y button + 756-bar chart cap) up front. Comfortably
-# covers the 252-bar (52-week) lookbacks the watchlist technical score needs.
+# display (the Analysis 3y button + 756-bar chart cap) up front.
 _BACKFILL_CALENDAR_DAYS = 1140
 
 
@@ -129,77 +121,11 @@ def watchlist_list(
     s: Session = Depends(get_session),
 ):
     """The watchlist page for the selected list (``?list=`` id or 'all').
-    Each row carries a memoized reversal_swing technical score plus earnings,
-    estimate-revision, and insider enrichment — all soft-fail per symbol so
-    missing data renders as a dash, never an error."""
-    # Resolve which list is selected (defaults to the primary "Watchlist"
-    # list; ``?list=all`` shows every symbol across all lists).
+    Per-symbol earnings, revisions and insider detail live on the Analysis
+    page each symbol links to."""
     selected_id, selected_label = resolve_selection(list, session=s)
     lists = list_watchlists(session=s)
     items = list_watchlist(list_id=selected_id, session=s)
-    # Show each watched symbol's reversal_swing score on the fly. We go
-    # through the strategy class because the strategy is the only home for
-    # its scoring — same code path the scanner uses. Scores are memoized
-    # per (symbol, last-bar-timestamp, date) — bars only change after a
-    # refresh, so repeat page loads skip the composite recompute entirely
-    # (it's the expensive part of this render: RSI/ATR/pivots/volume/RS
-    # over a 1-year tail, per symbol).
-    today = _date.today()
-    one_year_ago = today.replace(year=today.year - 1)
-    revsw = ReversalSwing()
-    tech_scores: dict[str, float | None] = {}
-    # Per-symbol earnings + revisions + insider enrichment. All safe() —
-    # never blocks the page; missing data renders as "—".
-    next_earnings_by_sym: dict[str, object] = {}
-    days_to_earn_by_sym: dict[str, int | None] = {}
-    revisions_by_sym: dict[str, object] = {}
-    insider_by_sym: dict[str, object] = {}
-    for item in items:
-        bars = safe(
-            lambda sym=item.symbol: get_bars(sym, one_year_ago, today, session=s),
-            label=f"watchlist.get_bars[{item.symbol}]",
-        )
-        if bars is None or getattr(bars, "empty", True):
-            tech_scores[item.symbol] = None
-        else:
-            cache_key = (item.symbol, str(bars.index[-1]), today)
-            if cache_key in _SCORE_MEMO:
-                tech_scores[item.symbol] = _SCORE_MEMO[cache_key]
-            else:
-                result = safe(
-                    lambda b=bars: revsw.reversal_score(b, today),
-                    label=f"watchlist.reversal_score[{item.symbol}]",
-                )
-                score = result.score if result is not None else None
-                # New day → old keys are dead weight; reset before insert.
-                if _SCORE_MEMO and next(iter(_SCORE_MEMO))[2] != today:
-                    _SCORE_MEMO.clear()
-                _SCORE_MEMO[cache_key] = score
-                tech_scores[item.symbol] = score
-
-        earn = safe(
-            lambda sym=item.symbol: next_earnings(sym, as_of=today, session=s),
-            label=f"watchlist.next_earnings[{item.symbol}]",
-        )
-        next_earnings_by_sym[item.symbol] = earn
-        days_to_earn_by_sym[item.symbol] = (
-            days_until(earn.report_date, today) if earn is not None else None
-        )
-        # Filter to periods ending within the last 12 months so the
-        # column reflects the current forward-looking quarter, not a
-        # stale snapshot for a quarter that ran years ago.
-        revisions_by_sym[item.symbol] = safe(
-            lambda sym=item.symbol: revision_summary(
-                sym,
-                since=today - _timedelta(days=365),
-                session=s,
-            ),
-            label=f"watchlist.revision_summary[{item.symbol}]",
-        )
-        insider_by_sym[item.symbol] = safe(
-            lambda sym=item.symbol: net_buys_90d(sym, session=s),
-            label=f"watchlist.net_buys_90d[{item.symbol}]",
-        )
     return render(
         request,
         "watchlist/list.html",
@@ -207,11 +133,6 @@ def watchlist_list(
         lists=lists,
         selected_id=selected_id,
         selected_label=selected_label,
-        tech_scores=tech_scores,
-        next_earnings_by_sym=next_earnings_by_sym,
-        days_to_earn_by_sym=days_to_earn_by_sym,
-        revisions_by_sym=revisions_by_sym,
-        insider_by_sym=insider_by_sym,
         bars_as_of=_bars_as_of(items),
         err=err,
     )

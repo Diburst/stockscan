@@ -133,7 +133,6 @@ def test_body_includes_pct_change():
 # --- Orchestration ---
 def test_check_and_fire_alerts_fires_only_triggered():
     triggered = _item(target=Decimal("200"), direction="above", last_close=Decimal("210"))
-    not_triggered = _item(target=Decimal("200"), direction="above", last_close=Decimal("190"))
 
     captured = []
 

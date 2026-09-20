@@ -8,7 +8,7 @@ def test_settings_load_defaults() -> None:
 
     s = Settings(_env_file=None)
     assert s.timezone == "America/New_York"
-    assert s.default_risk_pct == Decimal("0.01")
+    assert s.starting_equity == Decimal("100000")
     assert s.max_positions == 15
     assert s.max_position_pct == Decimal("0.08")
     assert s.max_sector_pct == Decimal("0.25")

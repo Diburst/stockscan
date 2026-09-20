@@ -1,11 +1,11 @@
 """Strategy-version SQL helpers.
 
-When a strategy's class version is bumped (Donchian 1.0.0 → 1.1.0,
+When a strategy's class version is bumped (rsi2_meanrev 1.0.0 → 2.0.0,
 say), historical signals from the older version stay in the database
 intentionally — they're useful for offline comparison and audit. But
-the live web UI and the meta-label trainer should default to ONLY the
-current registered version, so the user isn't comparing apples to
-oranges across signal-generation eras.
+the live web UI should default to ONLY the current registered version,
+so the user isn't comparing apples to oranges across signal-generation
+eras.
 
 This module exposes one helper, :func:`current_version_filter`, that
 returns a SQL ``WHERE``-clause fragment + parameter dict for filtering
@@ -16,9 +16,8 @@ version of EACH strategy. The clause is composed of ``OR``-ed
 or version-bumped — no separate config to maintain.
 
 CLI commands that legitimately want to look at older versions
-(``stockscan ml train --version 1.0.0``, ``stockscan signals delete
---version 1.0.0``) bypass this helper and filter on the explicit
-version directly.
+(``stockscan signals delete --version 1.0.0``) bypass this helper and
+filter on the explicit version directly.
 """
 
 from __future__ import annotations
@@ -61,8 +60,8 @@ def current_version_filter(
     '((s.strategy_name = :svn0 AND s.strategy_version = :svv0)
        OR (s.strategy_name = :svn1 AND s.strategy_version = :svv1))'
     >>> params
-    {'svn0': 'donchian_trend', 'svv0': '1.1.0',
-     'svn1': 'rsi2_meanrev', 'svv1': '1.0.0'}
+    {'svn0': 'momentum_52w_high', 'svv0': '2.0.0',
+     'svn1': 'rsi2_meanrev', 'svv1': '2.0.0'}
     """
     strategies = STRATEGY_REGISTRY.all()
     if not strategies:

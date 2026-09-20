@@ -9,7 +9,7 @@
 
 {% block content %}
 {% if not run %}
-  {{ empty("Backtest not found.", "❓") }}
+  {{ empty("Backtest not found.") }}
   <div class="mt-4">{{ back_link("/backtests", "Back to backtests") }}</div>
 {% else %}
 <div class="space-y-6">
@@ -214,8 +214,7 @@
       {% else %}
         {{ empty(
           "No bars in the local store for " ~ (selected_symbol or "this symbol") ~
-          " over the run window. Run `stockscan refresh bars " ~ (selected_symbol or "<SYM>") ~ "` first.",
-          "📉"
+          " over the run window. Run `stockscan refresh bars " ~ (selected_symbol or "<SYM>") ~ "` first."
         ) }}
       {% endif %}
 
@@ -276,13 +275,12 @@
                 <td class="px-4 py-1.5 text-xs">
                   {% if t.exit_reason %}
                     {% set reason_color = {
-                      'hard_stop': 'bad-600',
-                      'macd_below_zero': 'warn-600',
+                      'stop_loss': 'bad-600',
+                      'below_sma100': 'warn-600',
+                      'left_near_high_set': 'warn-600',
                       'time_stop': 'ink-500',
-                      'reached_profit_sma': 'ok-600',
-                      'mean_reverted_above_sma5': 'ok-600',
-                      'chandelier_stop': 'ok-600',
-                      'exit_below_n_day_low': 'bad-600',
+                      'recovered_above_sma5': 'ok-600',
+                      'rsi_recovered': 'ok-600',
                       'end_of_backtest': 'ink-500',
                     } %}
                     <span class="px-1.5 py-0.5 rounded text-[10px] bg-{{ reason_color.get(t.exit_reason, 'ink-500') }}/10 text-{{ reason_color.get(t.exit_reason, 'ink-700') }} border border-{{ reason_color.get(t.exit_reason, 'ink-300') }}/30 font-mono">
@@ -309,7 +307,7 @@
         </table>
       </div>
     {% else %}
-      {{ empty("No trades in this run.", "📭") }}
+      {{ empty("No trades in this run.") }}
     {% endif %}
   {% endcall %}
 

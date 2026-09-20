@@ -10,16 +10,11 @@ from __future__ import annotations
 import hashlib
 import inspect
 import json
-import warnings
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, ClassVar
 
-from pydantic import BaseModel
-
 if TYPE_CHECKING:
-    from collections.abc import Mapping
     from datetime import date
-    from decimal import Decimal
 
     import pandas as pd
 
@@ -28,22 +23,6 @@ if TYPE_CHECKING:
         PositionSnapshot,
         RawSignal,
     )
-
-# Canonical regime label set. Used by ``__init_subclass__`` when deriving
-# ``regime_affinity`` from the deprecated ``applicable_regimes`` so the
-# derived mapping covers every label explicitly (in-set → 1.0, out-of-set
-# → 0.0) rather than relying on per-lookup defaults.
-_ALL_REGIME_LABELS: tuple[str, ...] = (
-    "trending_up",
-    "trending_down",
-    "choppy",
-    "transitioning",
-)
-
-
-class StrategyParams(BaseModel):
-    """Subclass per strategy. Pydantic provides validation + JSON schema export."""
-
 
 class _Registry:
     """In-process registry. Populated by `__init_subclass__` on Strategy."""
@@ -89,9 +68,10 @@ STRATEGY_REGISTRY = _Registry()
 class Strategy(ABC):
     """Strategy contract.
 
-    Subclasses must declare the class attributes (`name`, `version`,
-    `display_name`, `description`, `params_model`) and implement
-    `required_history`, `signals`, and `exit_rules`.
+    Subclasses declare the class attributes (`name`, `version`,
+    `display_name`, `description`), keep every tunable knob as a ClassVar
+    constant on the class (edit the file and bump `version` to change one),
+    and implement `required_history`, `signals`, and `exit_rules`.
 
     Subclassing this triggers automatic registration.
     """
@@ -103,12 +83,21 @@ class Strategy(ABC):
     description: ClassVar[str] = ""  # one-paragraph teaser (UI cards)
     manual: ClassVar[str] = ""  # long-form, beginner-friendly walkthrough
     tags: ClassVar[tuple[str, ...]] = ()
-    # Optional. Set this on a subclass when the strategy wants pydantic-validated
-    # params (useful for backtest parameter sweeps). Strategies that prefer to
-    # keep all knobs as ClassVar constants in the file (the "edit-and-bump"
-    # model) leave this as None and instantiate with no arguments.
-    params_model: ClassVar[type[StrategyParams] | None] = None
+
+    # ----- Sizing -----
+    # Stop-based strategies risk ``default_risk_pct`` of equity per trade;
+    # share count follows from the stop distance. Strategies that emit no
+    # stop (mean reversion, where stops hurt — Kaminski & Lo 2014) set
+    # ``position_pct`` instead and get a fixed fraction of equity per slot.
     default_risk_pct: ClassVar[float] = 0.01
+    position_pct: ClassVar[float | None] = None
+    # Cap on this strategy's own open positions (the portfolio-wide cap in
+    # config still applies). None = only the portfolio cap.
+    max_open_positions: ClassVar[int | None] = None
+    # Whether the regime layer's realized-vol scalar shrinks this strategy's
+    # size in high-vol markets. True for momentum (that is where momentum
+    # crashes); False for mean reversion (reversal pays best in high vol).
+    sizes_down_in_high_vol: ClassVar[bool] = True
     # Non-bar data the strategy reads from the DB (provider feature names,
     # see stockscan.data.providers.base.ALL_FEATURES). Bars are implicit.
     # Purely informational: the strategy page uses it to show "fundamentals
@@ -116,47 +105,9 @@ class Strategy(ABC):
     # refreshes that input. Empty = bars only.
     data_dependencies: ClassVar[tuple[str, ...]] = ()
 
-    # ----- Regime preferences (v2 — soft sizing) -----
-    # ``regime_affinity`` maps regime label → weight in [0, 1]. The runner
-    # multiplies a signal's base position size by this weight (along with
-    # the continuous composite-score multiplier) instead of gating signals
-    # on/off. Missing labels fall back to ``default_affinity`` (1.0 =
-    # neutral). An empty mapping means "no preference" — the strategy runs
-    # at full sizing in every regime.
-    regime_affinity: ClassVar[Mapping[str, float]] = {}
-    default_affinity: ClassVar[float] = 1.0
-
-    # ----- Deprecated v1 gate -----
-    # ``applicable_regimes`` is the old hard-gate API. If a subclass declares
-    # this and not ``regime_affinity``, ``__init_subclass__`` derives the
-    # affinity mapping (in-set → 1.0, out-of-set → 0.0) and emits a
-    # ``DeprecationWarning``. Declaring both is a hard error.
-    applicable_regimes: ClassVar[frozenset[str]] = frozenset()
-
     # Subclasses set this to True if they should NOT be auto-registered
     # (e.g., abstract intermediate base classes).
     __abstract__: ClassVar[bool] = False
-
-    def __init__(self, params: StrategyParams | None = None) -> None:
-        # Strategies that declare ``params_model`` accept a pydantic instance
-        # (and validate it); strategies that keep their knobs as ClassVar
-        # constants accept no params at all and ``self.params`` is None.
-        if self.params_model is None:
-            if params is not None:
-                raise TypeError(
-                    f"{type(self).__name__} declares no params_model — "
-                    f"instantiate with no arguments (got {type(params).__name__})."
-                )
-            self.params: StrategyParams | None = None
-            return
-        if params is None:
-            params = self.params_model()
-        if not isinstance(params, self.params_model):
-            raise TypeError(
-                f"{type(self).__name__} expected params of type "
-                f"{self.params_model.__name__}, got {type(params).__name__}"
-            )
-        self.params = params
 
     # ----- contract methods -----
     @abstractmethod
@@ -174,24 +125,11 @@ class Strategy(ABC):
         bars: pd.DataFrame,
         as_of: date,
     ) -> ExitDecision | None:
-        """Return an exit decision, or None to hold."""
+        """Return an exit decision, or None to hold.
 
-    def ratchet_stop(
-        self,
-        position: PositionSnapshot,
-        bars: pd.DataFrame,
-        as_of: date,
-    ) -> Decimal | None:
-        """Return a new stop level, or None to keep the current one.
-
-        Called by the engine before the stop-loss check on every bar.
-        The engine enforces the "only ratchet up" invariant: if the
-        returned value is lower than the current stop, it's ignored.
-
-        Override in concrete strategies to implement periodic ATR-based
-        stop resets. The default returns None (no ratcheting).
+        Exits — including any stop — are the strategy's decision alone; the
+        engine and the live runner apply no stop of their own.
         """
-        return None
 
     # ----- helpers used by the framework -----
     @classmethod
@@ -206,83 +144,41 @@ class Strategy(ABC):
         except (TypeError, OSError):
             return "unknown"
 
-    @classmethod
-    def params_json_schema(cls) -> dict[str, object] | None:
-        """JSON Schema for the strategy's params, or None when the strategy
-        doesn't expose a pydantic params model."""
-        if cls.params_model is None:
-            return None
-        return cls.params_model.model_json_schema()
+    _METADATA_ATTRS: ClassVar[frozenset[str]] = frozenset(
+        {"name", "version", "display_name", "description", "manual", "tags",
+         "data_dependencies"}
+    )
 
     @classmethod
-    def hash_params(cls, params: StrategyParams | None) -> str:
-        """Stable SHA-256 of canonical-JSON params (or of the empty object when
-        the strategy has no params_model)."""
-        if params is None:
-            canonical = "{}"
-        else:
-            canonical = json.dumps(
-                params.model_dump(mode="json"),
-                sort_keys=True,
-                separators=(",", ":"),
-            )
+    def knobs(cls) -> dict[str, int | float | str | bool]:
+        """Every tunable constant declared on this class, for the strategy
+        page, the run record and the CLI. Sizing attributes count as knobs."""
+        out: dict[str, int | float | str | bool] = {}
+        for klass in reversed(cls.__mro__):
+            for key, value in vars(klass).items():
+                if key.startswith("_") or key in cls._METADATA_ATTRS:
+                    continue
+                if isinstance(value, (int, float, str, bool)) and not isinstance(value, type):
+                    out[key] = value
+        return out
+
+    @classmethod
+    def knobs_hash(cls) -> str:
+        """Stable SHA-256 of the knob dict — the run record's identity for
+        'which settings produced this'."""
+        canonical = json.dumps(cls.knobs(), sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
-
-    @classmethod
-    def affinity_for(cls, label: str) -> float:
-        """Return this strategy's affinity weight for ``label`` in [0, 1].
-
-        Lookup precedence:
-          1. The label is in ``regime_affinity`` → return the stored weight.
-          2. The mapping is empty AND ``label`` is unknown → ``default_affinity``.
-          3. The mapping is non-empty but doesn't include ``label`` →
-             ``default_affinity`` (the regime label set may grow over time;
-             unknown labels are treated as neutral, not as "blocked").
-
-        The runner multiplies the base position size by this weight and by
-        the composite-score multiplier to get the final sizing factor.
-        """
-        if label in cls.regime_affinity:
-            return float(cls.regime_affinity[label])
-        return cls.default_affinity
 
     # ----- auto-registration -----
     def __init_subclass__(cls, **kwargs: object) -> None:
         super().__init_subclass__(**kwargs)
         if getattr(cls, "__abstract__", False):
             return
-        # Verify required class attributes exist before registering.
-        # params_model is intentionally NOT in this set — it is optional;
-        # strategies that keep their knobs as ClassVar constants leave it None.
         for attr in ("name", "version", "display_name"):
             if not hasattr(cls, attr):
                 raise TypeError(
                     f"Strategy subclass {cls.__name__} is missing required class "
                     f"attribute '{attr}'."
                 )
-
-        # Migrate the deprecated ``applicable_regimes`` gate to the new
-        # ``regime_affinity`` mapping. ``cls.__dict__`` (not ``cls.X``)
-        # so we only inspect THIS subclass's declarations, not anything
-        # inherited from Strategy itself.
-        legacy = cls.__dict__.get("applicable_regimes")
-        new = cls.__dict__.get("regime_affinity")
-        if legacy and new:
-            raise TypeError(
-                f"Strategy {cls.__name__} declares both 'applicable_regimes' "
-                f"(deprecated) and 'regime_affinity'. Pick one — prefer the "
-                f"new 'regime_affinity' mapping for soft sizing."
-            )
-        if legacy and not new:
-            derived: dict[str, float] = {
-                label: 1.0 if label in legacy else 0.0 for label in _ALL_REGIME_LABELS
-            }
-            cls.regime_affinity = derived
-            warnings.warn(
-                f"Strategy {cls.name!r} uses deprecated 'applicable_regimes'. "
-                f"Migrate to 'regime_affinity = {derived!r}' for soft sizing.",
-                DeprecationWarning,
-                stacklevel=2,
-            )
 
         STRATEGY_REGISTRY.register(cls)

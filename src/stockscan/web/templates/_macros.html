@@ -22,12 +22,40 @@
   <span class="inline-flex items-center text-xs px-2 py-0.5 rounded border {{ classes.get(kind, classes['neutral']) }}">{{ label }}</span>
 {% endmacro %}
 
-{% macro empty(message, icon="📭") %}
-  <div class="text-center text-ink-500 py-8">
-    <div class="text-3xl mb-2">{{ icon }}</div>
-    <p class="text-sm">{{ message }}</p>
-  </div>
+{% macro empty(message) %}
+  <p class="text-sm text-ink-500 text-center py-6">{{ message }}</p>
 {% endmacro %}
+
+{# Regime label → coloured chip. The label→colour mapping lives here only. #}
+{% macro regime_badge(label) -%}
+  {%- set kinds = {'risk_on': 'ok', 'risk_off': 'warn', 'credit_stress': 'bad'} -%}
+  {{ badge((label or "?") | replace("_", " "), kinds.get(label, 'neutral')) }}
+{%- endmacro %}
+
+{# Signed (coloured by sign) or plain money amount, thousands-separated,
+   no currency symbol. `decimals` picks the precision. #}
+{% macro money(value, signed=True, decimals=0) -%}
+  {%- if value is none -%}
+    <span class="text-ink-400">—</span>
+  {%- elif signed -%}
+    <span class="tabular-nums {{ 'text-ok-600' if value >= 0 else 'text-bad-600' }}">{{ "{:+,.{p}f}".format(value|float, p=decimals) }}</span>
+  {%- else -%}
+    <span class="tabular-nums">{{ "{:,.{p}f}".format(value|float, p=decimals) }}</span>
+  {%- endif -%}
+{%- endmacro %}
+
+{# Labelled stat with an optional one-line explanation under the label. #}
+{% macro stat_row(label, value, explanation=None) -%}
+  <div class="flex items-baseline justify-between gap-3 py-1.5 border-b border-ink-300/30 last:border-b-0">
+    <div class="min-w-0">
+      <div class="text-sm text-ink-700 font-medium">{{ label }}</div>
+      {% if explanation %}
+        <div class="text-xs text-ink-500 mt-0.5 leading-snug">{{ explanation }}</div>
+      {% endif %}
+    </div>
+    <div class="text-sm flex-shrink-0 text-right">{{ value }}</div>
+  </div>
+{%- endmacro %}
 
 {% macro stat(label, value, sub=None, kind="neutral") %}
   {%- set color = {
@@ -53,11 +81,12 @@
 
 
 {# ====================================================================
-   Pass 1 additions — shared UI primitives. Import them per-template:
-     {% from "_macros.html" import tooltip, time_ago, tech_score,
-        confirm_button, table_header, mobile_list_open, mobile_list_close,
-        loading_spinner, back_link, page_header, toast_region, toast,
-        field_label, field_error, sort_header %}
+   Shared UI primitives. Import them per-template:
+     {% from "_macros.html" import tooltip, time_ago,
+        confirm_button, table_open, table_close, mobile_list_open,
+        mobile_list_close, signal_row, loading_spinner, back_link,
+        page_header, toast_region, toast, field_label, field_error,
+        sort_header %}
    ==================================================================== #}
 
 {# ----- tooltip ---------------------------------------------------------
@@ -99,37 +128,6 @@
 {% endmacro %}
 
 
-{# ----- tech_score -----------------------------------------------------
-   Signed [-1, +1] technical confirmation score rendered as a small
-   coloured chip. Consolidates _tech_score_badge (signals) and
-   tech_score_badge (watchlist).
-#}
-{% macro tech_score(score) %}
-  {%- if score is none -%}
-    <span class="text-xs text-ink-500">—</span>
-  {%- else -%}
-    {%- set s = score|float -%}
-    {%- if s > 0.05 -%}
-      <span class="inline-flex items-center text-xs font-mono px-2 py-0.5 rounded
-                   bg-ok-100 text-ok-600 border border-ok-600/30"
-            title="Technical bias: bullish ({{ '%+.2f'|format(s) }})">
-        {{ "%+.2f"|format(s) }}
-      </span>
-    {%- elif s < -0.05 -%}
-      <span class="inline-flex items-center text-xs font-mono px-2 py-0.5 rounded
-                   bg-bad-100 text-bad-600 border border-bad-600/30"
-            title="Technical bias: bearish ({{ '%+.2f'|format(s) }})">
-        {{ "%+.2f"|format(s) }}
-      </span>
-    {%- else -%}
-      <span class="inline-flex items-center text-xs font-mono px-2 py-0.5 rounded
-                   bg-ink-100 text-ink-500 border border-ink-300/60"
-            title="Technical bias: neutral ({{ '%+.2f'|format(s) }})">
-        {{ "%+.2f"|format(s) }}
-      </span>
-    {%- endif -%}
-  {%- endif -%}
-{% endmacro %}
 
 
 {# ----- back_link / page_header --------------------------------------
@@ -151,20 +149,9 @@
 {% endmacro %}
 
 
-{# ----- loading_spinner ----------------------------------------------
-   A 12px CSS spinner + optional label. For HTMX, wrap with the
-   `htmx-indicator` class on the parent so it auto-shows during requests.
-#}
-{% macro loading_spinner(label="") %}
-  <span class="inline-flex items-center gap-1.5 text-xs text-ink-500">
-    <span class="inline-block w-3 h-3 border-2 border-ink-300 border-t-ink-700 rounded-full animate-spin"
-          aria-hidden="true"></span>
-    {%- if label %} {{ label }}{% endif %}
-  </span>
-{% endmacro %}
 
 
-{# ----- table_header / mobile_list_open / mobile_list_close ----------
+{# ----- table_open / table_close / mobile_list_open / mobile_list_close --
    Standard wrappers for the "desktop table + mobile cards" pattern
    used by trades/list, backtests/list, watchlist/list. Templates still
    render their own row markup (cell shapes vary too much to abstract);
@@ -173,11 +160,17 @@
 
    Headers is a list of dicts:
      {label: "Symbol", align: "left"|"right"|"center", help: "tooltip text"}
-   `align` defaults to "left", `help` is optional.
+   `align` defaults to "left", `help` is optional; an empty list renders
+   no <thead>. `label` may be pre-rendered markup (e.g. sort_header()).
+
+   `mobile` is "hide" (the table is replaced by a card list below sm) or
+   "scroll" (always shown, horizontally scrollable — pair with a
+   `table_classes` min-width such as "min-w-[560px]").
 #}
-{% macro table_open(headers, classes="") %}
-  <div class="hidden sm:block overflow-x-auto -mx-4 {{ classes }}">
-    <table class="w-full text-sm">
+{% macro table_open(headers, classes="", mobile="hide", table_classes="") %}
+  <div class="{% if mobile == 'hide' %}hidden sm:block {% endif %}overflow-x-auto -mx-4 {{ classes }}">
+    <table class="w-full text-sm {{ table_classes }}">
+      {% if headers %}
       <thead class="text-xs uppercase text-ink-500 border-b border-ink-300/40">
         <tr>
           {% for h in headers %}
@@ -188,6 +181,7 @@
           {% endfor %}
         </tr>
       </thead>
+      {% endif %}
       <tbody class="divide-y divide-ink-300/40">
 {% endmacro %}
 
@@ -203,6 +197,71 @@
 
 {% macro mobile_list_close() %}
   </ul>
+{% endmacro %}
+
+
+{# ----- signal_row ---------------------------------------------------
+   One passing signal, shared by the Signals page and the dashboard's
+   latest-scan card: a <tr> for table_open() (columns Symbol, Side,
+   Strategy, Score, Entry, Stop, Qty, Date, actions) or, with
+   mobile=True, an <li> for mobile_list_open(). `actions` is optional
+   pre-rendered markup (e.g. a watch button) placed with the row's links.
+#}
+{% macro signal_row(sig, mobile=False, actions=None) %}
+  {%- set score = "%.2f"|format(sig.score|float) if sig.score is not none else "—" -%}
+  {%- set entry = ("$" ~ "%.2f"|format(sig.suggested_entry|float)) if sig.suggested_entry is not none else "—" -%}
+  {%- set stop = ("$" ~ "%.2f"|format(sig.suggested_stop|float)) if sig.suggested_stop is not none else "—" -%}
+  {% if mobile %}
+    <li class="px-4 py-3">
+      <div class="flex items-baseline justify-between">
+        <a href="/analysis/{{ sig.symbol }}" class="font-mono font-semibold text-base hover:underline"
+           title="Open analysis for {{ sig.symbol }}">{{ sig.symbol }}</a>
+        <span class="text-xs text-ink-500">{{ sig.as_of_date }}</span>
+      </div>
+      <div class="text-xs text-ink-700 mt-0.5 flex items-center gap-2">
+        <span>{{ badge(sig.side, "ok" if sig.side == "long" else "bad") }}</span>
+        <span>{{ sig.strategy_name }} · score {{ score }}</span>
+      </div>
+      <div class="text-xs mt-1 font-mono">
+        entry <span class="font-semibold">{{ entry }}</span>
+        · stop <span class="text-bad-600">{{ stop }}</span>
+        · qty {{ sig.suggested_qty or "—" }}
+      </div>
+      <div class="mt-2 flex gap-3 items-center">
+        <a href="/signals/{{ sig.signal_id }}#paper-trade"
+           class="inline-flex items-center gap-1 text-xs px-2 py-1 rounded border border-ok-600/30 bg-ok-100 text-ok-600"
+           title="Open paper trade from this signal">
+          Trade
+        </a>
+        <a href="/signals/{{ sig.signal_id }}/base-rates" class="text-xs underline">base rates</a>
+        <a href="/signals/{{ sig.signal_id }}" class="text-xs underline" title="Open signal detail">Open</a>
+        {% if actions %}{{ actions }}{% endif %}
+      </div>
+    </li>
+  {% else %}
+    <tr>
+      <td class="px-4 py-2 font-mono font-semibold">
+        <a href="/analysis/{{ sig.symbol }}" class="hover:underline" title="Open analysis for {{ sig.symbol }}">{{ sig.symbol }}</a>
+      </td>
+      <td class="px-4 py-2">{{ badge(sig.side, "ok" if sig.side == "long" else "bad") }}</td>
+      <td class="px-4 py-2 text-ink-700">{{ sig.strategy_name }}</td>
+      <td class="px-4 py-2 text-right">{{ score }}</td>
+      <td class="px-4 py-2 text-right font-mono">{{ entry }}</td>
+      <td class="px-4 py-2 text-right font-mono text-bad-600">{{ stop }}</td>
+      <td class="px-4 py-2 text-right">{{ sig.suggested_qty or "—" }}</td>
+      <td class="px-4 py-2 text-ink-500 text-xs">{{ sig.as_of_date }}</td>
+      <td class="px-4 py-2 text-right whitespace-nowrap space-x-3">
+        <a href="/signals/{{ sig.signal_id }}#paper-trade"
+           class="inline-flex items-center gap-1 text-xs px-2 py-1 rounded border border-ok-600/30 bg-ok-100 text-ok-600 hover:bg-ok-600 hover:text-white transition-colors"
+           title="Open paper trade from this signal">
+          Trade
+        </a>
+        <a href="/signals/{{ sig.signal_id }}/base-rates" class="text-xs underline">base rates</a>
+        <a href="/signals/{{ sig.signal_id }}" class="text-xs underline" title="Open signal detail">Open</a>
+        {% if actions %}{{ actions }}{% endif %}
+      </td>
+    </tr>
+  {% endif %}
 {% endmacro %}
 
 
@@ -243,9 +302,6 @@
   </label>
 {% endmacro %}
 
-{% macro field_error(message) %}
-  {% if message %}<p class="text-xs text-bad-600 mt-1">⚠ {{ message }}</p>{% endif %}
-{% endmacro %}
 
 
 {# ----- confirm_button ----------------------------------------------

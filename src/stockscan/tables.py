@@ -20,7 +20,6 @@ from sqlalchemy import (
     MetaData,
     Numeric,
     PrimaryKeyConstraint,
-    String,
     Table,
     Text,
 )
@@ -121,10 +120,8 @@ strategy_versions = Table(
     PrimaryKeyConstraint("strategy_name", "strategy_version"),
 )
 
-# NOTE: strategy_configs was retired in migration 0016. Strategy tunable knobs
-# now live in the strategy file (ClassVar constants for the "edit-and-bump"
-# model, pydantic Field defaults for params_model strategies) and the live
-# runner uses file defaults directly — no DB shadow.
+# Strategy knobs live in the strategy file (ClassVar constants); there is no
+# DB shadow (strategy_configs was retired in migration 0016).
 
 strategy_runs = Table(
     "strategy_runs",
@@ -309,12 +306,11 @@ paper_trades = Table(
     Column("symbol", Text, nullable=False),
     Column("side", Text, nullable=False),
     Column("entry_price", Numeric(14, 6), nullable=False),
-    Column("stop_price", Numeric(14, 6), nullable=False),
+    Column("stop_price", Numeric(14, 6)),
     Column("target_price", Numeric(14, 6)),
     Column("qty", Integer, nullable=False),
     Column("opened_at", TIMESTAMP(timezone=True), nullable=False, server_default="NOW()"),
     Column("entry_signal_metadata", JSONB),
-    Column("entry_tech_score", JSONB),
     Column("entry_regime", JSONB),
     Column("entry_strategy_params", JSONB),
     Column("current_price", Numeric(14, 6)),
@@ -331,7 +327,6 @@ paper_trades = Table(
     Column("realized_pnl_pct", Numeric(8, 4)),
     Column("holding_days", Integer),
     Column("exit_signal_metadata", JSONB),
-    Column("exit_tech_score", JSONB),
     Column("exit_regime", JSONB),
     Column("exit_strategy_params", JSONB),
     Column("auto_close_rules", JSONB),

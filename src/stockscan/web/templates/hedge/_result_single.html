@@ -1,4 +1,4 @@
-{% macro money(v) %}<span class="{{ 'text-ok-600' if v >= 0 else 'text-bad-600' }}">{{ "{:+,.0f}".format(v) }}</span>{% endmacro %}
+{% from "_macros.html" import money %}
 {% macro spark(title, sp, color, fmt) %}
 <div class="bg-white rounded-xl shadow-sm border border-ink-300/40 p-3">
   <div class="flex justify-between text-xs text-ink-500 mb-1"><span>{{ title }}</span><span>last {{ fmt|format(sp.last) }}</span></div>
@@ -26,7 +26,7 @@
   </div>
   <div class="bg-white rounded-xl shadow-sm border border-ink-300/40 p-3">
     <div class="text-xs text-ink-500">Trades / cost</div>
-    <div class="text-lg tabular-nums">{{ s.num_trades }} · <span class="text-ink-500">${{ "{:,.0f}".format(s.transaction_cost) }}</span></div>
+    <div class="text-lg tabular-nums">{{ s.num_trades }} · <span class="text-ink-500">${{ money(s.transaction_cost, signed=False) }}</span></div>
     <div class="text-xs text-ink-400">{{ s.shares_traded }} shares traded</div>
   </div>
   <div class="bg-white rounded-xl shadow-sm border border-ink-300/40 p-3">

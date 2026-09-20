@@ -13,9 +13,6 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from markupsafe import Markup
 from sqlalchemy.orm import Session
 
-from datetime import datetime as _datetime
-from datetime import timedelta as _timedelta
-from datetime import timezone as _tz
 
 from stockscan.analysis import (
     analyze_symbol,
@@ -26,7 +23,6 @@ from stockscan.analysis import (
 from stockscan.config import settings
 from stockscan.data.providers.eodhd import EODHDError, EODHDProvider
 from stockscan.earnings import latest_trend, next_earnings
-from stockscan.econ_events import upcoming_events
 from stockscan.insider import (
     net_buys_90d,
     recent_transactions,
@@ -56,9 +52,9 @@ def analysis_list(
     selected_id, selected_label = resolve_selection(list, session=s)
     lists = list_watchlists(session=s)
     raw_cards = analyze_watchlist_cards(list_id=selected_id, session=s)
-    # Each card carries the full interactive-chart payload (every study, S/R
-    # levels, expected-move bands, fib) so the hub charts have parity with the
-    # detail page. The static SVG is kept as a no-bars fallback.
+    # Each card carries the full interactive-chart payload (every study +
+    # expected-move bands) so the hub charts have parity with the detail
+    # page. The static SVG is kept as a no-bars fallback.
     cards = []
     for c in raw_cards:
         a = c["analysis"]
@@ -111,24 +107,8 @@ def analysis_detail(
     # SVG fallback only used when the interactive payload is empty
     # (no bars in store yet for this symbol). Cheap to render.
     chart_svg = Markup(render_chart_svg(analysis, width=1100, height=380))
-    # High-importance US macro events in the next 7 days — surfaced as a
-    # small badge above the chart so entry-timing decisions account for
-    # known vol catalysts.
-    now_utc = _datetime.now(_tz.utc)
-    try:
-        macro_events = upcoming_events(
-            start=now_utc,
-            end=now_utc + _timedelta(days=7),
-            country="US",
-            importance_min="high",
-            session=s,
-        )
-    except Exception:  # the badge is decorative — never block the page
-        log.exception("analysis_detail: upcoming_events failed for %s", sym)
-        macro_events = []
-
     # Next earnings + full per-period estimate trends — surfaced as a
-    # "Estimate revisions" card under the existing trend/vol/momentum trio.
+    # "Estimate revisions" card under the existing trend/vol pair.
     try:
         upcoming_earn = next_earnings(sym, session=s)
     except Exception:
@@ -164,7 +144,6 @@ def analysis_detail(
         analysis=analysis,
         chart_svg=chart_svg,
         chart_payload=chart_payload,
-        macro_events=macro_events,
         upcoming_earnings=upcoming_earn,
         earnings_trends=trends,
         insider_txns=insider_txns,

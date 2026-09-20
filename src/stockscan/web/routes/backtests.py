@@ -1,24 +1,169 @@
-"""Backtests pages — list + detail with equity curve, per-symbol price chart, and trade markers."""
+"""Backtests pages — list + detail with equity curve, per-symbol price chart, and trade markers.
+
+Endpoints:
+  GET  /backtests               — run form + job status + recent runs
+  POST /backtests/run           — start a background backtest job
+  GET  /backtests/run/status    — polling fragment for the running job
+  GET  /backtests/{run_id}      — single-run report
+"""
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
-from fastapi import APIRouter, Depends, Query, Request
+import logging
+from datetime import date, datetime, timedelta, timezone
+from fastapi import APIRouter, Depends, Form, Query, Request
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from stockscan.backtest.job import (
+    DEFAULT_CAPITAL,
+    DEFAULT_COMMISSION,
+    DEFAULT_SLIPPAGE_BPS,
+    DEFAULT_WINDOW_DAYS,
+    consume_finished as consume_backtest_job,
+    current_job as current_backtest_job,
+    start_backtest,
+)
 from stockscan.backtest.store import list_runs
 from stockscan.data.store import get_bars
-from stockscan.web.deps import get_session, render
+from stockscan.strategies import STRATEGY_REGISTRY, discover_strategies
+from stockscan.web.deps import attach_hx_toast, flash_redirect, get_session, render
 
 router = APIRouter(prefix="/backtests")
+log = logging.getLogger(__name__)
+
+
+def _form_ctx() -> dict[str, object]:
+    """Template context for ``backtests/_run_form.html`` — strategy choices
+    and the CLI's defaults so the form and ``backtest run`` agree."""
+    discover_strategies()
+    today = date.today()
+    return {
+        "strategies": STRATEGY_REGISTRY.all(),
+        "default_start": (today - timedelta(days=DEFAULT_WINDOW_DAYS)).isoformat(),
+        "default_end": today.isoformat(),
+        "default_capital": int(DEFAULT_CAPITAL),
+        "default_slippage_bps": DEFAULT_SLIPPAGE_BPS,
+        "default_commission": DEFAULT_COMMISSION,
+    }
+
+
+def _status_ctx(*, message: str | None = None) -> dict[str, object]:
+    """Template context for ``backtests/_run_status.html``.
+
+    While a job runs the fragment carries the running job and re-polls;
+    once finished the job is consumed here so the result line renders once.
+    """
+    job = current_backtest_job()
+    if job is not None and job.status == "running":
+        return {"job": job, "finished": None, "message": message}
+    return {"job": None, "finished": consume_backtest_job(), "message": message}
+
+
+def _parse_date(value: str | None) -> date | None:
+    """ISO date from a form field; '' means "use the CLI default"."""
+    if value is None or value.strip() == "":
+        return None
+    return date.fromisoformat(value.strip())
+
+
+def _parse_symbols(value: str | None) -> list[str] | None:
+    """Free-text symbols — whitespace/comma separated, upper-cased, de-duped
+    in order. Empty → None (point-in-time S&P 500 membership)."""
+    if not value:
+        return None
+    seen: dict[str, None] = {}
+    for tok in value.replace(",", " ").split():
+        seen.setdefault(tok.upper(), None)
+    return list(seen) or None
 
 
 @router.get("")
 def backtests_list(request: Request):
-    """List the 100 most recent backtest runs."""
+    """Run form, job status and the 100 most recent backtest runs."""
     runs = list_runs(limit=100)
-    return render(request, "backtests/list.html", runs=runs)
+    return render(
+        request, "backtests/list.html", runs=runs, **_form_ctx(), **_status_ctx(),
+    )
+
+
+@router.post("/run")
+def backtest_run(
+    request: Request,
+    strategy: str = Form(...),
+    start: str | None = Form(None),
+    end: str | None = Form(None),
+    capital: float = Form(DEFAULT_CAPITAL),
+    slippage_bps: float = Form(DEFAULT_SLIPPAGE_BPS),
+    commission: float = Form(DEFAULT_COMMISSION),
+    symbols: str | None = Form(None),
+    note: str | None = Form(None),
+):
+    """Start a backtest as a BACKGROUND job with the same inputs as
+    ``stockscan backtest run``; blank dates take the CLI defaults.
+
+    HTMX callers get the ``_run_status.html`` fragment (which polls
+    ``GET /backtests/run/status`` every 2 s); a plain form POST redirects
+    back to the list with a flash. Single-flight: a second POST while a job
+    runs is told so instead of starting another.
+    """
+    is_hx = request.headers.get("HX-Request") == "true"
+
+    def _respond(kind: str, message: str):
+        if not is_hx:
+            return flash_redirect("/backtests", kind, message)
+        response = render(request, "backtests/_run_status.html", **_status_ctx())
+        return attach_hx_toast(response, kind, message)
+
+    existing = current_backtest_job()
+    if existing is not None and existing.status == "running":
+        return _respond("info", "A backtest is already running — wait for it to finish")
+
+    try:
+        start_d = _parse_date(start)
+        end_d = _parse_date(end)
+    except ValueError:
+        return _respond("error", "Dates must be ISO (YYYY-MM-DD)")
+    if start_d and end_d and start_d >= end_d:
+        return _respond("error", "Start date must be before end date")
+    if capital <= 0:
+        return _respond("error", "Starting capital must be positive")
+
+    try:
+        _job, started_new = start_backtest(
+            strategy=strategy,
+            start=start_d,
+            end=end_d,
+            capital=capital,
+            slippage_bps=slippage_bps,
+            commission=commission,
+            symbols=_parse_symbols(symbols),
+            note=(note or "").strip() or None,
+        )
+    except KeyError:
+        return _respond("error", f"Unknown strategy: {strategy}")
+    if not started_new:
+        return _respond("info", "A backtest is already running — wait for it to finish")
+    return _respond("info", f"Backtest started — {strategy}, runs in the background")
+
+
+@router.get("/run/status")
+def backtest_run_status(request: Request):
+    """Polling endpoint for the background backtest.
+
+    While the job runs: the self-replacing status fragment (it re-polls
+    every 2 s). When it finishes: the same fragment with a link to the
+    saved report, or the error; the finished job is consumed so a stray
+    later poll doesn't re-announce it.
+    """
+    ctx = _status_ctx()
+    response = render(request, "backtests/_run_status.html", **ctx)
+    finished = ctx["finished"]
+    if finished is None:
+        return response
+    if finished.error:
+        return attach_hx_toast(response, "error", "Backtest failed")
+    return attach_hx_toast(response, "success", f"Backtest saved — run #{finished.run_id}")
 
 
 @router.get("/{run_id}")

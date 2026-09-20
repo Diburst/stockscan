@@ -36,12 +36,12 @@ class TradeResult:
     # Optional — present when the trade originated from a strategy that
     # specified a hard-stop level at entry. Required to compute r_multiple.
     entry_stop: Decimal | None = None
-    # Reason the strategy gave for the exit (e.g. 'macd_below_zero',
-    # 'hard_stop', 'time_stop'). 'end_of_backtest' for trades closed by the
+    # Reason the strategy gave for the exit (e.g. 'stop_loss',
+    # 'recovered_above_sma5', 'time_stop'). 'end_of_backtest' for trades closed by the
     # force-close at the end of the run.
     exit_reason: str | None = None
     # Snapshot of strategy.signals() metadata at entry time — RSI value,
-    # MACD histogram, etc. Populated by the engine, displayed in the UI.
+    # Populated by the engine, displayed in the UI.
     entry_metadata: dict[str, Any] | None = None
 
     @property

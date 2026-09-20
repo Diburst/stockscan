@@ -16,7 +16,7 @@
 
 {% block content %}
 {% if not pt %}
-  {{ empty("Paper trade not found.", "❓") }}
+  {{ empty("Paper trade not found.") }}
   <div class="mt-4">{{ back_link("/trades", "Back to trades") }}</div>
 {% else %}
 <div class="space-y-6">
@@ -49,7 +49,7 @@
       </div>
       <div>
         <dt class="text-xs text-ink-500 uppercase tracking-wide">Stop</dt>
-        <dd class="font-mono text-bad-600">${{ "%.2f"|format(pt.stop_price|float) }}</dd>
+        <dd class="font-mono {% if pt.stop_price is not none %}text-bad-600{% else %}text-ink-400{% endif %}">{% if pt.stop_price is not none %}${{ "%.2f"|format(pt.stop_price|float) }}{% else %}no stop{% endif %}</dd>
       </div>
       <div>
         <dt class="text-xs text-ink-500 uppercase tracking-wide">Target</dt>
@@ -166,26 +166,6 @@
             <dd>{{ _fmt(key, value) }}</dd>
           </div>
         {% endfor %}
-      </div>
-    {% endcall %}
-  {% endif %}
-
-  {% if pt.entry_tech_score %}
-    {% call card(title="Entry technical score") %}
-      <div class="text-sm">
-        {% if pt.entry_tech_score.score is not none %}
-          {%- set s = pt.entry_tech_score.score|float -%}
-          <span class="font-mono font-semibold text-lg
-                       {% if s > 0.05 %}text-ok-600{% elif s < -0.05 %}text-bad-600{% else %}text-ink-500{% endif %}">
-            {{ "%+.3f"|format(s) }}
-          </span>
-        {% endif %}
-        {% if pt.entry_tech_score.breakdown %}
-          <details class="mt-2 text-xs">
-            <summary class="text-ink-500 cursor-pointer">Breakdown</summary>
-            <pre class="mt-1 bg-ink-100 p-2 rounded overflow-auto">{{ pt.entry_tech_score.breakdown|tojson(indent=2) }}</pre>
-          </details>
-        {% endif %}
       </div>
     {% endcall %}
   {% endif %}

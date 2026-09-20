@@ -1,97 +1,64 @@
-"""Strategies page — read-only metadata view + meta-label model status."""
+"""Strategies page — read-only view of each strategy's knobs and sizing."""
 
 from __future__ import annotations
 
-from typing import Any
-
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Depends, Request
+from sqlalchemy import text
+from sqlalchemy.orm import Session
 
 from stockscan.config import settings
-from stockscan.ml import list_models, load_model
 from stockscan.strategies import STRATEGY_REGISTRY, discover_strategies
-from stockscan.web.deps import render, safe
+from stockscan.web.deps import get_session, render, safe
 
 router = APIRouter(prefix="/strategies")
 
-
-def _models_by_strategy() -> dict[str, Any]:
-    """Build a name→ModelArtifact lookup once per request.
-
-    Soft-fails to an empty dict on any error so the strategies page never
-    breaks because of a corrupted artifact.
-    """
-    models = safe(list_models, default=[], label="strategies.list_models")
-    return {a.strategy_name: a for a in models or []}
+_LATEST_SECTOR_BAR_SQL = text(
+    "SELECT MAX(bar_ts)::date FROM bars WHERE symbol LIKE '$EWSECTOR:%' AND interval = '1d'"
+)
 
 
 @router.get("")
 def strategies_list(request: Request):
-    """Read-only list of every registered strategy, each annotated with its
-    meta-label model status (soft-fails to no models on artifact errors)."""
+    """Read-only list of every registered strategy."""
     discover_strategies()
-    return render(
-        request,
-        "strategies/list.html",
-        strategies=STRATEGY_REGISTRY.all(),
-        models_by_strategy=_models_by_strategy(),
-    )
+    return render(request, "strategies/list.html", strategies=STRATEGY_REGISTRY.all())
 
 
 @router.get("/{name}")
-def strategy_detail(name: str, request: Request):
-    """Single strategy view: metadata, the params JSON schema or — for
-    strategies that keep their knobs as ClassVar constants — a tuning-knobs
-    table built from the class attributes, plus its meta-label model
-    artifact. Unknown names render the empty-state page."""
+def strategy_detail(name: str, request: Request, s: Session = Depends(get_session)):
+    """Single strategy view: metadata, the sizing rule, the tuning-knobs
+    table read off the class, and the freshness of any non-bar data it
+    depends on. Unknown names render the empty-state page."""
     discover_strategies()
     try:
         cls = STRATEGY_REGISTRY.get(name)
     except KeyError:
-        return render(request, "strategies/detail.html", strategy=None, model=None)
+        return render(request, "strategies/detail.html", strategy=None)
 
-    # Load this strategy's model artifact directly (single-file lookup;
-    # cheaper than walking the whole models dir).
-    model_artifact = safe(lambda: load_model(name), label=f"load_model[{name}]")
-
-    # Strategies that keep their knobs as ClassVar constants in the file
-    # (no params_model) get a "Tuning knobs" table built from the class's
-    # own primitive attributes; strategies with a params_model fall through
-    # to the JSON-schema panel.
-    knobs: list[tuple[str, object]] | None = None
-    if cls.params_model is None:
-        skip = {"name", "version", "display_name", "description", "manual",
-                "tags", "regime_affinity", "default_affinity",
-                "applicable_regimes", "params_model"}
-        knobs = [
-            (k, v) for k, v in vars(cls).items()
-            if not k.startswith("_")
-            and k not in skip
-            and isinstance(v, (int, float, str, bool))
-        ]
-
-    # Freshness of non-bar inputs (e.g. the fundamentals snapshot behind
-    # largecap_rebound's market-cap filter). Only queried when declared.
+    # Freshness of non-bar inputs. Sector composites are built locally from
+    # bars plus the fundamentals sector map, so they keep refreshing on any
+    # plan; provider feature families only refresh when the plan allows.
     data_inputs: list[dict[str, object]] = []
     for feature in cls.data_dependencies:
         as_of = None
+        refreshing = feature in settings.eodhd_feature_set
         if feature == "fundamentals":
             from stockscan.fundamentals.store import snapshot_as_of
 
             as_of = safe(snapshot_as_of, label="fundamentals.snapshot_as_of")
-        data_inputs.append(
-            {
-                "feature": feature,
-                "as_of": as_of,
-                "refreshing": feature in settings.eodhd_feature_set,
-            }
-        )
+        elif feature == "sector_composites":
+            row = safe(
+                lambda: s.execute(_LATEST_SECTOR_BAR_SQL).first(),
+                label="strategies.latest_sector_bar",
+            )
+            as_of = row[0] if row is not None else None
+            refreshing = True
+        data_inputs.append({"feature": feature, "as_of": as_of, "refreshing": refreshing})
 
     return render(
         request,
         "strategies/detail.html",
         strategy=cls,
-        schema=cls.params_json_schema(),
-        knobs=knobs,
-        model=model_artifact,
+        knobs=cls.knobs(),
         data_inputs=data_inputs,
     )

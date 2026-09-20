@@ -4,7 +4,7 @@ Conventions:
   - Inputs are pandas Series or DataFrames indexed by datetime (asc).
   - Outputs are Series/DataFrames aligned to the input index.
   - Insufficient-history positions are NaN, never zero or fill-forward.
-  - Wilder smoothing (used in RSI, ATR, ADX) implemented as the standard
+  - Wilder smoothing (used in RSI and ATR) implemented as the standard
     recursive EMA with alpha = 1/period (NOT the pandas ewm default).
 """
 
@@ -32,13 +32,13 @@ def _wilder_smoothing(series: pd.Series, period: int) -> pd.Series:
 
     The first value is the simple mean of the first `period` observations;
     subsequent values use the recursion: y[t] = y[t-1] + (x[t] - y[t-1]) / period.
-    Matches the canonical RSI / ATR / ADX behavior used in TA literature.
+    Matches the canonical RSI / ATR behavior used in TA literature.
 
     The recursion is sequential (each step depends on the previous), so it
     can't be vectorised — but it can be run on a NumPy ndarray instead of a
     pandas Series, skipping the per-write block-consolidation and
     chained-assignment plumbing that dominated cProfile (~80% of total
-    backtest runtime on a 10-symbol × 1-year reversal_swing run, with
+    backtest runtime on a 10-symbol × 1-year backtest run, with
     pandas ``__setitem__`` accounting for 2.3M of 2.5M cumulative calls).
     Same math, same seed, same NaN propagation — just no pandas overhead
     in the hot loop. ~50× faster on this function at scale.
@@ -101,102 +101,6 @@ def atr(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> 
     return _wilder_smoothing(tr, period)
 
 
-# ---------------------------------------------------------------------
-# Donchian channel
-# ---------------------------------------------------------------------
-def donchian_channel(
-    high: pd.Series,
-    low: pd.Series,
-    period: int = 20,
-) -> pd.DataFrame:
-    """Donchian channel: rolling max of high, rolling min of low, midpoint.
-
-    Returns a DataFrame with columns [upper, lower, middle].
-    The current bar is INCLUDED in the window — for "is today a new
-    20-day high?" tests, compare today's close to `upper.shift(1)`.
-    """
-    upper = high.rolling(window=period, min_periods=period).max()
-    lower = low.rolling(window=period, min_periods=period).min()
-    middle = (upper + lower) / 2
-    return pd.DataFrame({"upper": upper, "lower": lower, "middle": middle})
-
-
-# ---------------------------------------------------------------------
-# ADX (Average Directional Index)
-# ---------------------------------------------------------------------
-def adx(
-    high: pd.Series,
-    low: pd.Series,
-    close: pd.Series,
-    period: int = 14,
-) -> pd.Series:
-    """ADX with Wilder smoothing. Range [0, 100]; >25 = strong trend."""
-    up_move = high.diff()
-    down_move = -low.diff()
-
-    plus_dm = pd.Series(
-        np.where((up_move > down_move) & (up_move > 0), up_move, 0.0),
-        index=high.index,
-    )
-    minus_dm = pd.Series(
-        np.where((down_move > up_move) & (down_move > 0), down_move, 0.0),
-        index=high.index,
-    )
-
-    tr = true_range(high, low, close)
-
-    atr_w = _wilder_smoothing(tr, period)
-    plus_di = 100 * _wilder_smoothing(plus_dm, period) / atr_w.replace(0, np.nan)
-    minus_di = 100 * _wilder_smoothing(minus_dm, period) / atr_w.replace(0, np.nan)
-
-    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
-    return _wilder_smoothing(dx.fillna(0.0), period)
-
-
-# ---------------------------------------------------------------------
-# MACD — Moving Average Convergence Divergence
-# ---------------------------------------------------------------------
-def macd(
-    close: pd.Series,
-    fast: int = 12,
-    slow: int = 26,
-    signal: int = 9,
-) -> pd.DataFrame:
-    """MACD with the canonical 12/26/9 EMA periods.
-
-    Returns a DataFrame with columns:
-      - macd      : EMA(fast) − EMA(slow)
-      - signal    : EMA(macd, signal)
-      - histogram : macd − signal
-
-    Histogram > 0 + rising = bullish acceleration;
-    histogram < 0 + falling = bearish acceleration.
-    """
-    ema_fast = ema(close, fast)
-    ema_slow = ema(close, slow)
-    macd_line = ema_fast - ema_slow
-    signal_line = ema(macd_line, signal)
-    histogram = macd_line - signal_line
-    return pd.DataFrame(
-        {"macd": macd_line, "signal": signal_line, "histogram": histogram}
-    )
-
-
-# ---------------------------------------------------------------------
-# Bollinger Bands
-# ---------------------------------------------------------------------
-def bollinger_bands(close: pd.Series, period: int = 20, stddev: float = 2.0) -> pd.DataFrame:
-    """Bollinger bands: SMA ± stddev × rolling std."""
-    middle = sma(close, period)
-    std = close.rolling(window=period, min_periods=period).std(ddof=0)
-    upper = middle + stddev * std
-    lower = middle - stddev * std
-    return pd.DataFrame({"upper": upper, "middle": middle, "lower": lower})
-
-
-# ---------------------------------------------------------------------
-# Liquidity
-# ---------------------------------------------------------------------
 def avg_dollar_volume(close: pd.Series, volume: pd.Series, period: int = 20) -> pd.Series:
     """Rolling average of close × volume — the liquidity floor used by filters."""
     return (close.astype(float) * volume.astype(float)).rolling(

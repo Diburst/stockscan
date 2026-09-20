@@ -14,60 +14,6 @@ if TYPE_CHECKING:
 
 
 @dataclass(frozen=True, slots=True)
-class Level:
-    """One support or resistance level with strength scoring.
-
-    Levels are price values where the symbol has historically reversed.
-    The ``strength`` field is a [0, 1] composite of volume-weighted
-    touches, recency, and pivot prominence — higher means more
-    historically significant.
-
-    **Polarity / role-reversal.** ``kind`` is set from the level's
-    relationship to the *current* close, not from the pivot type that
-    originally produced it: anything below current price is "support",
-    anything above is "resistance". The pivot origin is preserved
-    separately in ``origin``. When ``kind`` and ``origin`` disagree,
-    the level has flipped roles - a broken resistance now acting as
-    support, or a broken support now acting as resistance. Use the
-    ``is_flipped`` property to detect that case in the UI; flipped
-    levels are notable setups in classical TA and worth surfacing
-    distinctly from never-tested levels.
-
-    **Weekly confirmation.** ``confirmed_by_weekly`` is True when the
-    level's cluster price also matches a pivot on the weekly resample
-    of the bar history (within the same cluster tolerance). Multi-
-    timeframe confirmation is a long-standing strength tiebreak in
-    classical TA — a level that shows up on both timeframes is harder
-    structure than one that only shows up daily. Use this flag to
-    visually emphasise such levels (e.g., a thicker / solid line vs.
-    dashed for daily-only).
-    """
-
-    price: float
-    kind: str  # 'support' | 'resistance' — determined by price vs last_close
-    strength: float  # [0, 1]
-    touches: int  # how many times price reversed near this level
-    last_touch_days_ago: int  # 0 = today, larger = older
-    distance_pct: float  # signed % from current close (negative = below)
-    origin: str = "pivot_high"  # 'pivot_high' | 'pivot_low' — pivot type that produced this level
-    confirmed_by_weekly: bool = False  # True if a weekly-pivot exists within cluster tolerance
-
-    @property
-    def is_flipped(self) -> bool:
-        """True when role differs from pivot origin (broken-and-reversed level).
-
-        ``pivot_high`` origin + ``support`` kind = an old resistance the
-        market broke through and is now defending as floor.
-        ``pivot_low`` origin + ``resistance`` kind = an old support the
-        market broke through and is now hitting as ceiling.
-        """
-        return (
-            (self.origin == "pivot_high" and self.kind == "support")
-            or (self.origin == "pivot_low" and self.kind == "resistance")
-        )
-
-
-@dataclass(frozen=True, slots=True)
 class ExpectedRange:
     """Forward-projected price range at one horizon, ±1sigma from current price.
 
@@ -103,7 +49,6 @@ class TrendState:
     sma_20: float | None
     sma_50: float | None
     sma_200: float | None
-    adx_14: float | None
     # Distance of close from each MA, in % (signed; positive = above MA)
     pct_above_sma20: float | None
     pct_above_sma50: float | None
@@ -120,7 +65,7 @@ class TrendState:
             explanation="Insufficient bars to assess trend.",
             return_5d=None, return_21d=None, return_63d=None,
             ma_alignment="mixed",
-            sma_20=None, sma_50=None, sma_200=None, adx_14=None,
+            sma_20=None, sma_50=None, sma_200=None,
             pct_above_sma20=None, pct_above_sma50=None,
             pct_above_sma200=None, emas={},
         )
@@ -133,7 +78,6 @@ class VolatilityState:
     realized_vol_63d_pct: float | None
     atr_14: float | None  # in dollars
     atr_pct_of_price: float | None  # ATR as % of current price
-    bb_width_pct: float | None  # (upper - lower) / middle, as %
     hv_percentile: float | None  # 0-100; current 21d realized vol's rank in 252-day distribution
     expected_7d: ExpectedRange | None
     expected_30d: ExpectedRange | None
@@ -151,34 +95,11 @@ class VolatilityState:
         return cls(
             available=False, realized_vol_21d_pct=None,
             realized_vol_63d_pct=None, atr_14=None,
-            atr_pct_of_price=None, bb_width_pct=None,
+            atr_pct_of_price=None,
             hv_percentile=None, expected_7d=None, expected_30d=None,
             bucket="?", label="n/a",
             explanation="Insufficient bars to compute volatility metrics.",
             ewma_vol_pct=None,
-        )
-
-
-@dataclass(frozen=True, slots=True)
-class MomentumState:
-    available: bool
-    rsi_14: float | None
-    rsi_bucket: str  # 'oversold' | 'low' | 'neutral' | 'high' | 'overbought' | '?'
-    rsi_label: str
-    macd_line: float | None
-    macd_signal: float | None
-    macd_histogram: float | None
-    macd_state: str  # 'bullish_cross' | 'bullish' | 'neutral' | 'bearish' | 'bearish_cross' | '?'
-    macd_label: str
-    explanation: str
-
-    @classmethod
-    def unavailable(cls) -> MomentumState:
-        return cls(
-            available=False, rsi_14=None, rsi_bucket="?",
-            rsi_label="n/a", macd_line=None, macd_signal=None,
-            macd_histogram=None, macd_state="?", macd_label="n/a",
-            explanation="Insufficient bars to compute momentum.",
         )
 
 
@@ -188,7 +109,7 @@ class OptionStrike:
 
     Produced by :mod:`stockscan.analysis.black_scholes` and carried on the
     :class:`OptionsContext` so the analysis page can show a concrete strike
-    instead of only a vague "sell premium above resistance" hint.
+    instead of only a vague "sell premium" hint.
 
     The vol fed into the model is **realized** HV (21-day), not option-
     implied vol - we have no chain. ``vol_pct`` and ``rate_pct`` record the
@@ -210,8 +131,8 @@ class OptionStrike:
     vol_pct: float  # annualised realized vol used (percent)
     rate_pct: float  # annualised risk-free rate used (percent)
     # Structural confluence: short prose strings flagging when this strike
-    # sits within 0.5×ATR(14) of a key EMA or S/R level. Empty when the
-    # strike lands in open space. Populated by options_context.
+    # sits within 0.5×ATR(14) of a key EMA. Empty when the strike lands in
+    # open space. Populated by options_context.
     confluences: tuple[str, ...] = ()
 
 
@@ -250,11 +171,6 @@ class OptionsContext:
     days_to_earnings: int | None  # None if no upcoming earnings on file
     earnings_date: _date | None
     earnings_warning: bool  # True if within 5 trading days of earnings
-    # Position framing
-    nearest_support: Level | None
-    nearest_resistance: Level | None
-    pct_to_support: float | None
-    pct_to_resistance: float | None
     # Suggested Black-Scholes strikes, one StrikeSet per expiry tenor
     # (empty when vol/price unavailable). Ordered nearest-expiry first.
     strike_sets: list[StrikeSet] = field(default_factory=list)
@@ -265,9 +181,7 @@ class OptionsContext:
     def unavailable(cls) -> OptionsContext:
         return cls(
             available=False, days_to_earnings=None, earnings_date=None,
-            earnings_warning=False, nearest_support=None,
-            nearest_resistance=None, pct_to_support=None,
-            pct_to_resistance=None, strike_sets=[], observations=[],
+            earnings_warning=False, strike_sets=[], observations=[],
         )
 
 
@@ -286,10 +200,8 @@ class SymbolAnalysis:
     last_close: float | None
     last_volume: float | None  # dollar volume on the most recent bar
     bars_count: int  # rows in the underlying frame (for diagnostics)
-    levels: list[Level]
     trend: TrendState
     volatility: VolatilityState
-    momentum: MomentumState
     options_context: OptionsContext
     # Keep a small slice of the raw close history so chart.py doesn't
     # need to re-query the DB. Indexed chronologically; most-recent
@@ -312,10 +224,8 @@ class SymbolAnalysis:
         return cls(
             symbol=symbol, as_of=as_of, available=False,
             last_close=None, last_volume=None, bars_count=0,
-            levels=[],
             trend=TrendState.unavailable(),
             volatility=VolatilityState.unavailable(),
-            momentum=MomentumState.unavailable(),
             options_context=OptionsContext.unavailable(),
             failures=[reason] if reason else [],
         )

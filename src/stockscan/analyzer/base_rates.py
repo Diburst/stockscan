@@ -24,7 +24,6 @@ from stockscan.metrics import TradeResult, performance_report
 from stockscan.strategies import (
     PositionSnapshot,
     Strategy,
-    StrategyParams,
 )
 
 
@@ -77,7 +76,6 @@ class BaseRateReport:
 
 def compute_base_rates(
     strategy_cls: type[Strategy],
-    params: StrategyParams,
     symbol: str,
     as_of: date,
     *,
@@ -85,7 +83,7 @@ def compute_base_rates(
     history_years: int = 16,
 ) -> BaseRateReport:
     """Enumerate historical signals on `symbol` and aggregate outcomes."""
-    strategy = strategy_cls(params)
+    strategy = strategy_cls()
 
     if bars is None:
         start = date(as_of.year - history_years, 1, 1)
@@ -118,17 +116,14 @@ def compute_base_rates(
     required = strategy.required_history()
 
     for i in range(required, len(bars) - 1):
-        row = bars.iloc[i]
         ts = bars.index[i]
         d = ts.date() if hasattr(ts, "date") else ts
         if in_position_until and d <= in_position_until:
             continue
         view = bars.iloc[: i + 1]
         view.attrs["symbol"] = symbol
-        sigs = strategy.signals(view, as_of=d)
-        if not sigs:
+        if not strategy.signals(view, as_of=d):
             continue
-        sig = sigs[0]
         # Simulate: enter at next bar's open
         if i + 1 >= len(bars):
             break

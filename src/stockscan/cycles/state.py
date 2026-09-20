@@ -17,7 +17,6 @@ from dataclasses import dataclass, field
 from datetime import date as _date
 from typing import TYPE_CHECKING
 
-from stockscan.cycles.breadth import BreadthState, compute_breadth
 from stockscan.cycles.cycles import (
     DecennialState,
     PresidentialCycleState,
@@ -75,7 +74,6 @@ class CalendarState:
     santa_claus: SantaClausState
     january_barometer: JanuaryBarometerState
     decennial: DecennialState
-    breadth: BreadthState
     # Diagnostic — list of indicator names that hard-failed (not just
     # produced ``available=False`` from missing data, but raised an
     # actual exception). Surfaced in a small footer chip so silent
@@ -172,11 +170,6 @@ def _compute(as_of: _date, session: Session) -> CalendarState:
         lambda: decennial_state(as_of),
         DecennialState.unavailable(as_of),
     )
-    breadth = _safe(
-        failures, "breadth",
-        lambda: compute_breadth(session, as_of),
-        BreadthState.unavailable(),
-    )
 
     return CalendarState(
         as_of=as_of,
@@ -188,7 +181,6 @@ def _compute(as_of: _date, session: Session) -> CalendarState:
         santa_claus=santa,
         january_barometer=jan_b,
         decennial=dec,
-        breadth=breadth,
         failures=failures,
     )
 

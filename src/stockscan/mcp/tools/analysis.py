@@ -14,8 +14,6 @@ FACETS = (
     "summary",
     "trend",
     "volatility",
-    "momentum",
-    "levels",
     "options_summary",
     "options_context",
     "full",
@@ -37,8 +35,7 @@ def _strip_chart_history(d: dict[str, Any]) -> dict[str, Any]:
 def get_analysis(symbol: str, as_of: str | None = None) -> dict[str, Any]:
     """Run the full technical-analysis pipeline for one symbol.
 
-    Covers support/resistance levels, trend state, volatility, momentum
-    (RSI/MACD), and an options/expected-move context.
+    Covers trend state, volatility, and an options/expected-move context.
 
     Args:
         symbol: Ticker, e.g. "AAPL".
@@ -66,8 +63,6 @@ def _project(a: Any, facet: str) -> dict[str, Any]:
     if facet == "summary":
         base["trend_bucket"] = a.trend.bucket
         base["vol_bucket"] = a.volatility.bucket
-        base["rsi_bucket"] = a.momentum.rsi_bucket
-        base["macd_state"] = a.momentum.macd_state
         return base
     if facet == "options_summary":
         oc = a.options_context
@@ -103,22 +98,12 @@ def _project(a: Any, facet: str) -> dict[str, Any]:
         )
         base["call_15d"] = _leg("call")
         base["put_15d"] = _leg("put")
-        base["pct_to_resistance"] = (
-            round(oc.pct_to_resistance, 1) if oc.pct_to_resistance is not None else None
-        )
-        base["pct_to_support"] = (
-            round(oc.pct_to_support, 1) if oc.pct_to_support is not None else None
-        )
         base["confluence_count"] = n_conf
         return base
     if facet == "trend":
         base["trend"] = jsonable(a.trend)
     elif facet == "volatility":
         base["volatility"] = jsonable(a.volatility)
-    elif facet == "momentum":
-        base["momentum"] = jsonable(a.momentum)
-    elif facet == "levels":
-        base["levels"] = jsonable(a.levels)
     elif facet == "options_context":
         base["options_context"] = jsonable(a.options_context)
     elif facet == "full":
@@ -140,10 +125,10 @@ def analyze_watchlist(
     Args:
         list_id: Restrict to one named list (see list_watchlists); None = all.
         facet: Which slice to return per symbol. One of: "summary" (default —
-            last_close + trend/vol/rsi/macd buckets), "trend", "volatility",
-            "momentum", "levels", "options_summary" (lean options view — IV,
-            earnings flag, nearest 15-delta call/put strikes, support/resistance
-            distance, confluence count; preferred for an options cross-section),
+            last_close + trend/vol buckets), "trend", "volatility",
+            "options_summary" (lean options view — IV, earnings flag, nearest
+            15-delta call/put strikes, EMA confluence count; preferred for an
+            options cross-section),
             "options_context" (full strike sets with greeks + confluences —
             large), or "full" (everything — largest; use sparingly).
         as_of: ISO date (YYYY-MM-DD); default today.
@@ -164,14 +149,16 @@ def analyze_watchlist(
 
 
 def get_regime(as_of: str | None = None) -> dict[str, Any]:
-    """Get the detected market regime and composite-health scores.
+    """Get the market regime controls for a date.
 
     Args:
         as_of: ISO date (YYYY-MM-DD); default today.
 
     Returns:
-        The MarketRegime row (regime label, ADX, composite/vol/trend/breadth/
-        credit scores, credit-stress flag), or {"error": "no_regime"}.
+        The MarketRegime row (regime label, trend gate open/closed with
+        days_on_side, SPY close vs SMA(200) and its slope, realized vol +
+        percentile rank + vol_scalar, HY OAS level + rank, credit-stress
+        flag), or {"error": "no_regime"}.
     """
     as_of_d = date.fromisoformat(as_of) if as_of else date.today()
     reg = _get_regime(as_of_d)

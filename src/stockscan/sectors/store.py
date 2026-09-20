@@ -7,8 +7,8 @@ Postgres, builds the equal-weight composites (pure math in
 
 Why synthetic bars rather than a dedicated table (spec §8.3): relative-strength
 code already fetches a benchmark *by symbol* via
-:func:`stockscan.data.store.get_bars` (see ``donchian_trend._relative_strength``),
-so a sector composite is just another symbol — ``sector_rs`` becomes
+:func:`stockscan.data.store.get_bars` (see ``indicators.relative_strength``),
+so a sector composite is just another symbol — the sector return becomes
 ``get_bars(sector_composite_symbol_for(stock))`` with zero new fetch plumbing,
 and every ``indicators/ta.py`` function works on it unchanged. The reserved
 ``$`` prefix plus ``source='derived'`` keeps these rows out of the scan universe,

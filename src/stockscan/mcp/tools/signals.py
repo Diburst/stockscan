@@ -27,7 +27,7 @@ def list_signals(
     first, gated to each strategy's currently-registered version.
 
     Args:
-        strategy: Restrict to one strategy name (e.g. "reversal_swing"). None = all.
+        strategy: Restrict to one strategy name (e.g. "rsi2_meanrev"). None = all.
         days: Look-back window in days (default 7).
         include_rejected: Include rejected signals as well as passing ones.
         symbol: Case-insensitive ticker substring filter (e.g. "AAPL").

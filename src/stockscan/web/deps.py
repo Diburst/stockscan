@@ -42,13 +42,12 @@ def safe(
 
     Centralises the recurrent ``try → log.warning → fallback`` pattern that
     appears in route handlers loading optional / best-effort data
-    (model artifacts, technical scores, regime context, etc.). Keeps the
-    happy path readable while still surfacing failures in logs.
+    (regime context, data-freshness lookups, etc.). Keeps the happy path
+    readable while still surfacing failures in logs.
 
     Example::
 
-        models = safe(list_models, default=[], label="strategies.list_models")
-        artifact = safe(lambda: load_model(name), label=f"load_model[{name}]")
+        regime = safe(lambda: get_regime(as_of, session=s), label="regime")
     """
     try:
         return fn()
@@ -132,150 +131,73 @@ templates.env.filters["md_lite"] = _md_lite
 # Mapping: metadata-key → (display_label, one-line explanation).
 # The explanation appears as a hover tooltip and as collapsed body text.
 _METADATA_LABELS: dict[str, tuple[str, str]] = {
-    # ---- Donchian breakout ----
-    "breakout_window": (
-        "Breakout window",
-        "Which entry window fired. 20 = sensitive (Turtle System 1, subject "
-        "to the 1L skip-after-winner filter); 55 = confirmed (Turtle System "
-        "2, always taken regardless of recent signal history).",
+    # ---- RSI(2) pullback ----
+    "rsi_2": (
+        "RSI(2)",
+        "Two-period RSI on adjusted close — reads 'the stock fell hard over "
+        "the last two sessions'. The strategy buys below 10.",
     ),
-    "prior_max_close": (
-        "Prior N-day max close",
-        "Highest close in the N trading days BEFORE today, where N matches "
-        "the breakout window. Today's close exceeded this level.",
+    "sma_200": (
+        "SMA(200)",
+        "200-day simple moving average of adjusted close — the long-term "
+        "trend filter. Both strategies require the close above it.",
     ),
-    "adx": (
-        "ADX(14)",
-        "Average Directional Index — 0-100 scale measuring trend strength "
-        "(not direction). Values above ~18 indicate a real trend; below means "
-        "the market is choppy / range-bound.",
+    "stock_return_1m": (
+        "Stock 1-month return",
+        "The stock's own return over the last 21 trading days. Compared "
+        "against its sector composite to tell a stock-specific dip from a "
+        "sector-wide one.",
     ),
-    "volume_mult_actual": (
-        "Volume vs 20d avg",
-        "Today's volume divided by its trailing 20-day mean. Donchian v1.1 "
-        "requires this to be at least 1.5x to confirm institutional "
-        "participation. Higher = stronger conviction.",
+    "sector_return_1m": (
+        "Sector 1-month return",
+        "The stock's equal-weight sector composite's return over the last 21 "
+        "trading days. Below -5% the strategy stands aside — a sector in a "
+        "downtrend keeps falling.",
     ),
-    "vol_expansion_ratio": (
-        "True range / ATR(14)",
-        "Today's true range divided by the 14-day ATR. >= 1.0 means today "
-        "had at least average daily range — filters out wick-touch breakouts "
-        "that closed at the high but had no real intraday movement.",
+    "idiosyncratic_drop": (
+        "Idiosyncratic drop",
+        "Sector 1-month return minus stock 1-month return: how much more the "
+        "stock fell than its sector. This is the ranking score — the most "
+        "stock-specific drop goes first.",
     ),
-    "rs_60d_diff": (
-        "60d return vs SPY",
-        "Stock's 60-day return minus SPY's 60-day return. Positive = stock "
-        "is outperforming the market over the trailing 60 days; the "
-        "relative-strength filter requires this to be > 0.",
-    ),
-    "prior_signal_outcome": (
-        "Prior 20d breakout outcome",
-        "Outcome of the most recent prior 20-day breakout for this symbol "
-        "under the v1.1 exit rules. 'winner' triggers the Turtle 1L filter "
-        "(skip today's signal); 'loser' or 'none' allows it through.",
-    ),
-    # ---- Donchian v1.2 / v1.3: base-breakout filters ----
-    "base_range_pct": (
-        "Base width (20-bar)",
-        "Range of the 20 bars BEFORE the breakout — (max high - min low) "
-        "as % of midpoint. Donchian v1.2 requires <=15% to qualify as a "
-        "tight consolidation base; wider 'bases' are usually just chop. "
-        "Lower is tighter / cleaner.",
-    ),
-    "bbw_percentile": (
-        "Bollinger Bandwidth percentile",
-        "Yesterday's Bollinger Bandwidth (4σ/middle on BB(20)) ranked "
-        "within its trailing 126-bar (~6-month) distribution. Donchian "
-        "v1.3 requires this to be in the bottom 30% — the canonical "
-        "Bollinger Squeeze (BBW at a multi-month low). Lower = tighter "
-        "pre-breakout squeeze = stronger setup.",
-    ),
-    "pct_above_sma50": (
-        "% above SMA(50)",
-        "Today's close as a percent above the 50-day simple moving "
-        "average. Donchian v1.2 caps this at 15% to filter stocks that "
-        "are already extended off their long-term reference. Higher "
-        "values mean a more mature run-up with worse risk:reward.",
-    ),
-    "rsi_pre_breakout": (
-        "RSI(14) yesterday",
-        "RSI(14) computed on YESTERDAY's close — the bar BEFORE today's "
-        "breakout. Donchian v1.2 requires <65, since RSI >=65 going into "
-        "the move means the stock was already overbought. Today's "
-        "breakout bar will naturally pop RSI to 70+; that's expected.",
-    ),
-    # ---- Shared technical fields ----
-    "atr": (
-        "ATR(20)",
-        "Average True Range over the last 20 days, in dollars. The typical "
-        "daily price movement of this stock. Used to size the stop loss "
-        "(stop = entry - 2 x ATR).",
-    ),
-    "atr_period": ("ATR period", "Lookback window for ATR (in trading days)."),
-    "atr_stop_mult": (
-        "ATR stop multiplier",
-        "Multiplier applied to ATR to set the initial stop distance.",
+    "relative_volume": (
+        "Selloff volume vs normal",
+        "Mean volume over the two selloff bars divided by the 50-day baseline "
+        "before them. At 1.5x or more the setup is skipped — heavy-volume "
+        "declines tend to continue.",
     ),
     # ---- 52-week-high momentum ----
     "closeness_52w": (
         "Closeness to 52w high",
-        "Today's close ÷ highest close in the last 252 days. 1.00 = fresh "
-        "52-week high; 0.95 = within 5% of it. The strategy only emits "
-        "signals at 0.95+.",
+        "Today's close divided by the highest close in the last 252 days. 1.00 "
+        "= fresh 52-week high; 0.90 = within 10% of it, the entry gate.",
     ),
     "slope_quality": (
         "Slope quality",
-        "Annualised log-return slope of the last 90 days, weighted by R² and "
-        "sigmoid-normalised to [0, 1]. Higher = smoother uptrend. Used as a "
-        "tiebreak between names at similar closeness.",
+        "Clenow's ranking metric: 90-day regression slope of log price, "
+        "annualized and weighted by R-squared, squashed to (0, 1). Steep and "
+        "smooth beats steep and jagged.",
     ),
-    "max_close_52w": (
-        "52w high",
-        "The highest close in the last 252 trading days (the denominator of "
-        "the closeness ratio).",
+    "residual_return_12m": (
+        "Residual 12-month return",
+        "The stock's 252-day return minus its sector composite's — the part "
+        "of the climb that is the stock's own rather than a sector wave.",
     ),
-    "holding_days": (
-        "Planned holding period",
-        "Trading days from entry to time-based exit. Matches the original "
-        "George-Hwang study window.",
+    "residual_tilt": (
+        "Residual tilt",
+        "The residual 12-month return capped to +/-25%, added to the rank so "
+        "idiosyncratic momentum (the part that does not crash) leads.",
     ),
-    # ---- RSI(2) mean reversion ----
-    "rsi": (
-        "RSI",
-        "Relative Strength Index. 0-100 oscillator; below ~10 with RSI(2) "
-        "indicates extreme oversold conditions where mean reversion is "
-        "statistically likely.",
+    "realized_vol_1y": (
+        "Realized vol (1y)",
+        "Annualized standard deviation of daily returns over the last year. "
+        "Above 60% the name is skipped — momentum crashes concentrate in the "
+        "highest-beta names.",
     ),
-    "rsi_2": (
-        "RSI(2)",
-        "Two-period RSI — extremely sensitive to recent moves. The strategy "
-        "buys when this drops below 10 (deep oversold) in an uptrend.",
-    ),
-    "rsi_period": ("RSI period", "Lookback window for the RSI calculation."),
-    "sma200": (
-        "SMA(200)",
-        "200-day simple moving average — the long-term trend filter. The "
-        "strategy only buys above SMA(200) to avoid catching falling knives.",
-    ),
-    # ---- LargeCap rebound (z-score-style) ----
-    "z_score": (
-        "Z-score",
-        "Number of standard deviations today's close is below its 20-day "
-        "mean. The strategy buys 2 std-dev+ pullbacks in trending uptrends.",
-    ),
-    "pullback_pct": (
-        "Pullback %",
-        "Percent drop from the 20-day high. Captures the depth of the dip "
-        "the strategy is buying.",
-    ),
-    # Note: Z-score description uses 'std devs' rather than the unicode sigma
-    # symbol so the file stays ruff RUF001-clean.
-    # ---- Meta-labeling ----
-    "meta_label_proba": (
-        "Meta-label probability",
-        "XGBoost-classifier estimate of P(this signal hits its profit-take "
-        "barrier within the holding window). Score-only — never blocks "
-        "trades. 0.50 = no opinion; 0.55+ = model has signal.",
+    "sma_50": (
+        "SMA(50)",
+        "50-day simple moving average of adjusted close. Must sit above the "
+        "200-day for the uptrend to count as confirmed.",
     ),
 }
 
@@ -331,41 +253,33 @@ templates.env.filters["humanize_metadata"] = _humanize_metadata
 # longer tooltip explanation. Used by the rejected-signals card on
 # /signals and the rejection banner on /signals/{id}.
 #
-# Codes come from two sources: the FilterChain in stockscan.risk.filters
-# (most of them) and from strategies that emit a ``_strategy_reject_reason``
-# in metadata (currently only Donchian's Turtle 1L). When a strategy
-# adds a new reason it should add an entry here.
+# Codes come from the regime layer in the scan runner (the trend gate and
+# the credit-stress breaker) and from the FilterChain in
+# stockscan.risk.filters. When a filter adds a new reason it should add an
+# entry here.
 # ----------------------------------------------------------------------
 
 # Static reasons (no dynamic substring). Mapping: code -> (label, explanation).
 _REJECTION_REASONS_STATIC: dict[str, tuple[str, str]] = {
-    "turtle_1l_skip_after_winner": (
-        "Turtle 1L (skip after winner)",
-        "Donchian's 20-day breakout was rejected because the previous 20-day "
-        "breakout for this symbol would have been a winner. Per the original "
-        "Turtle Traders rules, big sustained trends usually start AFTER a "
-        "cluster of small false breakouts; once you've just had a winner, the "
-        "next breakout has elevated false-positive risk. The 55-day window "
-        "(System 2) acts as the failsafe and is always taken regardless.",
+    "trend_gate_closed": (
+        "Trend gate closed",
+        "SPY had closed below its 200-day SMA for three or more consecutive "
+        "sessions, so the regime layer refused the new long entry. Open "
+        "positions keep running their own exits; the gate governs entries "
+        "only, and reopens after three closes back above the line.",
     ),
     "credit_stress_long_block": (
         "Credit stress (long block)",
-        "HY OAS credit-stress flag was active and the signal is long. "
-        "Credit-stress regimes historically lead equity drawdowns by 1-3 "
-        "trading days, so new long entries are hard-blocked while the flag "
-        "is on (per regime composite §Tier 0(b)).",
-    ),
-    "regime_zero_size": (
-        "Regime sized to zero",
-        "The composite regime multiplier (affinity x composite_mult x "
-        "stress_mult) rounded the position size down to zero shares. "
-        "Means the regime is hostile to this strategy at this time.",
+        "HY OAS was in the top 15% of its trailing year and still rising, "
+        "and the signal is long. Credit stress historically leads equity "
+        "drawdowns by 1-3 trading days, so new long entries are refused "
+        "while the breaker fires.",
     ),
     "qty_zero": (
         "Sized to zero",
         "The position sizer returned zero shares. Usually means the "
-        "stop is too wide given equity and risk_pct, or risk_pct itself "
-        "is misconfigured.",
+        "stop is too wide given equity and the strategy's risk fraction, "
+        "or the vol scalar shrank a small allocation below one share.",
     ),
     "earnings_within_5_trading_days": (
         "Earnings within 5 days",
@@ -492,16 +406,6 @@ _TERM_EXPLANATIONS: dict[str, tuple[str, str]] = {
         "Two-period RSI — extremely sensitive to recent moves. Used by "
         "Larry Connors mean-reversion strategies; <10 = deep oversold.",
     ),
-    "macd": (
-        "MACD",
-        "Moving Average Convergence/Divergence — difference between 12 and "
-        "26-day EMAs, with a 9-day EMA signal line. Crosses signal trend changes.",
-    ),
-    "adx": (
-        "ADX",
-        "Average Directional Index — 0-100 trend-strength gauge (not "
-        "direction). >18 = real trend; <18 = chop / range-bound.",
-    ),
     "atr": (
         "ATR",
         "Average True Range — typical daily price movement (in dollars). "
@@ -520,21 +424,6 @@ _TERM_EXPLANATIONS: dict[str, tuple[str, str]] = {
         "EMA",
         "Exponential Moving Average — weighted MA that puts more weight on "
         "recent bars. Reacts faster than SMA.",
-    ),
-    "bb": (
-        "Bollinger Bands",
-        "Price envelope at SMA ± 2 standard deviations. %B measures where "
-        "price sits within the bands (0 = lower, 1 = upper).",
-    ),
-    "pct_b": (
-        "%B",
-        "Bollinger %B — (price − lower band) / (upper band − lower band). "
-        "0 = price at lower band; 1 = at upper; >1 = above the upper band.",
-    ),
-    "donchian": (
-        "Donchian channel",
-        "Upper/lower envelope of the highest high and lowest low over N "
-        "days. Breakouts above the upper channel are classic trend entries.",
     ),
     "vwap": (
         "VWAP",
@@ -618,6 +507,11 @@ _TERM_EXPLANATIONS: dict[str, tuple[str, str]] = {
         "distance × shares ÷ equity). Sizes the position so each loss is "
         "the same percentage hit.",
     ),
+    "position_pct": (
+        "Position %",
+        "Fixed fraction of equity per position, used by strategies that "
+        "emit no stop (there is no risk-per-share to size from).",
+    ),
     "notional": (
         "Notional",
         "Dollar value of the position (price × shares). Used to enforce "
@@ -632,41 +526,40 @@ _TERM_EXPLANATIONS: dict[str, tuple[str, str]] = {
     # ---- Regime ----
     "regime": (
         "Regime",
-        "Composite market state — a coarse classification of the current "
-        "market (trending up, trending down, choppy, transitioning) that "
-        "scales position sizes per strategy.",
+        "Market-health label derived from two flags: risk_on (trend gate "
+        "open), risk_off (gate closed — no new longs) or credit_stress "
+        "(HY OAS breaker firing — no new longs).",
     ),
-    "trending_up": (
-        "Trending up",
-        "Composite regime: clear positive trend, strategies that buy "
-        "strength get full size.",
+    "risk_on": (
+        "Risk on",
+        "SPY has held above its 200-day SMA for at least three closes and "
+        "credit is calm. New entries allowed at the strategy's own size, "
+        "scaled by the vol scalar where it applies.",
     ),
-    "trending_down": (
-        "Trending down",
-        "Composite regime: clear negative trend, long strategies are "
-        "down-weighted or blocked.",
+    "risk_off": (
+        "Risk off",
+        "SPY has closed below its 200-day SMA for three or more sessions. "
+        "New long entries are refused; open positions run their own exits.",
     ),
-    "choppy": (
-        "Choppy",
-        "Composite regime: no directional edge. Trend strategies are sized "
-        "down; mean-reversion may be sized up.",
+    "trend_gate": (
+        "Trend gate",
+        "SPY vs its 200-day SMA with a three-close dwell so a single cross "
+        "does not flip it. Closed = no new long entries. Evidence is "
+        "drawdown reduction, not return prediction.",
     ),
-    "transitioning": (
-        "Transitioning",
-        "Composite regime: the market is changing state. Conservative "
-        "sizing applied across the board.",
-    ),
-    "affinity": (
-        "Affinity",
-        "Per-strategy alignment with the current regime — multiplier "
-        "applied to base position size. 1.0 = no adjustment, <1 = trim, "
-        ">1 = lean in.",
+    "vol_scalar": (
+        "Vol scalar",
+        "Position-size multiplier in [0.5, 1]. When 20-day realized SPY vol "
+        "is in the top tercile of its trailing year the size shrinks toward "
+        "16% / realized; otherwise 1.0. Applies only to strategies that opt "
+        "in (momentum, not mean reversion).",
     ),
     "credit_stress": (
         "Credit stress",
-        "HY OAS (high-yield option-adjusted spread) widening flag. Credit "
-        "stress historically leads equity drawdowns by 1-3 trading days, "
-        "so when it's on, new long entries are blocked.",
+        "HY OAS (high-yield option-adjusted spread) in the top 15% of its "
+        "trailing year and rising. Credit stress historically leads equity "
+        "drawdowns by 1-3 trading days, so while it fires new long entries "
+        "are refused.",
     ),
     # ---- Misc trade lifecycle ----
     "stop": (
@@ -685,15 +578,9 @@ _TERM_EXPLANATIONS: dict[str, tuple[str, str]] = {
     ),
     "qty": (
         "Qty",
-        "Suggested position size in shares, computed by the sizer from "
-        "equity, risk %, and stop distance.",
-    ),
-    # ---- Meta-labeling ----
-    "meta_label": (
-        "Meta-label",
-        "Lopez de Prado meta-labelling — a secondary classifier estimates "
-        "P(this signal hits its profit target before its stop). Score-only; "
-        "never blocks trades.",
+        "Suggested position size in shares — risk fraction over the stop "
+        "distance for stop-based strategies, a fixed fraction of equity "
+        "for stop-less ones, then the vol scalar where it applies.",
     ),
 }
 

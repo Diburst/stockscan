@@ -14,7 +14,7 @@ Read tools (always available) — 21:
 - Signals: `list_signals` (filters: strategy, days, side, score band, symbol; gated to current strategy versions), `get_signal` (one by id, with the full score breakdown).
 - Strategies: `list_strategies`, `get_strategy` (includes the long-form `manual`).
 - Watchlist: `list_watchlists` (the named lists + counts), `list_watchlist` (items, enriched with latest close / % change).
-- Analysis: `get_analysis` (full per-symbol pipeline), `analyze_watchlist` (cross-section across watched symbols, with a `facet` to keep payloads small — summary/trend/volatility/momentum/levels/`options_summary` (lean: IV + nearest 15Δ strikes + earnings flag + confluence count)/`options_context` (full strike sets + greeks — large)/full), `get_regime`.
+- Analysis: `get_analysis` (full per-symbol pipeline), `analyze_watchlist` (cross-section across watched symbols, with a `facet` to keep payloads small — summary/trend/volatility/`options_summary` (lean: IV + nearest 15Δ strikes + earnings flag + EMA-confluence count)/`options_context` (full strike sets + greeks — large)/full), `get_regime`.
 - Market context: `get_fundamentals`, `screen_by_market_cap`, `get_earnings`, `upcoming_earnings`, `get_news` (headlines/snippets), `get_article` (full body on demand — re-fetches from EODHD, ~1 credit, needs key), `get_insider` (per-symbol), `watchlist_insider` (net-buys across the watchlist), `upcoming_econ_events`.
 - Backtests: `list_backtests`, `get_backtest` (export a run's trades/score-breakdowns/equity).
 - `get_refresh_status` — read side of the fire-and-poll refresh.
@@ -155,7 +155,7 @@ phone on the tailnet, this resolves privately; the cert is valid, so no warnings
 4. Save and click **Connect**. Claude opens a browser to the server's OAuth
    consent screen (the server self-registers your client via Dynamic Client
    Registration — no client id/secret to copy). Approve it.
-5. The stockscan tools now appear in Claude. Try: *"List my recent reversal_swing
+5. The stockscan tools now appear in Claude. Try: *"List my recent momentum_52w_high
    signals"* or *"What's the current market regime?"*.
 
 If the connector errors on connect, it's almost always the discovery chain not

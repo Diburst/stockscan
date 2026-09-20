@@ -7,13 +7,13 @@ like a trader's checklist:
      options_context (computed upstream by the analysis engine).
   2. The DAY-COLOR trigger picks the candidate side: a green day suggests
      selling a call, a red day suggests selling a put. No trigger -> no trade.
-  3. TREND/LEVEL gating qualifies the side — with-trend put-sales on dips are
-     preferred; call-sales are only taken into resistance, and down-weighted
-     hard on momentum leaders (don't sell calls into a breakout).
+  3. TREND gating qualifies the side — with-trend put-sales on dips are
+     preferred; call-sales are skipped outright on momentum leaders (don't
+     sell calls into a breakout) and down-weighted in any uptrend.
   4. HARD FILTERS drop anything with earnings inside the expiry, thin liquidity,
      a missing IV, or stale/insufficient bars.
-  5. A 0–1 SCORE blends premium richness, room to the threatened level, strike
-     confluence, trend alignment, and how stretched today's move is.
+  5. A 0–1 SCORE blends premium richness, strike confluence with key EMAs,
+     trend alignment, and how stretched today's move is.
 
 Knobs are module constants — edit and the next run picks them up.
 """
@@ -26,24 +26,20 @@ from stockscan.proposals._models import SELL_CALL, SELL_PUT, OptionProposal
 
 # ---- knobs ----------------------------------------------------------------
 DAY_TRIGGER_PCT = 1.5      # min |1-day move| to fire the day-color trigger
-NEAR_LEVEL_PCT = 4.0       # a strike is "at" a level within this % of spot
-PRICE_AT_LEVEL_PCT = 2.5   # current PRICE is "at" the level within this % (context flag)
 MIN_DOLLAR_VOLUME = 5_000_000.0   # liquidity floor (last bar $ volume)
 MIN_IV_PCT = 20.0          # below this, not worth selling
 EARNINGS_BUFFER_DAYS = 2   # drop if earnings land within dte + buffer
 
 # Score weights (sum to 1.0).
-W_PREMIUM = 0.30
-W_ROOM = 0.20
+W_PREMIUM = 0.35
 W_CONFLUENCE = 0.15
-W_TREND = 0.25
-W_DAYCOLOR = 0.10
+W_TREND = 0.35
+W_DAYCOLOR = 0.15
 
 # (breakdown key, human label, weight) — drives the UI score-derivation card.
 SCORE_INPUTS: tuple[tuple[str, str, float], ...] = (
     ("premium", "Premium — IV richness", W_PREMIUM),
-    ("room", "Room to threatened level", W_ROOM),
-    ("confluence", "Strike sits on levels", W_CONFLUENCE),
+    ("confluence", "Strike sits on key EMAs", W_CONFLUENCE),
     ("trend_align", "Trend alignment", W_TREND),
     ("daycolor", "Day-color stretch", W_DAYCOLOR),
 )
@@ -67,14 +63,12 @@ def _day_move_pct(analysis: Any) -> float | None:
     return (last - prev) / prev * 100.0
 
 
-def _select_side(
-    day_move: float, trend_bucket: str, oc: Any
-) -> tuple[str, float, float | None] | None:
-    """Pick the side from day-color, then qualify it with trend + levels.
+def _select_side(day_move: float, trend_bucket: str) -> tuple[str, float] | None:
+    """Pick the side from day-color, then qualify it with the trend.
 
-    Returns (side, trend_alignment_0to1, pct_to_threatened_level) or None when
-    there's no qualifying trigger. ``trend_alignment`` rewards with-trend
-    put-sales and penalizes counter-trend call-sales.
+    Returns (side, trend_alignment_0to1) or None when there's no qualifying
+    trigger. ``trend_alignment`` rewards with-trend put-sales and penalizes
+    counter-trend call-sales.
     """
     up = trend_bucket in _UPTREND
     down = trend_bucket in _DOWNTREND
@@ -82,17 +76,15 @@ def _select_side(
     if day_move <= -DAY_TRIGGER_PCT:
         # Red day -> sell a put. Best with-trend (dip in an uptrend).
         align = 1.0 if up else (0.55 if not down else 0.35)
-        return SELL_PUT, align, getattr(oc, "pct_to_support", None)
+        return SELL_PUT, align
 
     if day_move >= DAY_TRIGGER_PCT:
-        # Green day -> sell a call, but only into resistance, and never into a
-        # breakout. Counter-trend (selling calls in an uptrend) is penalized.
-        ptr = getattr(oc, "pct_to_resistance", None)
-        at_resistance = ptr is not None and ptr <= NEAR_LEVEL_PCT
-        if not at_resistance or trend_bucket == "strong_up":
-            return None  # green but breaking out / open space -> skip the call sale
+        # Green day -> sell a call, but never into a breakout. Counter-trend
+        # (selling calls in an uptrend) is penalized.
+        if trend_bucket == "strong_up":
+            return None  # green and breaking out -> skip the call sale
         align = 0.45 if up else (1.0 if down else 0.7)
-        return SELL_CALL, align, ptr
+        return SELL_CALL, align
 
     return None  # move too small to trigger
 
@@ -112,24 +104,20 @@ def _passes_hard_filters(analysis: Any, dte: int, iv_pct: float | None) -> str |
 
 
 def _score(
-    *, iv_pct: float, pct_to_threat: float | None, confluence_count: int,
-    trend_align: float, day_move: float,
+    *, iv_pct: float, confluence_count: int, trend_align: float, day_move: float,
 ) -> tuple[float, dict[str, Any]]:
     """Blend the inputs into a 0–1 attractiveness score (+ breakdown)."""
     premium = _clamp01(iv_pct / 150.0)                      # IV richness
-    room = _clamp01((pct_to_threat or 0.0) / 12.0)          # cushion to the level
-    confluence = _clamp01(confluence_count / 3.0)           # strike sits on levels
+    confluence = _clamp01(confluence_count / 3.0)           # strike sits on key EMAs
     daycolor = _clamp01(abs(day_move) / 5.0)                # how stretched the move
     score = (
         W_PREMIUM * premium
-        + W_ROOM * room
         + W_CONFLUENCE * confluence
         + W_TREND * trend_align
         + W_DAYCOLOR * daycolor
     )
     breakdown = {
         "premium": round(premium, 3),
-        "room": round(room, 3),
         "confluence": round(confluence, 3),
         "trend_align": round(trend_align, 3),
         "daycolor": round(daycolor, 3),
@@ -162,10 +150,10 @@ def propose_candidates(analyses: list[Any]) -> list[OptionProposal]:
             continue  # insufficient/stale history -> can't trigger
 
         trend_bucket = getattr(getattr(a, "trend", None), "bucket", "?")
-        sel = _select_side(day_move, trend_bucket, oc)
+        sel = _select_side(day_move, trend_bucket)
         if sel is None:
             continue
-        side, trend_align, pct_to_threat = sel
+        side, trend_align = sel
 
         leg = nearest.call if side == SELL_CALL else nearest.put
         if leg is None:
@@ -177,21 +165,16 @@ def propose_candidates(analyses: list[Any]) -> list[OptionProposal]:
             continue
 
         confluence_count = len(getattr(leg, "confluences", ()) or ())
-        # Context flag (not scored): is PRICE itself at the threatened level now?
-        price_at_level = pct_to_threat is not None and pct_to_threat <= PRICE_AT_LEVEL_PCT
         score, breakdown = _score(
-            iv_pct=iv_pct, pct_to_threat=pct_to_threat,
-            confluence_count=confluence_count, trend_align=trend_align,
-            day_move=day_move,
+            iv_pct=iv_pct, confluence_count=confluence_count,
+            trend_align=trend_align, day_move=day_move,
         )
 
-        threat = "resistance" if side == SELL_CALL else "support"
         rationale = (
             f"{'Green' if side == SELL_CALL else 'Red'} day ({day_move:+.1f}%); "
             f"sell {side.split('_')[1]} {leg.strike:g} ({leg.pct_otm:+.0f}% OTM, "
             f"{nearest.days_to_expiry}d), IV~{iv_pct:.0f}%, "
-            f"{confluence_count} level confluence(s), "
-            f"{(pct_to_threat if pct_to_threat is not None else float('nan')):.0f}% to {threat}."
+            f"{confluence_count} EMA confluence(s), trend {trend_bucket}."
         )
 
         out.append(
@@ -210,10 +193,8 @@ def propose_candidates(analyses: list[Any]) -> list[OptionProposal]:
                 day_move_pct=round(day_move, 2),
                 days_to_earnings=getattr(oc, "days_to_earnings", None),
                 confluence_count=confluence_count,
-                pct_to_threat=pct_to_threat,
                 trend_bucket=trend_bucket,
                 rationale=rationale,
-                price_at_level=price_at_level,
                 score_breakdown=breakdown,
             )
         )

@@ -70,7 +70,7 @@ def analyze_watchlist_cards(
 ) -> list[dict[str, Any]]:
     """Like :func:`analyze_watchlist`, but each item also carries the full
     interactive-chart payload so the Analysis hub can render fully-featured
-    charts (every study, S/R levels, expected-move bands, fib).
+    charts (every study + expected-move bands).
 
     Returns ``[{"analysis": SymbolAnalysis, "payload": dict}, ...]``. Bars are
     fetched once per symbol and shared between the analysis engine and the

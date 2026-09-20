@@ -1,11 +1,11 @@
 # User Stories — Personal Stock Trading App
 
 **Author:** Thomas
-**Status:** Draft v0.3
-**Date:** 2026-04-27
+**Status:** v0.4
+**Date:** 2026-09-19
 **Companion to:** [DESIGN.md](./DESIGN.md)
 
-> **v0.3 changes:** Added three new stories that have shipped: **Watchlist** (Story 11) with per-symbol price-target alerts and one-click "+ Watch" from the Dashboard, **Technical Confirmation Score** (Story 12) — a strategy-aware signed bias derived from RSI + MACD, displayed alongside the strategy score on Signals and Watchlist pages, and **Fundamentals Refresh** (Story 13) which underpins the Largecap Rebound strategy's market-cap filter. Story 1's "Run scan" CLI snippet updated to match the live commands.
+> **v0.4:** Stories 11 (Watchlist) and 13 (Fundamentals) are shipped as written. Story 12 was retired with the feature it described; the number is left unused so cross-references elsewhere stay stable. Mockups name the two strategies in the book: RSI(2) Pullback and 52-Week-High Momentum.
 
 > **v0.2 changes:** Mobile/responsive UI elevated to a v1 requirement (was deferred). Phone access is via existing WireGuard VPN to the home LAN. Per-story mobile considerations added below; cross-cutting responsive design requirement added at the end.
 
@@ -35,8 +35,7 @@ Plus supporting stories surfaced while writing the above:
 | 9 | Reconcile local positions against broker | Position manager |
 | 10 | Check system health (data freshness, broker auth) | Status panel |
 | 11 | Watch symbols and get price-target alerts | **Watchlist** (new) |
-| 12 | See a per-signal Technical Score next to the strategy score | **Technical scoring** (new) |
-| 13 | Refresh fundamentals to enable market-cap-aware strategies | **Fundamentals layer** (new) |
+| 13 | Refresh fundamentals (sector map, market cap) for the sector composites | **Fundamentals layer** |
 
 ---
 
@@ -46,26 +45,26 @@ Plus supporting stories surfaced while writing the above:
 
 ### Trigger
 - Scheduled: `refresh-and-scan` job at 20:00 ET runs all strategies, but a single-strategy scan is also runnable from the UI or CLI.
-- Manual: "Run scan" button on the strategy page, or `stockscan scan rsi2` from the CLI.
+- Manual: "Run scan" button on the strategy page, or `stockscan scan run rsi2_meanrev` from the CLI.
 
 ### Preconditions
 - Bars are fresh through yesterday's close (status panel shows green data freshness).
-- The strategy's parameters are configured.
+- The strategy's knobs are whatever the checked-in file says (edit and bump the version to change them).
 
 ### Happy path (UI)
 
 ```
 ┌────────────────────────────────────────────────────────────────────────────┐
-│ Scan: RSI(2) Mean-Reversion                          [Run scan] [Settings] │
+│ Scan: RSI(2) Pullback                                [Run scan]            │
 ├────────────────────────────────────────────────────────────────────────────┤
 │ As of:  2026-04-27 (close)         Universe: S&P 500 (501 names)           │
 │                                                                            │
 │ Passing signals (3)                                                        │
 │ ─────────────────────────────────────────────────────────────────────────  │
-│ Symbol  Score  Close   RSI(2)  Stop    Suggested qty   $ at risk   ▣ Chart│
-│  AAPL    0.92  189.40   3.1   181.20   54              $9,936       ▢      │
-│  MRK     0.81  104.55   5.8   100.10   168             $7,476       ▢      │
-│  CVS     0.74   58.32   8.2    55.40   685             $2,000       ▢      │
+│ Symbol  Score  Close   RSI(2)  Stop    Suggested qty   Notional    ▣ Chart│
+│  AAPL    0.092 189.40   3.1   —        52              $9,849       ▢      │
+│  MRK     0.081 104.55   5.8   —        95              $9,932       ▢      │
+│  CVS     0.074  58.32   8.2   —        171             $9,973       ▢      │
 │                                                                            │
 │ Rejected (5) ▾                                                             │
 │ ─────────────────────────────────────────────────────────────────────────  │
@@ -73,7 +72,7 @@ Plus supporting stories surfaced while writing the above:
 │  PFE     0.88  ⚠ Earnings in 3 days                                  ▢     │
 │  KO      0.76  ⚠ Sector cap (Consumer Staples at 24.8%, +KO=27.1%)   ▢     │
 │  ABBV    0.71  ⚠ Position size > 5% of 20d ADV                       ▢     │
-│  BAC     0.65  ⚠ Already long via TF strategy                        ▢     │
+│  BAC     0.65  ⚠ Already long via momentum_52w_high                  ▢     │
 │  WMT     0.62  ⚠ Below 200 SMA filter                                ▢     │
 │                                                                            │
 │ [⚙ Backdate scan to: 2024-03-15]   [📋 Export CSV]   [✉ Email summary]    │
@@ -83,12 +82,12 @@ Plus supporting stories surfaced while writing the above:
 ### Acceptance criteria
 
 1. Scan completes in under 30 seconds for the S&P 500 against the local DB.
-2. Each row shows: symbol, score, current close, strategy-specific indicator value(s), suggested stop, suggested qty (from sizer), dollar risk, and a hover-or-click chart preview.
+2. Each row shows: symbol, score, current close, strategy-specific indicator value(s), suggested stop (or none for a stop-less strategy), suggested qty (from sizer), dollar risk or notional, and a hover-or-click chart preview.
 3. **Rejected signals are shown alongside passing ones, visually distinguished**, with the specific filter that blocked them.
 4. The user can re-run the same scan against any historical date — `as_of` is a parameter, not a constant. Rejection reasons are evaluated as of that date too.
 5. Output is persisted to `signals` and `strategy_runs` tables; status is `'new'` for passing, `'rejected'` for failed-with-reason.
 6. A button exports the current view to CSV.
-7. Result is reproducible: re-running with the same `as_of` and unchanged params produces identical output (deterministic).
+7. Result is reproducible: re-running with the same `as_of` and unchanged strategy file produces identical output (deterministic).
 
 ### Edge cases
 
@@ -96,7 +95,7 @@ Plus supporting stories surfaced while writing the above:
 - **Missing data for a symbol:** symbol is excluded from the scan and listed in a "skipped" row with reason "no bars".
 - **All signals rejected:** the passing section shows "No qualifying signals" with a "show rejections" prompt.
 - **Backdated scan against a date the symbol wasn't in the index:** symbol is excluded; the universe respects historical S&P 500 membership.
-- **Strategy params changed since last run:** historical scan results in DB remain immutable; new run gets a new `run_id`.
+- **Strategy version bumped since last run:** historical scan results in DB remain immutable; new run gets a new `run_id` under the new version.
 
 ### Module mapping
 - `stockscan.scan` (single-strategy scan entry point).
@@ -110,9 +109,9 @@ The 8-column desktop table collapses to a stacked card per signal. Card layout:
 
 ```
 ┌──────────────────────────────────────┐
-│ AAPL              0.92    [Trade ▶]  │
+│ AAPL              0.092   [Trade ▶]  │
 │ $189.40    RSI(2) 3.1                │
-│ Stop $181.20 · 54 sh · $9,936 risk   │
+│ No stop · 52 sh · $9,849 (10%)       │
 │ ✓ Passing                            │
 └──────────────────────────────────────┘
 ┌──────────────────────────────────────┐
@@ -140,13 +139,13 @@ The "Backdate scan" control becomes a date picker in a collapsible "Scan options
 ┌────────────────────────────────────────────────────────────────────────────┐
 │ Daily scan — 2026-04-27                                  [Run all scans]   │
 ├────────────────────────────────────────────────────────────────────────────┤
-│ ▼ RSI(2) Mean-Reversion        3 passing,  5 rejected                      │
-│   AAPL   0.92   $9,936 risk    🔗 Also flagged by: (none)                   │
-│   MRK    0.81   $7,476 risk    🔗 Also flagged by: (none)                   │
-│   CVS    0.74   $2,000 risk    🔗 Also flagged by: Donchian (long)          │
+│ ▼ RSI(2) Pullback              3 passing,  5 rejected                      │
+│   AAPL   0.092  $9,849 notional 🔗 Also flagged by: (none)                  │
+│   MRK    0.081  $9,932 notional 🔗 Also flagged by: (none)                  │
+│   CVS    0.074  $9,973 notional 🔗 Also flagged by: Momentum (long)         │
 │                                                                            │
-│ ▼ Donchian Trend                1 passing,  2 rejected                     │
-│   CVS    0.69   $5,810 risk    🔗 Also flagged by: RSI(2) (long)  ✓ aligned │
+│ ▼ 52-Week-High Momentum         1 passing,  2 rejected                     │
+│   CVS    1.62   $5,810 risk    🔗 Also flagged by: RSI(2) (long)  ✓ aligned │
 │                                                                            │
 │ ▼ Cross-strategy conflicts (0)                                             │
 │   (none today)                                                             │
@@ -183,22 +182,22 @@ The "Backdate scan" control becomes a date picker in a collapsible "Scan options
 
 ```
 ┌────────────────────────── Trade Ticket ───────────────────────────┐
-│ AAPL · long  · from RSI(2) Mean-Reversion · signal #4821          │
+│ AAPL · long  · from 52-Week-High Momentum · signal #4821          │
 │                                                                   │
-│ Strategy stop:    $181.20 (entry − 2.5×ATR)                       │
-│ Suggested qty:    54 shares  (1% risk · $9,936)                   │
-│ Notional:         $10,228                                         │
+│ Strategy stop:    $161.00 (15% below entry)                       │
+│ Suggested qty:    26 shares  (0.75% risk · $739 · vol scalar 1.0) │
+│ Notional:         $4,924                                          │
 │                                                                   │
 │ Order type:    [● Market on Open]  [○ Limit @ ___]  [○ Stop ___]  │
 │ Time in force: [● DAY]  [○ GTC]                                   │
-│ Quantity:      [ 54 ]   ← editable                                │
+│ Quantity:      [ 26 ]   ← editable                                │
 │                                                                   │
 │ Broker: Suggestion Mode (E*TRADE auth lapsed — [reconnect])       │
 │                                                                   │
 │ Entry thesis (optional):                                          │
 │ ┌───────────────────────────────────────────────────────────────┐ │
-│ │ Pulling back to recent support after Q2 beat. Index uptrend   │ │
-│ │ intact. RSI(2) at 3.1 is the lowest in 6 months.              │ │
+│ │ New 52-week high on a smooth 90-day climb; sector composite   │ │
+│ │ lagging, so the move is the stock's own. Gate open.           │ │
 │ └───────────────────────────────────────────────────────────────┘ │
 │                                                                   │
 │       [Cancel]   [Save as suggestion]   [Submit to broker]        │
@@ -207,7 +206,7 @@ The "Backdate scan" control becomes a date picker in a collapsible "Scan options
 
 ### Acceptance criteria
 
-1. Ticket pre-fills `symbol`, `side`, `qty` (from sizer), `order_type` (default market-on-open), `stop_price` (from strategy), `time_in_force`.
+1. Ticket pre-fills `symbol`, `side`, `qty` (from sizer), `order_type` (default market-on-open), `stop_price` (from the strategy; blank for a stop-less strategy such as RSI(2)), `time_in_force`.
 2. User can edit qty, order type, limit/stop prices, and TIF before submitting.
 3. **Entry thesis is captured at submit time** as the first note on the resulting trade (Story 6).
 4. Submission routes through the active `Broker`:
@@ -239,19 +238,19 @@ The trade ticket is the highest-stakes mobile screen. On phones it renders as a 
 ```
 ┌────────────────────────────┐
 │ ◄ AAPL · long              │
-│ from RSI(2) · signal #4821 │
+│ from Momentum · signal #4821│
 ├────────────────────────────┤
-│ Stop:    $181.20           │
-│ Suggested qty:   54        │
-│ Notional:  $10,228         │
-│ Risk:     $9,936 (1%)      │
+│ Stop:    $161.00 (−15%)    │
+│ Suggested qty:   26        │
+│ Notional:  $4,924          │
+│ Risk:     $739 (0.75%)     │
 │                            │
 │ Order type                 │
 │ ┌────────────────────────┐ │
 │ │ Market on Open      ▾ │ │
 │ └────────────────────────┘ │
 │                            │
-│ Quantity  [  54        ]   │
+│ Quantity  [  26        ]   │
 │ TIF       [ DAY      ▾ ]   │
 │                            │
 │ Broker: Suggestion Mode    │
@@ -295,7 +294,7 @@ This is a **strategy-on-symbol historical analysis, including filter-rejected in
 
 ```
 ┌────────────────────────────────────────────────────────────────────────────┐
-│ Base rates · AAPL · RSI(2) Mean-Reversion                                  │
+│ Base rates · AAPL · RSI(2) Pullback                                        │
 │ Setup as of 2026-04-27: RSI(2)=3.1, Close > SMA(200), no earnings in 5d   │
 ├────────────────────────────────────────────────────────────────────────────┤
 │ Historical instances on AAPL: 38 over 16 years                             │
@@ -405,13 +404,13 @@ Should the analyzer also support cross-symbol "similar setup" search? E.g., "fin
 │   Max drawdown:      −4.1%   (3 weeks, recovered 2026-03-12)               │
 │                                                                            │
 │ By strategy                                                                │
-│   RSI(2) Mean-Reversion   42 trades   68% win   +$15,200   PF 1.92        │
-│   Donchian Trend           9 trades   33% win   + $8,980   PF 2.41        │
+│   RSI(2) Pullback         42 trades   68% win   +$15,200   PF 1.92        │
+│   52-Week-High Momentum    9 trades   33% win   + $8,980   PF 2.41        │
 │                                                                            │
 │ Open positions (3)                                                         │
 │   AAPL  RSI(2)   54 sh @ 189.40   day 2 of 10   MFE +1.1%  MAE −0.4%      │
 │   MRK   RSI(2)  168 sh @ 104.55   day 1 of 10   MFE +0.2%  MAE −0.6%      │
-│   COST  Donch'  120 sh @ 712.30   day 19        MFE +4.8%  MAE −1.2%      │
+│   COST  Mom52w   35 sh @ 712.30   day 19        MFE +4.8%  MAE −1.2%      │
 │                                                                            │
 │ Closed trades (51)  ▾                                                      │
 │   Date       Sym  Strategy   Qty  Entry   Exit   Days  P&L     P&L%       │
@@ -470,7 +469,7 @@ The trades page is one of the most-checked screens (you'll want to glance at ope
 
 ```
 ┌─────────────────── Trade detail · AAPL #1247 (CLOSED) ─────────────────────┐
-│ RSI(2) Mean-Reversion · entered 2026-04-15 · exited 2026-04-19 · +1.8%     │
+│ RSI(2) Pullback · entered 2026-04-15 · exited 2026-04-19 · +1.8%           │
 ├────────────────────────────────────────────────────────────────────────────┤
 │ Notes (3)                                              [+ Add note]        │
 │                                                                            │
@@ -591,11 +590,11 @@ A red light here is a "do not trade" signal. The morning order-placement job ref
 ├────────────────────────────────────────────────────────────────────────────┤
 │ Add: [ AAPL ] [target $190.00] [above ▾]                       [Add]      │
 │                                                                            │
-│ Symbol  Last close  Δ        Volume      Tech     Target           Alert   │
-│ ──────  ──────────  ──────   ─────────   ──────   ───────────────  ─────   │
-│ AAPL    $189.40     +0.84%   52,488,700  +0.42    above $190.00  ☑       × │
-│ MRK     $104.55     -1.17%   12,003,400  −0.05    below $100.00  ☐       × │
-│ COST    $712.30     +0.34%    2,019,400  +0.18    —                          × │
+│ Symbol  Last close  Δ        Volume      Target           Alert            │
+│ ──────  ──────────  ──────   ─────────   ───────────────  ─────            │
+│ AAPL    $189.40     +0.84%   52,488,700  above $190.00  ☑                × │
+│ MRK     $104.55     -1.17%   12,003,400  below $100.00  ☐                × │
+│ COST    $712.30     +0.34%    2,019,400  —                                 × │
 └────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -609,7 +608,7 @@ A red light here is a "do not trade" signal. The morning order-placement job ref
 6. **Alert checkbox** toggles `alert_enabled`. Hidden when no target is set. Auto-submits on change.
 7. **Alert firing**: during the nightly job, after the scan, the watchlist alert checker runs. For each item where `alert_enabled = TRUE` and the latest close has crossed the target, a high-priority notification fires (subject: `AAPL crossed above $200.00`). Then `alert_enabled` flips to `FALSE` to prevent daily re-spam — the user can re-arm via the checkbox.
 8. **Idempotent re-add**: `add_to_watchlist("AAPL")` for an existing symbol is a no-op (UPSERT on `symbol`); doesn't disrupt existing target/alert config.
-9. **Tech score column** shows direction-agnostic technical bias for each symbol (Story 12 — works in this column without a firing strategy).
+9. **Sector composite chart** below the table shows the equal-weight composite each watched symbol is ranked against.
 
 ### Module mapping
 - `stockscan.watchlist.store` (CRUD + last-bar enrichment)
@@ -619,61 +618,13 @@ A red light here is a "do not trade" signal. The morning order-placement job ref
 
 ---
 
-## Story 12 — Per-signal Technical Confirmation Score
+## Story 13 — Refresh fundamentals for the sector composites
 
-> **As Thomas, I want each signal to come with a technical confirmation score that tells me whether RSI + MACD agree with the strategy's thesis, so I can quickly filter out signals where the technical setup is weak.**
-
-### Why this is per-signal, not per-symbol
-
-The same indicator value means different things to different strategies. RSI(14) at 30 *confirms* an RSI(2) mean-reversion entry (the pullback is real), but *contradicts* a Donchian breakout (momentum is fading). So the score has to know which strategy is firing.
-
-### Trigger
-- Computed automatically by the `ScanRunner` after persisting each signal (passing AND rejected — rejected ones get a score for diagnostic value).
-- Displayed on the **Signals** page (new "Tech" column) and **Watchlist** page (neutral-mode score for symbols without a firing strategy).
-
-### Happy path (UI)
-
-```
-Symbol  Strategy        Score  Tech    Entry     Stop      Qty   Date
-──────  ──────────────  ─────  ──────  ────────  ────────  ───   ──────────
-AAPL    rsi2_meanrev    0.92   +0.68 ▰ $189.40   $181.20    54   2026-04-27
-MRK     rsi2_meanrev    0.81   −0.15 ▱ $104.55   $100.10   168   2026-04-27
-NVDA    donchian_trend  0.74   +0.55 ▰ $892.10   $850.20    12   2026-04-27
-```
-
-Green `+0.68` = technicals confirm; red `−0.15` = technicals contradict.
-
-### Acceptance criteria
-
-1. **Composite score in `[-1, +1]`** — equal-weight average across registered indicators that produced a value. Indicators with insufficient history abstain (skipped, not zero-weighted).
-2. **Strategy-aware via tags**, not strategy names. RSI scores low = +confirming for `mean_reversion`-tagged strategies; high = +confirming for `trend_following` / `breakout`. Adding a new strategy of an existing kind requires no indicator code changes.
-3. **Neutral mode (`strategy=None`)** for the Watchlist: high RSI + positive/rising MACD = positive bullish bias; low RSI + negative/falling MACD = negative.
-4. **Persisted** in `technical_scores` keyed `(symbol, as_of_date, strategy_name)`. Watchlist-mode scores use `strategy_name = '_neutral'`. Idempotent upsert.
-5. **Backfillable** via `stockscan technical backfill` for past signals; `stockscan technical recompute` overwrites after scoring-formula changes.
-6. **Plugin architecture** — new technical indicators are single-file drops into `stockscan/technical/indicators/`, auto-registered via `__init_subclass__`.
-7. **Initial indicators**: RSI(14) and MACD(12,26,9). Each declares `values()` returning raw indicator output and `score(values, strategy)` returning the [-1, +1] confirmation.
-8. **Sample-size guardrails**: when an indicator has insufficient bars (e.g., RSI needs ≥19, MACD needs ≥40 days for both readings), it returns `None` and the composite skips it. If every indicator abstains, the signal has no tech score (rendered as `—`).
-
-### Module mapping
-- `stockscan.technical.indicators` (TechnicalIndicator ABC + RSI + MACD)
-- `stockscan.technical.score` (composite orchestration)
-- `stockscan.technical.store` (`technical_scores` table)
-- `stockscan.scan.runner` (calls `compute_technical_score` and `upsert_score` after each signal)
-- `stockscan.web.routes.signals` (LEFT JOIN at query time)
-- `stockscan.web.routes.watchlist` (computed on-render, neutral mode)
-
-### Open question (deferred)
-Per-signal breakdown UI on the signal detail page — show each indicator's raw values + sub-score so the operator can see *why* the composite landed where it did. Data is already persisted in `breakdown` JSONB; just needs a render. v1.5.
-
----
-
-## Story 13 — Refresh fundamentals to enable market-cap-aware strategies
-
-> **As Thomas, I want a single CLI command that pulls fundamentals (market cap, sector, P/E, etc.) for the S&P 500 universe, so strategies that filter by market cap or sector can run.**
+> **As Thomas, I want a single CLI command that pulls fundamentals (market cap, sector, P/E, etc.) for the S&P 500 universe, so the sector composites both strategies rank against have a sector map and point-in-time share counts.**
 
 ### Trigger
 - `stockscan refresh fundamentals` from the CLI.
-- Auto-scheduled (weekly) is *not* set up by default — most fundamentals fields change quarterly with earnings, so a weekly cron is a reasonable interval.
+- Scheduled weekly (`infra/crontab`, Sun 03:00 ET); most fields change quarterly with earnings.
 
 ### Happy path
 
@@ -691,8 +642,8 @@ One EODHD `/fundamentals/{TICKER}.US` call per symbol. The full payload is hundr
 2. **Typed columns** for the fields strategies will filter on at scan time: `market_cap`, `sector`, `industry`, `shares_outstanding`, `pe_ratio`, `forward_pe`, `eps_ttm`, `dividend_yield`, `beta`, `week_52_high`, `week_52_low`, plus ~25 more.
 3. **`raw_payload` JSONB** retains the full provider response so future fields can be extracted without a migration.
 4. **Indexes**: partial DESC index on `market_cap` (used by `market_cap_percentile` queries) and `sector`.
-5. **`market_cap_percentile(symbol)` helper** uses Postgres `PERCENT_RANK()` over the snapshot table — used by the Largecap Rebound strategy's universe filter.
-6. **Robust to provider quirks**: missing fields silently become `None`; the strategy abstains rather than incorrectly passing/failing on `None`.
+5. **`market_cap_percentile(symbol)` helper** uses Postgres `PERCENT_RANK()` over the snapshot table — available to the analysis page and MCP tools; no strategy filters on it at scan time.
+6. **Robust to provider quirks**: missing fields silently become `None`; a symbol with no sector simply has no composite and passes the sector cap unfiltered.
 
 ### Module mapping
 - `stockscan.data.providers.eodhd.get_fundamentals` (one API call per symbol)
@@ -700,7 +651,7 @@ One EODHD `/fundamentals/{TICKER}.US` call per symbol. The full payload is hundr
 - `stockscan.fundamentals.store` (`upsert_fundamentals`, `market_cap_percentile`, `list_by_market_cap`)
 
 ### Caveat
-Currently the snapshot is *latest only*, not historical. A backtest of 2015 applies *today's* market-cap percentiles to historical bars — minor look-ahead bias on the universe filter (prices are still historical and clean). True historical fundamentals (point-in-time per quarter) is a Phase 5 enhancement.
+The snapshot is *latest only*. `fundamentals_history` (migration 0023) adds point-in-time shares outstanding for the cap-weighted composites; sector per period is still a TODO (`TODO.md`).
 
 ---
 
@@ -709,10 +660,10 @@ Currently the snapshot is *latest only*, not historical. A backtest of 2015 appl
 These apply to multiple stories.
 
 ### Determinism
-Same inputs → same outputs. A signal generated twice for the same `(strategy, symbol, as_of_date, params_version)` is byte-identical. Required for trust and debugging.
+Same inputs → same outputs. A signal generated twice for the same `(strategy, symbol, as_of_date, strategy_version)` is byte-identical. Required for trust and debugging.
 
 ### Observability
-Every scan, signal, order, fill, and exit decision is persisted with full context (params, timestamps, inputs). The dashboard shows recent activity; the DB allows arbitrary post-hoc queries.
+Every scan, signal, order, fill, and exit decision is persisted with full context (strategy version and knobs, timestamps, inputs). The dashboard shows recent activity; the DB allows arbitrary post-hoc queries.
 
 ### Reversibility
 No destructive operations from the UI without explicit confirmation. Notes are append-only by default (edit history kept). Closed trades can be re-opened only via a CLI admin command.

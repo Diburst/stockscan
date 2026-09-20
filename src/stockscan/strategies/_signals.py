@@ -28,28 +28,28 @@ class RawSignal:
     side: Side
     score: Decimal
     suggested_entry: Decimal
-    suggested_stop: Decimal
+    # None for strategies that size by fixed fraction and carry no price stop.
+    suggested_stop: Decimal | None
     suggested_target: Decimal | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
 class PositionSnapshot:
-    """Minimal position view passed to Strategy.exit_rules() and ratchet_stop()."""
+    """Minimal position view passed to Strategy.exit_rules()."""
 
     symbol: str
     qty: int
     avg_cost: Decimal
     opened_at: datetime
     strategy: str
-    current_stop: Decimal | None = None
 
 
 @dataclass(frozen=True, slots=True)
 class ExitDecision:
     """Sell decision returned by Strategy.exit_rules()."""
 
-    reason: str  # human-readable: 'rsi_cross', 'time_stop', 'hard_stop', etc.
+    reason: str  # human-readable: 'rsi_recovered', 'time_stop', 'stop_loss', etc.
     qty: int  # full or partial
     order_type: str = "market_on_open"
     limit_price: Decimal | None = None

@@ -14,9 +14,6 @@ Layout:
     |     │ \/     \/            │  │     └──────────┘   │         |
     |     │ ─── SMA(20)          │  │   * current $X.XX  │         |
     |     │ ─── SMA(50)          │  └────────────────────┘         |
-    |     │                     │                                  |
-    |     ┝─R: $XX────────────  ┝────────────  resistance horizon  |
-    |     ┝─S: $YY────────────  ┝────────────  support horizon     |
     +------------------------------------------------------------+
 
 Components rendered:
@@ -24,8 +21,6 @@ Components rendered:
   * **Price line** - last 90 days of close (from ``analysis.closes_history``).
   * **MA overlays** - SMA(20) and SMA(50) computed inside this module
     so the chart self-contains. Lighter strokes than the price line.
-  * **Horizontal S/R lines** - every level in ``analysis.levels`` drawn
-    as a horizontal band at the level's price, labeled.
   * **Forward range bands** - two shaded rectangles to the right of
     today's bar showing the 7d and 30d ±1sigma expected range.
   * **Current price marker** - labeled dot.
@@ -58,8 +53,6 @@ _COLOR_SMA20 = "#1d4ed8"  # blue-700, slightly muted
 _COLOR_SMA50 = "#7c3aed"  # purple-600
 _COLOR_GRID = "#e2e8f0"  # ink-200
 _COLOR_AXIS = "#64748b"  # ink-500
-_COLOR_SUPPORT = "#059669"  # ok-600
-_COLOR_RESISTANCE = "#dc2626"  # bad-600
 _COLOR_BAND_7D = "#fde68a"  # warm yellow, ~30% alpha applied via CSS
 _COLOR_BAND_30D = "#fed7aa"  # warm orange-yellow
 _COLOR_CURRENT = "#0f172a"
@@ -94,11 +87,9 @@ def render_chart_svg(
     sma20 = _rolling_mean(closes, 20)
     sma50 = _rolling_mean(closes, 50)
 
-    # Y-axis range. Include current closes + S/R levels + forward
-    # range bands so everything fits.
+    # Y-axis range. Include current closes + forward range bands so
+    # everything fits.
     y_values: list[float] = list(closes)
-    for lv in analysis.levels:
-        y_values.append(lv.price)
     if analysis.volatility.expected_30d:
         y_values.append(analysis.volatility.expected_30d.high)
         y_values.append(analysis.volatility.expected_30d.low)
@@ -209,24 +200,6 @@ def render_chart_svg(
             f'width="{band_w:.1f}" height="{(y_low - y_high):.1f}" '
             f'fill="{_COLOR_BAND_7D}" fill-opacity="0.55" '
             f'stroke="{_COLOR_BAND_7D}" stroke-width="0.5" />'
-        )
-
-    # Horizontal S/R lines.
-    for lv in analysis.levels:
-        y = y_for(lv.price)
-        color = _COLOR_SUPPORT if lv.kind == "support" else _COLOR_RESISTANCE
-        parts.append(
-            f'<line x1="{plot_x_left}" y1="{y:.1f}" '
-            f'x2="{plot_x_right}" y2="{y:.1f}" '
-            f'stroke="{color}" stroke-width="1" stroke-dasharray="4 3" '
-            f'opacity="{0.30 + 0.70 * lv.strength:.2f}" />'
-        )
-        # Tag at left edge: "R: $X" or "S: $X"
-        kind_letter = "R" if lv.kind == "resistance" else "S"
-        parts.append(
-            f'<text x="{plot_x_left + 2}" y="{y - 2:.1f}" '
-            f'fill="{color}" font-size="9" font-weight="600">'
-            f'{kind_letter} ${lv.price:.2f}</text>'
         )
 
     # MA overlays (SMA20 then SMA50).

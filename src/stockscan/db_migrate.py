@@ -38,11 +38,12 @@ from pathlib import Path
 
 from sqlalchemy import text
 
+from stockscan.config import settings
 from stockscan.db import get_engine, session_scope
 
 log = logging.getLogger(__name__)
 
-MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "migrations"
+MIGRATIONS_DIR = settings.resolved_migrations_dir
 VERSION_TABLE = "_migrations"
 
 _VERSION_RE = re.compile(r"^(\d{4})_(.+)\.sql$")
@@ -78,9 +79,11 @@ def _checksum(s: str) -> str:
 
 def discover_migrations(directory: Path = MIGRATIONS_DIR) -> list[Migration]:
     """Return all migration files in version order."""
+    if not directory.is_dir():
+        raise FileNotFoundError(
+            f"migrations directory not found: {directory} — set STOCKSCAN_MIGRATIONS_DIR"
+        )
     out: list[Migration] = []
-    if not directory.exists():
-        return out
     for path in sorted(directory.glob("*.sql")):
         m = _VERSION_RE.match(path.name)
         if not m:

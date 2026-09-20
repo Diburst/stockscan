@@ -3,11 +3,9 @@
 Returns a JSON-serializable dict containing:
 
   * ``bars``        — chronological OHLCV in Lightweight-Charts format.
-  * ``studies``     — every selectable indicator (SMAs, EMAs, Bollinger,
-                      Donchian, ATR bands, RSI, MACD), pre-computed so
-                      toggling on the client never round-trips.
-  * ``levels``      — support / resistance horizontal lines from the
-                      already-computed :class:`SymbolAnalysis`.
+  * ``studies``     — every selectable indicator (SMAs, EMAs, ATR bands,
+                      volume), pre-computed so toggling on the client
+                      never round-trips.
   * ``expected_move`` — forward ±1σ bands (7d / 30d) from
                         :class:`VolatilityState.expected_*`.
   * ``default_on``  — which studies/overlays are visible on first open.
@@ -34,7 +32,6 @@ import pandas as pd
 
 from stockscan.analysis.state import SymbolAnalysis
 from stockscan.indicators import ta
-from stockscan.indicators.fibonacci import fibonacci_retracement
 
 if TYPE_CHECKING:
     from sqlalchemy.orm import Session
@@ -49,14 +46,13 @@ log = logging.getLogger(__name__)
 _CHART_HISTORY_DAYS = 756
 
 # Studies on by default when the user first lands on /analysis/{symbol}.
-# Per Thomas's selection: 50 SMA, 200 SMA, expected-move bands, S/R levels.
+# Per Thomas's selection: 50 SMA, 200 SMA, expected-move bands.
 # Volume is always shown — it's part of the candle pane convention.
 DEFAULT_STUDIES: tuple[str, ...] = (
     "sma_50",
     "sma_200",
     "volume",
     "expected_move",
-    "levels",
 )
 
 
@@ -112,8 +108,7 @@ def build_chart_payload(
         Ticker.
     analysis:
         The already-computed :class:`SymbolAnalysis` for this symbol;
-        gives us S/R levels + expected-move bands without re-running
-        the engine.
+        gives us the expected-move bands without re-running the engine.
     session:
         Optional DB session for the bars fetch.
     bars:
@@ -165,7 +160,7 @@ def build_chart_payload(
     # ---- Overlays (price-pane) ---------------------------------------------
     # All studies follow the same shape: a {label, kind, data, color} dict.
     # ``kind`` tells the client renderer which Lightweight Charts series type
-    # to use ("line", "band", "subpanel_line", "subpanel_macd").
+    # to use ("line", "band", "subpanel_volume").
     studies: dict[str, dict[str, Any]] = {}
 
     # Simple / exponential moving averages, common 20 / 50 / 200 grid.
@@ -198,26 +193,6 @@ def build_chart_payload(
         "label": "EMA(200)", "kind": "line",
         "color": "#7c3aed",  # violet-600
         "data": _series_to_lwc(ta.ema(close, 200), dates),
-    }
-
-    # Bollinger Bands (20, 2σ): one combined band with upper / middle / lower.
-    bb = ta.bollinger_bands(close, period=20, stddev=2.0)
-    studies["bb"] = {
-        "label": "Bollinger(20, 2σ)", "kind": "band",
-        "color": "#94a3b8",  # slate-400
-        "upper": _series_to_lwc(bb["upper"], dates),
-        "middle": _series_to_lwc(bb["middle"], dates),
-        "lower": _series_to_lwc(bb["lower"], dates),
-    }
-
-    # Donchian channel (20).
-    dch = ta.donchian_channel(high, low, period=20)
-    studies["donchian"] = {
-        "label": "Donchian(20)", "kind": "band",
-        "color": "#fb923c",  # orange-400
-        "upper": _series_to_lwc(dch["upper"], dates),
-        "middle": _series_to_lwc(dch["middle"], dates),
-        "lower": _series_to_lwc(dch["lower"], dates),
     }
 
     # ATR(14) × 2 bands around close. Close ± 2×ATR is the canonical "envelope"
@@ -255,64 +230,6 @@ def build_chart_payload(
         "data": volume_recs,
     }
 
-    studies["rsi_14"] = {
-        "label": "RSI(14)", "kind": "subpanel_line",
-        "color": "#9333ea",  # purple-600
-        "data": _series_to_lwc(ta.rsi(close, period=14), dates),
-        # Optional reference levels the client can draw as price lines on
-        # the RSI subpanel — 70 / 30 are the canonical overbought / oversold
-        # bands.
-        "ref_lines": [
-            {"price": 70.0, "color": "#dc2626", "label": "70 (OB)"},
-            {"price": 30.0, "color": "#059669", "label": "30 (OS)"},
-        ],
-    }
-
-    macd_df = ta.macd(close)
-    studies["macd"] = {
-        "label": "MACD(12, 26, 9)", "kind": "subpanel_macd",
-        "color": "#0ea5e9",
-        "line": _series_to_lwc(macd_df["macd"], dates),
-        "signal": _series_to_lwc(macd_df["signal"], dates),
-        "histogram": _series_to_lwc(macd_df["histogram"], dates),
-    }
-
-    # ---- Levels (price-pane horizontal lines from SymbolAnalysis) ----------
-    # confirmed_by_weekly flows through to the chart so the renderer can
-    # visually tier daily-only vs. multi-timeframe-confirmed levels — see
-    # the discussion in find_support_resistance's docstring for why this
-    # is the strongest tiebreak we surface.
-    levels: list[dict[str, Any]] = [
-        {
-            "price": float(lv.price),
-            "kind": lv.kind,
-            "strength": float(lv.strength),
-            "is_flipped": bool(lv.is_flipped),
-            "confirmed_by_weekly": bool(lv.confirmed_by_weekly),
-            "label": (
-                f"{'S' if lv.kind == 'support' else 'R'} "
-                f"${lv.price:.2f}"
-                f"{' ·W' if lv.confirmed_by_weekly else ''}"
-            ),
-        }
-        for lv in (analysis.levels or [])
-    ]
-
-    # ---- Fibonacci retracement levels --------------------------------------
-    # Pure-bar primitive; toggleable in the chart sidebar. None when the
-    # bars are too short for the lookback or the anchor swing is flat.
-    fib = fibonacci_retracement(bars)
-    fib_payload: dict[str, Any] | None = None
-    if fib is not None:
-        fib_payload = {
-            "high": fib["high"],
-            "low": fib["low"],
-            "high_date": fib["high_date"].isoformat(),
-            "low_date": fib["low_date"].isoformat(),
-            "direction": fib["direction"],
-            "levels": fib["levels"],
-        }
-
     # ---- Expected-move bands (forward ±1σ projections) ---------------------
     expected_move: dict[str, dict[str, Any]] = {}
     if analysis.volatility.expected_7d is not None:
@@ -340,8 +257,6 @@ def build_chart_payload(
         ),
         "bars": _bars_to_lwc(bars, dates),
         "studies": studies,
-        "levels": levels,
         "expected_move": expected_move,
-        "fib_retracement": fib_payload,
         "default_on": list(DEFAULT_STUDIES),
     }

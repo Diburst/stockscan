@@ -60,7 +60,6 @@ services:
     env_file: .env
     volumes:
       - logs:/app/logs
-      - models:/app/models
     depends_on:
       db:
         condition: service_healthy
@@ -88,7 +87,6 @@ services:
     env_file: .env
     volumes:
       - logs:/app/logs
-      - models:/app/models
       - backups:/backups
     depends_on:
       db:
@@ -99,5 +97,4 @@ services:
 volumes:
   pgdata:
   logs:
-  models:
   backups:

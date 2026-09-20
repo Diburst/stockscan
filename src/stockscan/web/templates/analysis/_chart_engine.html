@@ -31,7 +31,7 @@
 (function () {
   const WINDOWS = { '7d': 7, '30d': 30, '90d': 90, '1y': 252, '3y': 756 };
   const DEFAULT_WINDOW = '90d';
-  const SUBPANEL_KEYS = ['volume', 'rsi_14', 'macd'];
+  const SUBPANEL_KEYS = ['volume'];
 
   // Sidebar render order + grouping. Same shape the detail sidebar expects.
   const STUDY_DEFS = [
@@ -41,19 +41,12 @@
     ['ema_20',          'EMA(20)',               'overlay'],
     ['ema_50',          'EMA(50)',               'overlay'],
     ['ema_200',         'EMA(200)',              'overlay'],
-    ['bb',              'Bollinger(20,2σ)',      'overlay'],
-    ['donchian',        'Donchian(20)',          'overlay'],
     ['atr_bands',       'ATR(14) ±2× bands',     'overlay'],
     ['volume',          'Volume',                'subpanel'],
-    ['rsi_14',          'RSI(14)',               'subpanel'],
-    ['macd',            'MACD(12,26,9)',         'subpanel'],
-    ['levels',          'Support / resistance',  'level'],
     ['expected_move',   'Implied move (±1σ)',    'level'],
-    ['fib_retracement', 'Fibonacci retracement', 'level'],
   ];
 
   const fmt2 = v => v == null ? '—' : v.toFixed(2);
-  const fmt3 = v => v == null ? '—' : v.toFixed(3);
   const fmtVol = v => {
     if (v == null) return '—';
     if (v >= 1e9) return (v / 1e9).toFixed(2) + 'B';
@@ -125,8 +118,8 @@
       studyMeta[key] = { label: st.label, kind: 'line', color: st.color, series: [series] };
     });
 
-    // Band overlays (BB, Donchian, ATR): three line series each.
-    ['bb', 'donchian', 'atr_bands'].forEach(key => {
+    // Band overlay (ATR): three line series.
+    ['atr_bands'].forEach(key => {
       const st = payload.studies[key];
       if (!st || !st.upper || !st.upper.length) return;
       const lines = ['upper', 'middle', 'lower'].map(part => {
@@ -147,7 +140,7 @@
 
     // ----- Subpanel layout helper -----
     function layoutSubpanels() {
-      const order = ['macd', 'rsi_14', 'volume'];
+      const order = ['volume'];
       const slot = 0.15;
       const visible = order.filter(k => enabled.has(k) && payload.studies[k]);
       const totalSub = visible.length * slot;
@@ -180,83 +173,7 @@
       studyMeta.volume = { label: 'Vol', kind: 'volume', color: st.color, series: [volumeSeries] };
     })();
 
-    // RSI — line series with 70 / 30 reference lines.
-    (function () {
-      const st = payload.studies.rsi_14;
-      if (!st || !st.data || !st.data.length) return;
-      const rsiSeries = chart.addLineSeries({
-        color: st.color, lineWidth: 2,
-        priceLineVisible: false, lastValueVisible: false,
-        crosshairMarkerVisible: false,
-        priceScaleId: 'rsi',
-        visible: enabled.has('rsi_14'),
-      });
-      rsiSeries.setData(st.data);
-      (st.ref_lines || []).forEach(rl => {
-        rsiSeries.createPriceLine({
-          price: rl.price, color: rl.color, lineWidth: 1,
-          lineStyle: 2, axisLabelVisible: false, title: rl.label,
-        });
-      });
-      seriesByKey.rsi_14 = [rsiSeries];
-      studyMeta.rsi_14 = { label: st.label, kind: 'line', color: st.color, series: [rsiSeries] };
-    })();
-
-    // MACD — line + signal + histogram.
-    (function () {
-      const st = payload.studies.macd;
-      if (!st || !st.line || !st.line.length) return;
-      const macdLine = chart.addLineSeries({
-        color: st.color, lineWidth: 2,
-        priceLineVisible: false, lastValueVisible: false,
-        crosshairMarkerVisible: false,
-        priceScaleId: 'macd',
-        visible: enabled.has('macd'),
-      });
-      macdLine.setData(st.line);
-      const macdSignal = chart.addLineSeries({
-        color: '#f97316',
-        lineWidth: 1, lineStyle: 2,
-        priceLineVisible: false, lastValueVisible: false,
-        crosshairMarkerVisible: false,
-        priceScaleId: 'macd',
-        visible: enabled.has('macd'),
-      });
-      macdSignal.setData(st.signal);
-      const macdHist = chart.addHistogramSeries({
-        priceScaleId: 'macd',
-        visible: enabled.has('macd'),
-      });
-      macdHist.setData(st.histogram.map(d => ({
-        time: d.time, value: d.value,
-        color: d.value >= 0 ? 'rgba(5,150,105,0.6)' : 'rgba(220,38,38,0.6)',
-      })));
-      seriesByKey.macd = [macdLine, macdSignal, macdHist];
-      studyMeta.macd = {
-        label: st.label, kind: 'macd', color: st.color,
-        series: [macdLine, macdSignal, macdHist],
-        signalColor: '#f97316',
-      };
-    })();
-
-    // ----- Price-pane horizontal lines: S/R levels + expected-move + Fib -----
-    function applyLevels(on) {
-      (priceLinesByKey.levels || []).forEach(pl => candles.removePriceLine(pl));
-      priceLinesByKey.levels = [];
-      if (!on) return;
-      (payload.levels || []).forEach(lv => {
-        const confirmed = lv.confirmed_by_weekly;
-        const baseWidth = Math.max(1, Math.round(lv.strength * 2 + 1));
-        const width = confirmed ? baseWidth + 1 : baseWidth;
-        const style = confirmed ? 0 : (lv.is_flipped ? 1 : 2);
-        priceLinesByKey.levels.push(candles.createPriceLine({
-          price: lv.price,
-          color: lv.kind === 'support' ? '#059669' : '#dc2626',
-          lineWidth: width, lineStyle: style,
-          axisLabelVisible: true, title: lv.label,
-        }));
-      });
-    }
+    // ----- Price-pane horizontal lines: expected-move -----
     function applyExpectedMove(on) {
       (priceLinesByKey.expected_move || []).forEach(pl => candles.removePriceLine(pl));
       priceLinesByKey.expected_move = [];
@@ -276,35 +193,15 @@
         }));
       });
     }
-    function applyFib(on) {
-      (priceLinesByKey.fib || []).forEach(pl => candles.removePriceLine(pl));
-      priceLinesByKey.fib = [];
-      if (!on) return;
-      const fib = payload.fib_retracement;
-      if (!fib || !fib.levels || !fib.levels.length) return;
-      fib.levels.forEach(lv => {
-        priceLinesByKey.fib.push(candles.createPriceLine({
-          price: lv.price, color: '#64748b',
-          lineWidth: 1, lineStyle: 2,
-          axisLabelVisible: true, title: 'Fib ' + lv.label,
-        }));
-      });
-    }
-
     function hasStudy(key) {
-      if (key === 'fib_retracement') return !!payload.fib_retracement;
-      if (key === 'levels' || key === 'expected_move') return true;
+      if (key === 'expected_move') return true;
       return !!payload.studies[key];
     }
 
     function setStudy(key, on) {
       if (on) enabled.add(key); else enabled.delete(key);
-      if (key === 'levels') {
-        applyLevels(on);
-      } else if (key === 'expected_move') {
+      if (key === 'expected_move') {
         applyExpectedMove(on);
-      } else if (key === 'fib_retracement') {
-        applyFib(on);
       } else if (seriesByKey[key]) {
         seriesByKey[key].forEach(s => s.applyOptions({ visible: on }));
         if (SUBPANEL_KEYS.includes(key)) layoutSubpanels();
@@ -353,9 +250,7 @@
     }
 
     // ----- Initial render -----
-    applyLevels(enabled.has('levels'));
     applyExpectedMove(enabled.has('expected_move'));
-    applyFib(enabled.has('fib_retracement'));
     layoutSubpanels();
     setWindow(opts.defaultWindow || DEFAULT_WINDOW);
 
@@ -364,8 +259,7 @@
       const TOOLTIP_ROW_ORDER = [
         'sma_20', 'sma_50', 'sma_200',
         'ema_20', 'ema_50', 'ema_200',
-        'bb', 'donchian', 'atr_bands',
-        'volume', 'rsi_14', 'macd',
+        'atr_bands', 'volume',
       ];
       function studyRowHtml(key, param) {
         const meta = studyMeta[key];
@@ -398,22 +292,6 @@
           return '<div>' + sw +
             '<span style="color:#64748b">' + meta.label + '</span> ' +
             '<span style="font-weight:600">' + fmtVol(d.value) + '</span></div>';
-        }
-        if (meta.kind === 'macd') {
-          const line = param.seriesData.get(meta.series[0]);
-          const signal = param.seriesData.get(meta.series[1]);
-          const hist = param.seriesData.get(meta.series[2]);
-          if (!line && !signal && !hist) return '';
-          const histColor = (hist && hist.value >= 0) ? '#059669' : '#dc2626';
-          return '<div>' + sw +
-            '<span style="color:#64748b">' + meta.label + '</span><br>' +
-            '<span style="margin-left:14px; color:#64748b">L</span> ' +
-              '<span style="color:' + meta.color + '">' + fmt3(line && line.value) + '</span>' +
-            ' <span style="color:#64748b">S</span> ' +
-              '<span style="color:' + meta.signalColor + '">' + fmt3(signal && signal.value) + '</span>' +
-            ' <span style="color:#64748b">H</span> ' +
-              '<span style="color:' + histColor + '; font-weight:600">' + fmt3(hist && hist.value) + '</span>' +
-            '</div>';
         }
         return '';
       }

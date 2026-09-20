@@ -1,11 +1,11 @@
 """Market-regime routes.
 
 Endpoint:
-  POST /regime/refresh   — pull the latest SPY / VIX / RSP bars from the
-                            provider, recompute the regime composite for
-                            today, and return the freshly-rendered regime
-                            card so HTMX can swap it in place on the
-                            dashboard.
+  POST /regime/refresh   — pull the latest SPY bars from the provider,
+                            recompute the trend gate / vol scalar /
+                            credit-stress flag for today, and return the
+                            freshly-rendered regime card so HTMX can swap
+                            it in place on the dashboard.
 
 The refresh handler covers the common "indicators look stale" failure
 mode: in single-user dev, the nightly cron may not have run, so
@@ -13,8 +13,8 @@ mode: in single-user dev, the nightly cron may not have run, so
 the daily timer — bars catch up, ``detect_regime`` re-runs with
 ``force_recompute=True``, and the card swaps in place.
 
-HY OAS (the credit component) is FRED-side and lags ~2 trading days, so
-it is NOT refreshed here — the nightly ``refresh macro`` job handles it.
+HY OAS (the credit-stress input) is FRED-side and lags ~2 trading days,
+so it is NOT refreshed here — the nightly ``refresh macro`` job handles it.
 """
 
 from __future__ import annotations
@@ -33,11 +33,7 @@ from stockscan.data.backfill import (
 )
 from stockscan.data.providers.eodhd import EODHDError, EODHDProvider
 from stockscan.data.store import latest_bar_date
-from stockscan.regime import (
-    build_strategy_factors,
-    detect_regime,
-    latest_regime,
-)
+from stockscan.regime import detect_regime, latest_regime
 from stockscan.strategies import STRATEGY_REGISTRY, discover_strategies
 from stockscan.web.deps import (
     attach_hx_toast,
@@ -49,11 +45,10 @@ from stockscan.web.deps import (
 router = APIRouter(prefix="/regime")
 log = logging.getLogger(__name__)
 
-# Symbols the regime composite reads. Filtered server-side so the
+# The one symbol the regime rules read. Filtered server-side so the
 # bulk-EOD response is small even though the endpoint pulls the full
 # exchange.
-_REGIME_US_SYMBOLS = {"SPY", "RSP"}
-_REGIME_INDX_SYMBOLS = {"VIX"}
+_REGIME_SYMBOLS = {"SPY"}
 
 # How many recent trading days to refresh. 5 covers a long weekend +
 # the typical "missed the nightly job" gap. detect_regime only needs
@@ -80,7 +75,7 @@ def refresh_endpoint(
     request: Request,
     s: Session = Depends(get_session),
 ):
-    """Refresh SPY/VIX/RSP bars and recompute the regime for today.
+    """Refresh SPY bars and recompute the regime for today.
 
     HTMX swaps the response into ``#regime-card`` so the dashboard
     updates in place without a full page reload. The partial is the
@@ -115,38 +110,23 @@ def refresh_endpoint(
     if not api_key:
         error = "EODHD_API_KEY is not set. Add it to your .env to refresh bars."
     else:
-        # ---- Phase 1: refresh recent SPY/RSP/VIX bars. ----
-        # Gap-fill per exchange group only up to the latest completed session:
-        # when the regime symbols already cover it, BOTH bulk calls are skipped
-        # and the refresh is a zero-cost no-op (detect_regime still re-runs on
-        # the existing bars below). Each exchange group is gated independently
-        # because INDX (VIX) can post later than US equities.
+        # ---- Phase 1: refresh recent SPY bars. ----
+        # Gap-fill only up to the latest completed session: when SPY already
+        # covers it the bulk call is skipped and the refresh is a zero-cost
+        # no-op (detect_regime still re-runs on the existing bars below).
         target = latest_completed_session()
         floor = today - timedelta(days=_REFRESH_DAYS_BACK)
-
-        def _group_window(symbols: set[str]) -> list[date]:
-            # Oldest latest-bar across the group (a symbol with no bars → floor,
-            # forcing a full-window backfill). Clamp the look-back to floor.
-            latest = min(
-                (latest_bar_date(sym, session=s) or floor) for sym in symbols
-            )
-            return trading_days_since(max(latest, floor), target)
-
-        us_window = _group_window(_REGIME_US_SYMBOLS)
-        indx_window = _group_window(_REGIME_INDX_SYMBOLS)
+        # A symbol with no bars → floor, forcing a full-window backfill.
+        latest = min(
+            (latest_bar_date(sym, session=s) or floor) for sym in _REGIME_SYMBOLS
+        )
+        window = trading_days_since(max(latest, floor), target)
         try:
-            if us_window or indx_window:
+            if window:
                 with EODHDProvider(api_key=api_key) as provider:
-                    if us_window:
-                        bars_upserted += refresh_recent_days_bulk(
-                            provider, us_window, exchange="US",
-                            filter_to=_REGIME_US_SYMBOLS,
-                        )
-                    if indx_window:
-                        bars_upserted += refresh_recent_days_bulk(
-                            provider, indx_window, exchange="INDX",
-                            filter_to=_REGIME_INDX_SYMBOLS,
-                        )
+                    bars_upserted += refresh_recent_days_bulk(
+                        provider, window, exchange="US", filter_to=_REGIME_SYMBOLS,
+                    )
         except EODHDError as exc:
             log.warning("regime refresh: provider error: %s", exc)
             error = f"Provider error: {exc}"
@@ -214,13 +194,11 @@ def _render_card(
     toast: tuple[str, str] | None,
 ):
     """Render the regime card partial with the post-refresh context."""
-    regime = latest_regime(session=session)
-    strategy_factors = build_strategy_factors(regime, STRATEGY_REGISTRY.all())
     response = render(
         request,
         "_regime_card.html",
-        regime=regime,
-        strategy_factors=strategy_factors,
+        regime=latest_regime(session=session),
+        strategies=STRATEGY_REGISTRY.all(),
         regime_refresh_error=error,
         regime_refresh_summary=summary,
     )

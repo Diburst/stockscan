@@ -44,7 +44,7 @@ def ensure_strategy_version(
         "dn": strategy_cls.display_name,
         "d": strategy_cls.description,
         "t": list(strategy_cls.tags),
-        "schema": json.dumps(strategy_cls.params_json_schema()),
+        "schema": json.dumps(strategy_cls.knobs()),
         "fp": strategy_cls.code_fingerprint(),
     }
     if session is not None:

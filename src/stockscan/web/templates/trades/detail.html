@@ -5,7 +5,7 @@
 
 {% block content %}
 {% if not trade %}
-  {{ empty("Trade not found.", "❓") }}
+  {{ empty("Trade not found.") }}
   <div class="mt-4">{{ back_link("/trades", "Back to trades") }}</div>
 {% else %}
 <div class="space-y-6">
@@ -54,7 +54,7 @@
         {% endfor %}
       </ul>
     {% else %}
-      {{ empty("No lots recorded.", "🧾") }}
+      {{ empty("No lots recorded.") }}
     {% endif %}
   {% endcall %}
 
@@ -74,7 +74,7 @@
         {% endfor %}
       </ul>
     {% else %}
-      {{ empty("No notes yet — capture your thesis below.", "📝") }}
+      {{ empty("No notes yet — capture your thesis below.") }}
     {% endif %}
 
     <form action="/trades/{{ trade.trade_id }}/notes" method="post" class="mt-4 space-y-2">

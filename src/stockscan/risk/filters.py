@@ -68,6 +68,20 @@ def make_max_positions_filter(limit: int) -> Filter:
     return _f
 
 
+def make_strategy_positions_filter(limit: int) -> Filter:
+    """Cap the number of open positions belonging to the signal's strategy."""
+
+    def _f(signal: RawSignal, qty: int, ctx: PortfolioContext) -> FilterResult:
+        held = sum(
+            1 for p in ctx.open_positions.values() if p.get("strategy") == signal.strategy_name
+        )
+        if held >= limit:
+            return FilterResult(False, f"max_{signal.strategy_name}_positions_{limit}")
+        return FilterResult(True)
+
+    return _f
+
+
 def make_max_position_pct_filter(max_pct: Decimal) -> Filter:
     def _f(signal: RawSignal, qty: int, ctx: PortfolioContext) -> FilterResult:
         notional = signal.suggested_entry * qty
@@ -141,18 +155,22 @@ class FilterChain:
         max_sector_pct: Decimal,
         max_adv_pct: Decimal,
         max_drawdown: Decimal,
+        strategy_max_positions: int | None = None,
     ) -> FilterChain:
-        return cls(
-            filters=[
-                make_drawdown_circuit_breaker(max_drawdown),
-                filter_already_in_position,
-                filter_earnings_5d,
-                make_max_positions_filter(max_positions),
-                make_max_position_pct_filter(max_position_pct),
-                make_max_sector_pct_filter(max_sector_pct),
-                make_max_adv_pct_filter(max_adv_pct),
-            ]
-        )
+        filters = [
+            make_drawdown_circuit_breaker(max_drawdown),
+            filter_already_in_position,
+            filter_earnings_5d,
+            make_max_positions_filter(max_positions),
+        ]
+        if strategy_max_positions is not None:
+            filters.append(make_strategy_positions_filter(strategy_max_positions))
+        filters += [
+            make_max_position_pct_filter(max_position_pct),
+            make_max_sector_pct_filter(max_sector_pct),
+            make_max_adv_pct_filter(max_adv_pct),
+        ]
+        return cls(filters=filters)
 
     def evaluate(
         self, signal: RawSignal, qty: int, ctx: PortfolioContext

@@ -17,7 +17,6 @@ infra/pgdata
 infra/migration_export
 logs
 backups
-models
 pytest-cache-files-*
 tsla1
 

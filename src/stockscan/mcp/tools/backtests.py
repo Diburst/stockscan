@@ -24,23 +24,19 @@ def list_backtests(strategy: str | None = None, limit: int = 25) -> dict[str, An
     return {"count": len(runs), "runs": [jsonable(r) for r in runs]}
 
 
-def get_backtest(
-    run_id: int, include_per_day: bool = False, include_regime: bool = False
-) -> dict[str, Any]:
-    """Export a single backtest run's results (trades, score breakdowns, equity).
+def get_backtest(run_id: int, include_regime: bool = False) -> dict[str, Any]:
+    """Export a single backtest run's results (trades with entry metadata,
+    summary stats, equity curve).
 
     Args:
         run_id: The run id (from list_backtests).
-        include_per_day: Include the daily equity curve (larger payload).
         include_regime: Include the daily regime overlay across the window.
 
     Returns:
         The export bundle as a dict, or {"error": "not_found"} for an unknown id.
     """
     try:
-        bundle = export_run(
-            run_id, include_per_day=include_per_day, include_regime=include_regime
-        )
+        bundle = export_run(run_id, include_regime=include_regime)
     except (KeyError, ValueError) as exc:
         return {"error": "not_found", "run_id": run_id, "detail": str(exc)}
     if bundle is None:

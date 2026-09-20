@@ -49,16 +49,6 @@ notify = [
     # Optional: rich Discord embeds. We can post webhooks with httpx alone.
     "discord-webhook>=1.3",
 ]
-ml = [
-    # Meta-labeling layer (Lopez de Prado, 2017). XGBoost binary classifier
-    # over engineered daily-bar features predicts P(profitable) for each
-    # signal; runner persists the score into signals.metadata. Models are
-    # trained via `stockscan ml train <strategy>` and pickled to ./models/.
-    # scikit-learn pulled in for train/test splitting + metrics; the model
-    # itself is xgboost.
-    "xgboost>=2.1",
-    "scikit-learn>=1.5",
-]
 mcp = [
     # MCP server (stockscan.mcp): exposes signals/watchlist/scans/analysis to AI
     # agents over the Model Context Protocol. Only needed when

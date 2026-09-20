@@ -7,8 +7,7 @@
     <h1 class="text-xl font-semibold">Options — proposed book</h1>
     <span class="text-sm text-ink-400">
       {{ as_of }} ·
-      {% if regime %}regime: {{ regime.regime }}
-        {% if regime.composite_score is not none %}({{ '%.2f'|format(regime.composite_score|float) }}){% endif %}
+      {% if regime %}regime: {{ regime.regime }} · vol scalar {{ '%.2f'|format(regime.vol_multiplier) }}
       {% else %}regime: n/a{% endif %}
       · {{ book|length }} of {{ candidates }} candidates
     </span>
@@ -45,12 +44,6 @@
             <div>
               <span class="font-medium">{{ '%g'|format(p.strike) }}</span>
               <span class="text-ink-400">({{ '%+.0f'|format(p.pct_otm) }}% OTM · {{ p.days_to_expiry }}d · {{ p.expiry_date }})</span>
-              {% if p.price_at_level %}
-                <span class="ml-1 text-xs px-1.5 py-0.5 rounded bg-amber-900/40 text-amber-300"
-                      title="Current price is sitting at this level now — the 'confirmed level' timing signal (context only, not scored).">
-                  ● price at {{ 'resistance' if p.side == 'sell_call' else 'support' }}
-                </span>
-              {% endif %}
             </div>
             <div class="text-xs text-ink-400">{{ p.rationale }}</div>
           </div>
@@ -85,9 +78,8 @@
             </div>
             <div class="text-ink-400 space-y-1.5">
               <div>Day move: <span class="text-ink-200">{% if p.day_move_pct is not none %}{{ '%+.1f'|format(p.day_move_pct) }}%{% else %}n/a{% endif %}</span> · trend <span class="text-ink-200">{{ p.trend_bucket }}</span></div>
-              <div>Strike δ ~{{ '%.2f'|format(p.delta) }} · {{ p.confluence_count }} level confluence(s)</div>
-              <div>{% if p.pct_to_threat is not none %}{{ '%.0f'|format(p.pct_to_threat) }}% to {{ 'resistance' if p.side == 'sell_call' else 'support' }}{% endif %}
-                {% if p.days_to_earnings is not none %} · earnings in {{ p.days_to_earnings }}d{% endif %}</div>
+              <div>Strike δ ~{{ '%.2f'|format(p.delta) }} · {{ p.confluence_count }} EMA confluence(s)</div>
+              {% if p.days_to_earnings is not none %}<div>Earnings in {{ p.days_to_earnings }}d</div>{% endif %}
               <div class="pt-1">
                 <a href="/analysis/{{ p.symbol }}" class="text-sky-400 hover:underline">Full analysis →</a>
               </div>

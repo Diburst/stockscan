@@ -12,11 +12,8 @@ import pandas as pd
 import pytest
 
 from stockscan.indicators import (
-    adx,
     atr,
     avg_dollar_volume,
-    bollinger_bands,
-    donchian_channel,
     ema,
     rsi,
     sma,
@@ -28,7 +25,7 @@ from stockscan.indicators import (
 
 @pytest.fixture
 def trend_up() -> pd.DataFrame:
-    """Steadily rising price series — RSI should be ~100, ADX should rise."""
+    """Steadily rising price series — RSI should be ~100."""
     n = 100
     idx = pd.date_range("2024-01-01", periods=n, freq="B")
     close = pd.Series(np.linspace(100, 200, n), index=idx)
@@ -109,37 +106,6 @@ def test_atr_positive_in_random_walk(random_walk):
 def test_true_range_nonneg(random_walk):
     tr = true_range(random_walk["high"], random_walk["low"], random_walk["close"])
     assert (tr.dropna() >= 0).all()
-
-
-# --------------- Donchian ---------------
-def test_donchian_uptrend(trend_up):
-    chan = donchian_channel(trend_up["high"], trend_up["low"], 20)
-    # In a strict uptrend the upper band should equal today's high.
-    assert chan["upper"].iloc[-1] == pytest.approx(float(trend_up["high"].iloc[-1]))
-    # Middle is between upper and lower.
-    assert chan["lower"].iloc[-1] < chan["middle"].iloc[-1] < chan["upper"].iloc[-1]
-
-
-# --------------- ADX ---------------
-def test_adx_strong_in_pure_trend(trend_up):
-    a = adx(trend_up["high"], trend_up["low"], trend_up["close"], 14)
-    valid = a.dropna()
-    # In a pure linear uptrend ADX should rise to a high value (>50 typical).
-    assert valid.iloc[-1] > 30
-
-
-def test_adx_in_range(random_walk):
-    a = adx(random_walk["high"], random_walk["low"], random_walk["close"], 14)
-    valid = a.dropna()
-    assert (valid >= 0).all() and (valid <= 100).all()
-
-
-# --------------- Bollinger ---------------
-def test_bollinger_upper_above_middle(random_walk):
-    bb = bollinger_bands(random_walk["close"], 20, 2.0)
-    valid = bb.dropna()
-    assert (valid["upper"] >= valid["middle"]).all()
-    assert (valid["middle"] >= valid["lower"]).all()
 
 
 # --------------- Volume ---------------

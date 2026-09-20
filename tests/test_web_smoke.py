@@ -8,11 +8,15 @@ Postgres. Real end-to-end integration tests are marked @pytest.mark.integration.
 from __future__ import annotations
 
 from collections.abc import Iterator
+from datetime import date
+from decimal import Decimal
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
 from fastapi.testclient import TestClient
 
+from stockscan.regime import MarketRegime, regime_label
 from stockscan.web.app import create_app
 from stockscan.web.deps import get_session
 
@@ -58,6 +62,73 @@ def test_dashboard_has_mobile_nav(client):
     """Hamburger nav for mobile must be in the DOM."""
     r = client.get("/")
     assert 'id="mobile-nav"' in r.text
+
+
+def _nav_labels(html: str) -> list[str]:
+    """Top-nav link labels, in order, from the desktop <nav>."""
+    import re
+
+    nav = html.split('<nav class="hidden sm:flex', 1)[1].split("</nav>", 1)[0]
+    return [m.strip() for m in re.findall(r'<a href="[^"]+"[^>]*>\s*([^<]+?)\s*</a>', nav)]
+
+
+def test_nav_is_seven_pages_with_reference_links_in_footer(client):
+    r = client.get("/")
+    assert _nav_labels(r.text) == [
+        "Dashboard", "Signals", "Watchlist", "Options", "Hedge", "Trades", "Backtests",
+    ]
+    # Analysis is reached from symbol links, not the nav; Strategies + Docs
+    # sit in the footer on every page.
+    footer = r.text.split("<footer", 1)[1]
+    assert 'href="/strategies"' in footer and 'href="/docs"' in footer
+    assert 'href="/analysis"' not in r.text.split("<footer", 1)[0].split("</header>", 1)[0]
+    # The mobile nav mirrors the desktop one.
+    mobile = r.text.split('id="mobile-nav"', 1)[1].split("</nav>", 1)[0]
+    assert 'href="/backtests"' in mobile and 'href="/strategies"' not in mobile
+
+
+def test_dashboard_latest_scan_card(client, monkeypatch):
+    """The card shows only status='new' rows from the latest scan date."""
+    from stockscan.web.routes import dashboard as dash_route
+
+    passing = SimpleNamespace(as_of_date=date(2026, 9, 18), n=2)
+    rows = [
+        SimpleNamespace(signal_id=1, strategy_name="rsi2_meanrev", symbol="AAPL",
+                        side="long", score=Decimal("0.04"), suggested_entry=Decimal("187.2"),
+                        suggested_stop=None, suggested_qty=53, as_of_date=date(2026, 9, 18)),
+        SimpleNamespace(signal_id=2, strategy_name="momentum_52w_high", symbol="NVDA",
+                        side="long", score=Decimal("1.2"), suggested_entry=Decimal("120"),
+                        suggested_stop=Decimal("102"), suggested_qty=10, as_of_date=date(2026, 9, 18)),
+    ]
+    app = create_app()
+    session = MagicMock()
+
+    def _execute(stmt, params=None):
+        sql = str(stmt)
+        res = _empty_result()
+        if "count(*)" in sql:
+            res.first.return_value = passing
+        elif "s.as_of_date = :d" in sql:
+            res.all.return_value = rows
+        return res
+
+    session.execute.side_effect = _execute
+
+    def _session():
+        yield session
+
+    app.dependency_overrides[get_session] = _session
+    monkeypatch.setattr(dash_route, "list_open_trades", lambda session=None: [])
+    monkeypatch.setattr(dash_route, "watchlist_symbols", lambda session=None: set())
+    r = TestClient(app, raise_server_exceptions=True).get("/")
+    assert r.status_code == 200
+    assert "Latest scan · 2026-09-18" in r.text and "2 passing" in r.text
+    assert 'href="/signals/1#paper-trade"' in r.text and 'href="/signals/2/base-rates"' in r.text
+    assert "$102.00" in r.text
+    assert 'href="/signals"' in r.text
+    # The rows query pins the latest scan date, not a monthly window.
+    sql = " ".join(str(c.args[0]) for c in session.execute.call_args_list)
+    assert "s.as_of_date = :d" in sql and "s.status = 'new'" in sql
 
 
 def test_signals_list_renders_empty(client):
@@ -113,15 +184,28 @@ def test_backtest_detail_missing(client):
 def test_strategies_list_shows_registered(client):
     r = client.get("/strategies")
     assert r.status_code == 200
-    # RSI(2) and Donchian are auto-registered on import
-    assert "RSI(2)" in r.text or "rsi2_meanrev" in r.text
-    assert "Donchian" in r.text
+    # Both book strategies are auto-registered on import.
+    assert "RSI(2)" in r.text
+    assert "52-Week-High" in r.text
 
 
 def test_strategy_detail_renders(client):
     r = client.get("/strategies/rsi2_meanrev")
     assert r.status_code == 200
-    assert "RSI(2)" in r.text or "rsi2_meanrev" in r.text
+    assert "RSI(2)" in r.text
+    # Sizing summary + every knob off the class + the sector-composite input.
+    assert "fixed 10% of equity per position" in r.text
+    assert "does not apply" in r.text
+    assert "rsi_entry" in r.text and "max_holding_bars" in r.text
+    assert "$EWSECTOR" in r.text
+
+
+def test_strategy_detail_stop_based_sizing(client):
+    r = client.get("/strategies/momentum_52w_high")
+    assert r.status_code == 200
+    assert "risk 0.75% of equity against the stop" in r.text
+    assert "Max open positions" in r.text and ">10<" in r.text
+    assert "sizes down in the top tercile" in r.text
 
 
 def test_strategy_detail_unknown(client):
@@ -247,3 +331,248 @@ def test_unwatch_not_watched_still_succeeds(client, monkeypatch):
     )
     assert r.status_code == 200
     assert "+ Watch" in r.text
+
+
+# -----------------------------------------------------------------------
+# Regime layer surfaces: the dashboard card and the signal-detail sizing /
+# regime-context cards, rendered against a real MarketRegime row.
+# -----------------------------------------------------------------------
+
+def _regime(*, gate_open=True, stress=False, vol_scalar="0.7200"):
+    return MarketRegime(
+        as_of_date=date(2026, 9, 18),
+        regime=regime_label(trend_gate_open=gate_open, credit_stress_flag=stress),
+        trend_gate_open=gate_open,
+        days_on_side=7,
+        spy_close=Decimal("512.30"),
+        spy_sma200=Decimal("498.10"),
+        spy_sma200_slope_20d=Decimal("0.012"),
+        realized_vol_20d=Decimal("0.2222"),
+        realized_vol_pct_rank=Decimal("0.91"),
+        vol_scalar=Decimal(vol_scalar),
+        hy_oas_level=Decimal("3.41"),
+        hy_oas_pct_rank=Decimal("0.22"),
+        credit_stress_flag=stress,
+    )
+
+
+def test_dashboard_regime_card_shows_controls(client, monkeypatch):
+    from stockscan.web.routes import dashboard as dash_route
+
+    monkeypatch.setattr(dash_route, "latest_regime", lambda session=None: _regime())
+    r = client.get("/")
+    assert r.status_code == 200
+    assert "risk on" in r.text
+    assert "7 closes on side" in r.text
+    assert "22.2% realized" in r.text and "rank 91%" in r.text
+    assert "×0.72" in r.text
+    assert "HY OAS 341 bp" in r.text
+    # Per-strategy sizing lines: momentum opts into the scalar, RSI(2) does not.
+    assert "vol scalar applies" in r.text
+    assert "vol scalar does not apply" in r.text
+    assert "no new entries" not in r.text
+    # Safari-safe: the controls are a table, never a styled <summary>.
+    assert "<summary class=\"grid" not in r.text and "<summary class=\"flex" not in r.text
+    assert "How to read this card" in r.text
+
+
+def test_dashboard_regime_card_closed_gate(client, monkeypatch):
+    from stockscan.web.routes import dashboard as dash_route
+
+    monkeypatch.setattr(
+        dash_route, "latest_regime", lambda session=None: _regime(gate_open=False)
+    )
+    r = client.get("/")
+    assert r.status_code == 200
+    assert "risk off" in r.text
+    assert "no new longs" in r.text
+    assert "no new entries" in r.text
+
+
+def _signal_row(**overrides):
+    base = dict(
+        signal_id=42, strategy_name="rsi2_meanrev",
+        strategy_version="2.0.0", symbol="AAPL", side="long",
+        score=Decimal("0.0312"), status="new", as_of_date=date(2026, 9, 18),
+        suggested_entry=Decimal("187.20"), suggested_stop=None,
+        suggested_target=None, suggested_qty=53, rejected_reason=None,
+        metadata={
+            "rsi_2": 4.1, "sma_200": 171.5, "stock_return_1m": -0.061,
+            "sector_return_1m": -0.012, "idiosyncratic_drop": 0.049,
+            "relative_volume": 0.9,
+        },
+    )
+    base.update(overrides)
+    return SimpleNamespace(**base)
+
+
+def _client_with_signal(signal, regime):
+    app = create_app()
+
+    def _session():
+        s = MagicMock()
+        res = MagicMock()
+        res.first.return_value = signal
+        res.all.return_value = []
+        s.execute.return_value = res
+        yield s
+
+    app.dependency_overrides[get_session] = _session
+    from stockscan.web.routes import signals as signals_route
+
+    signals_route.get_regime = lambda as_of, session=None: regime
+    return TestClient(app, raise_server_exceptions=True)
+
+
+def test_signal_detail_stopless_strategy(monkeypatch):
+    client = _client_with_signal(_signal_row(), _regime())
+    r = client.get("/signals/42")
+    assert r.status_code == 200
+    # No stop: the Outcome card says so instead of inventing a $0 stop.
+    assert "time stop and fixed size carry the risk" in r.text
+    assert "$0.00" not in r.text
+    # Humanized metadata with the new keys.
+    assert "Idiosyncratic drop" in r.text and "+4.90%" in r.text
+    assert "Selloff volume vs normal" in r.text
+    # Sizing card: fixed-fraction rule, scalar does not apply → 1.000.
+    assert "fixed 10% of equity" in r.text
+    assert "does not apply to this strategy" in r.text
+    assert "1.000" in r.text
+    # Regime table on the signal date.
+    assert "22.2% realized" in r.text and "rank 91%" in r.text
+    assert "HY OAS 341 bp" in r.text
+
+
+def test_signal_detail_vol_scaled_strategy_blocked_by_gate():
+    signal = _signal_row(
+        strategy_name="momentum_52w_high", suggested_stop=Decimal("159.12"),
+        status="rejected", rejected_reason="trend_gate_closed",
+        metadata={"closeness_52w": 0.97, "slope_quality": 0.81, "sma_50": 180.0,
+                  "sma_200": 171.5, "realized_vol_1y": 0.31, "residual_tilt": 0.12,
+                  "residual_return_12m": 0.12},
+    )
+    client = _client_with_signal(signal, _regime(gate_open=False))
+    r = client.get("/signals/42")
+    assert r.status_code == 200
+    assert "Trend gate closed" in r.text  # humanized rejection reason
+    assert "risk 0.75% of equity against the stop" in r.text
+    assert "applies to this strategy" in r.text and "0.720" in r.text
+    assert "New longs were blocked on this day" in r.text
+    assert "risk off" in r.text
+
+
+# Data-plan gating: cards and columns for feeds that are off collapse, and
+# the dashboard explains the absence once.
+# -----------------------------------------------------------------------
+
+def _prices_only_plan(monkeypatch):
+    from stockscan import config
+
+    monkeypatch.setattr(config.settings, "eodhd_features", "eod,bulk")
+
+
+def test_dashboard_hides_cards_for_feeds_off_plan(client, monkeypatch):
+    _prices_only_plan(monkeypatch)
+    r = client.get("/")
+    assert r.status_code == 200
+    assert "Market News" not in r.text
+    assert "Macro this week" not in r.text
+    assert "Earnings this week" not in r.text
+    assert "Not on current data plan: universe, fundamentals, news, calendar, insider, econ_events" in r.text
+    # Headline strip is four stats, regime included.
+    assert "Passing signals" in r.text and "Regime" in r.text and "Cash" not in r.text
+
+
+def test_dashboard_shows_cards_on_full_plan(client, monkeypatch):
+    from stockscan import config
+
+    monkeypatch.setattr(config.settings, "eodhd_features", "all")
+    r = client.get("/")
+    assert "Market News" in r.text
+    assert "Macro this week" in r.text
+    assert "Earnings this week" in r.text
+    assert "Not on current data plan" not in r.text
+
+
+def test_watchlist_has_no_earnings_columns(client, monkeypatch):
+    """Earnings / revisions / insider detail lives on the Analysis page the
+    symbol links to, on every data plan."""
+    from stockscan import config
+    from stockscan.web.routes import watchlist as wl_route
+
+    monkeypatch.setattr(config.settings, "eodhd_features", "all")
+    monkeypatch.setattr(wl_route, "list_watchlist", lambda **k: [SimpleNamespace(
+        watchlist_id=1, symbol="AAPL", last_close=Decimal("187.20"),
+        pct_change_today=0.012, last_volume=1_000_000, target_price=Decimal("200"),
+        target_direction="above", alert_enabled=True, target_satisfied=False,
+        last_bar_date=date(2026, 9, 18),
+    )])
+    r = client.get("/watchlist")
+    assert r.status_code == 200
+    import re
+
+    for header in ("Earnings", "Est revs 30d", "Insider 90d"):
+        assert not re.search(r">\s*" + re.escape(header) + r"\s*</th>", r.text)
+    assert 'href="/analysis/AAPL"' in r.text
+    assert "Analyse" in r.text and 'href="/analysis?list=' in r.text
+    # Mobile: the target editor sits behind a plain-text disclosure.
+    assert "<summary" in r.text and "edit target" in r.text
+    assert "above $200.00" in r.text
+
+
+def test_analysis_detail_has_no_macro_strip(client):
+    from stockscan.web.routes import analysis as an_route
+
+    assert not hasattr(an_route, "upcoming_events")
+    r = client.get("/analysis/AAPL")
+    assert r.status_code == 200
+    assert "Macro this week" not in r.text
+
+
+def test_signal_detail_has_no_scan_run_card():
+    client = _client_with_signal(_signal_row(), _regime())
+    r = client.get("/signals/42")
+    assert "Scan-run context" not in r.text
+    assert "Raw signal.metadata" not in r.text
+    assert "Base rates →" in r.text
+    # The header keeps the strategy link and the back link; the footer no
+    # longer duplicates them.
+    import re
+
+    assert not re.search(r"Strategy reference\s*</a>", r.text)
+    assert r.text.count("Back to signals") == 1
+
+
+def test_hedge_pages_render_money_values(client, monkeypatch):
+    from stockscan.web.routes import hedge as hedge_route
+
+    pos = SimpleNamespace(
+        hedge_position_id=7, symbol="MU", option_side="short", contracts=2,
+        option_kind="call", strike=Decimal("130"), status="active",
+        last_spot=Decimal("128.5"), last_delta=Decimal("-90"), held_shares=90,
+        last_target_shares=90, premium=Decimal("1250"), settlement_spot=None,
+        close_reason=None, realized_pnl=None,
+    )
+    pnl = {"option_open_pnl": 312.5, "realized_hedge_pnl": -40.0,
+           "hedge_unrealized_pnl": 15.0, "net_open_pnl": 287.5, "option_value": 937.5}
+    monkeypatch.setattr(hedge_route.store, "list_hedge_positions", lambda **k: [pos])
+    monkeypatch.setattr(hedge_route.store, "get_heartbeat", lambda **k: None)
+    monkeypatch.setattr(hedge_route.service, "live_pnl", lambda p, **k: pnl)
+    monkeypatch.setattr(hedge_route, "_default_symbol", lambda session: "")
+    r = client.get("/hedge")
+    assert r.status_code == 200
+    # Shared money(): signed values coloured by sign, premium plain.
+    assert "+312" in r.text and ">-25<" in r.text and "+288" in r.text
+    assert ">1,250<" in r.text
+    assert 'text-bad-600">-25' in r.text
+
+    pos.expiry = __import__("datetime").datetime(2026, 10, 16)
+    pos.iv_pct = Decimal("42.0")
+    pos.rate_pct = Decimal("4.5")
+    pos.band_policy = SimpleNamespace(mode="whalley_wilmott")
+    pos.avg_cost = Decimal("127.10")
+    monkeypatch.setattr(hedge_route.store, "get_hedge_position", lambda hid, **k: pos)
+    monkeypatch.setattr(hedge_route.store, "list_adjustments", lambda hid, **k: [])
+    r = client.get("/hedge/7")
+    assert r.status_code == 200
+    assert "+312.50" in r.text and "-25.00" in r.text and "mark <span" in r.text

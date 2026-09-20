@@ -1,6 +1,7 @@
-{# Market News card — rendered both on dashboard initial load and as the
-   target of POST /news/refresh (HTMX swap). The outer <div> carries the
-   #news-card id so HTMX can target it for outerHTML replacement.
+{# Market News card — rendered both on dashboard initial load (only when the
+   'news' feed is on the data plan) and as the target of POST /news/refresh
+   (HTMX swap). The outer <div> carries the #news-card id so HTMX can target
+   it for outerHTML replacement.
 
    Inputs:
      news_articles      — list[NewsArticle], most recent first (already limited)
@@ -46,11 +47,6 @@
           </span>
         {% endif %}
       </div>
-      {% if 'news' not in data_features() %}
-      <span class="text-xs text-ink-500 italic" title="Set EODHD_FEATURES to include 'news' after upgrading the data plan">
-        ○ News {{ DATA_PLAN_NOTE }}
-      </span>
-      {% else %}
       <form
         hx-post="/news/refresh"
         hx-target="#news-card"
@@ -72,7 +68,6 @@
           ⟳ Refresh
         </button>
       </form>
-      {% endif %}
     </div>
 
     {% if news_refresh_error %}
@@ -84,9 +79,7 @@
     {% if not news_articles %}
       {{ empty(
             "No news yet — click 'Refresh' to populate from EODHD." if news_last_fetched is none
-            else "No articles match the configured general-market feed yet.",
-            "📰",
-      ) }}
+            else "No articles match the configured general-market feed yet.") }}
     {% else %}
       <ul class="divide-y divide-ink-300/40 -mx-4">
         {% for art in news_articles %}

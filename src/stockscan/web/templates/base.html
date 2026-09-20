@@ -37,11 +37,12 @@
           ('/', 'Dashboard'),
           ('/signals', 'Signals'),
           ('/watchlist', 'Watchlist'),
-          ('/analysis', 'Analysis'),
           ('/options', 'Options'),
           ('/hedge', 'Hedge'),
           ('/trades', 'Trades'),
           ('/backtests', 'Backtests'),
+        ] %}
+        {% set footer_links = [
           ('/strategies', 'Strategies'),
           ('/docs', 'Docs'),
         ] %}
@@ -82,8 +83,13 @@
   </main>
 
   <footer class="max-w-6xl mx-auto px-4 py-6 text-xs text-ink-500">
-    <div class="flex justify-between items-center">
+    <div class="flex justify-between items-center flex-wrap gap-3">
       <span>stockscan {{ app_version }}</span>
+      <nav class="flex items-center gap-4" aria-label="Reference">
+        {% for href, label in footer_links %}
+          <a href="{{ href }}" class="hover:text-ink-900 {% if request.url.path.startswith(href) %}text-ink-900 font-semibold{% endif %}">{{ label }}</a>
+        {% endfor %}
+      </nav>
       <span>{{ request.url.path }}</span>
     </div>
   </footer>

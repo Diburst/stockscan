@@ -8,7 +8,6 @@ Endpoints:
 
 from __future__ import annotations
 
-import json
 import logging
 from datetime import date
 from decimal import Decimal, InvalidOperation
@@ -22,11 +21,30 @@ from stockscan.positions import (
     get_paper_trade,
     open_paper_trade,
 )
-from stockscan.regime import get_regime
+from stockscan.regime import MarketRegime, get_regime
+from stockscan.strategies import STRATEGY_REGISTRY, discover_strategies
 from stockscan.web.deps import flash_redirect, get_session, render, safe
 
 router = APIRouter()
 log = logging.getLogger(__name__)
+
+
+def _regime_snapshot(regime: MarketRegime | None) -> dict[str, object] | None:
+    """The regime controls as a JSON-able dict for the trade's entry/exit
+    snapshot columns; None when no row exists for that day."""
+    if regime is None:
+        return None
+    return {
+        "regime": regime.regime,
+        "trend_gate_open": regime.trend_gate_open,
+        "days_on_side": regime.days_on_side,
+        "vol_scalar": regime.vol_multiplier,
+        "realized_vol_20d": (
+            float(regime.realized_vol_20d) if regime.realized_vol_20d is not None else None
+        ),
+        "credit_stress_flag": regime.credit_stress_flag,
+        "hy_oas_level": float(regime.hy_oas_level) if regime.hy_oas_level is not None else None,
+    }
 
 
 @router.post("/signals/{signal_id}/paper-trade")
@@ -34,21 +52,22 @@ def create_paper_trade(
     signal_id: int,
     request: Request,
     entry_price: str = Form(...),
-    stop_price: str = Form(...),
+    stop_price: str = Form(""),
     target_price: str = Form(""),
     qty: int = Form(...),
     s: Session = Depends(get_session),
 ):
     """Open a paper trade from a signal.
 
-    Pre-fills entry, stop, target, qty from the signal row. Captures a
-    snapshot of the signal metadata, technical score, regime context, and
-    strategy params at the moment the trade is opened.
+    Pre-fills entry, stop, target, qty from the signal row. A blank stop is
+    allowed — some strategies carry no price stop and exit on rules alone.
+    Captures a snapshot of the signal metadata, regime context, and strategy
+    knobs at the moment the trade is opened.
     """
     # Validate prices
     try:
         entry = Decimal(entry_price)
-        stop = Decimal(stop_price)
+        stop = Decimal(stop_price) if stop_price.strip() else None
         target = Decimal(target_price) if target_price.strip() else None
     except (InvalidOperation, ValueError):
         return flash_redirect(
@@ -59,8 +78,6 @@ def create_paper_trade(
             f"/signals/{signal_id}", "error", "Quantity must be positive."
         )
 
-    # Fetch the signal + its context (strategy_configs is retired; we snapshot
-    # params from the strategy class itself at trade-open time below).
     sig_sql = text(
         """
         SELECT s.signal_id, s.strategy_name, s.strategy_version,
@@ -75,71 +92,29 @@ def create_paper_trade(
     if signal is None:
         return flash_redirect("/signals", "error", "Signal not found.")
 
-    # Snapshot the strategy-owned score breakdown at open time. Strategies that
-    # compose their score from indicator primitives stash it under
-    # metadata.score_breakdown; the parallel technical_scores annotation is gone.
-    tech_snapshot = None
-    _sb = (signal.metadata or {}).get("score_breakdown") if signal.metadata else None
-    if isinstance(_sb, dict) and _sb:
-        _sb_meta = _sb.get("_meta", {})
-        tech_snapshot = {
-            "score": _sb_meta.get("score") if isinstance(_sb_meta, dict) else None,
-            "breakdown": _sb,
-        }
-
-    # Grab regime snapshot
     regime = safe(
         lambda: get_regime(signal.as_of_date, session=s),
         label="paper_trade.regime",
     )
-    regime_snapshot = None
-    if regime:
-        regime_snapshot = {
-            "regime": regime.regime,
-            "composite_score": float(regime.composite_score) if regime.composite_score else None,
-            "credit_stress_flag": regime.credit_stress_flag,
-            "vol_score": float(regime.vol_score) if regime.vol_score else None,
-            "trend_score": float(regime.trend_score) if regime.trend_score else None,
-            "breadth_score": float(regime.breadth_score) if regime.breadth_score else None,
-            "credit_score": float(regime.credit_score) if regime.credit_score else None,
-        }
+    regime_snapshot = _regime_snapshot(regime)
 
-    # Build auto-close rules from signal metadata + the strategy class itself.
-    # We snapshot the current-version params at open time (strategy_configs is
-    # retired; the file is the source of truth — a version bump is the unit of
-    # change). For strategies with no params_model, the knobs are read off the
-    # class directly.
-    auto_close_rules: dict = {
-        "stop_price": float(stop),
-    }
+    # Auto-close rules from the form plus the strategy's own knobs, which are
+    # snapshotted at open time (the file is the source of truth — a version
+    # bump is the unit of change).
+    auto_close_rules: dict = {}
+    if stop is not None:
+        auto_close_rules["stop_price"] = float(stop)
     if target:
         auto_close_rules["target_price"] = float(target)
 
-    from stockscan.strategies import STRATEGY_REGISTRY, discover_strategies
     discover_strategies()
-    params_json: dict = {}
     try:
-        sig_cls = STRATEGY_REGISTRY.get(signal.strategy_name)
-        if sig_cls.params_model is not None:
-            params_json = sig_cls.params_model().model_dump(mode="json")
-        else:
-            # Surface the strategy's ClassVar knobs by name. Only attributes the
-            # strategy itself declared (not inherited from Strategy) are
-            # interesting here.
-            params_json = {
-                k: getattr(sig_cls, k)
-                for k in vars(sig_cls)
-                if isinstance(getattr(sig_cls, k), (int, float, str, bool))
-                and not k.startswith("_")
-                and k not in {"name", "version", "display_name", "description", "manual"}
-            }
+        params_json = STRATEGY_REGISTRY.get(signal.strategy_name).knobs()
     except KeyError:
         params_json = {}
 
-    if "holding_days" in (signal.metadata or {}):
-        auto_close_rules["time_stop_days"] = signal.metadata["holding_days"]
-    elif "max_holding_days" in params_json:
-        auto_close_rules["time_stop_days"] = params_json["max_holding_days"]
+    if "max_holding_bars" in params_json:
+        auto_close_rules["time_stop_days"] = params_json["max_holding_bars"]
 
     paper_trade_id = open_paper_trade(
         signal_id=signal_id,
@@ -152,7 +127,6 @@ def create_paper_trade(
         target_price=target,
         qty=qty,
         entry_signal_metadata=signal.metadata,
-        entry_tech_score=tech_snapshot,
         entry_regime=regime_snapshot,
         entry_strategy_params=params_json if params_json else None,
         auto_close_rules=auto_close_rules,
@@ -194,21 +168,13 @@ def close_paper_trade_endpoint(
             "Trade is already closed.",
         )
 
-    # Capture exit-time context
     regime = safe(lambda: get_regime(date.today(), session=s), label="paper_trade_close.regime")
-    regime_snapshot = None
-    if regime:
-        regime_snapshot = {
-            "regime": regime.regime,
-            "composite_score": float(regime.composite_score) if regime.composite_score else None,
-            "credit_stress_flag": regime.credit_stress_flag,
-        }
 
     close_paper_trade(
         paper_trade_id,
         exit_price=price,
         exit_reason=exit_reason,
-        exit_regime=regime_snapshot,
+        exit_regime=_regime_snapshot(regime),
         session=s,
     )
 

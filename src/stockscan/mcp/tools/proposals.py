@@ -14,11 +14,10 @@ def propose_options(
     """Propose a ranked, regime-sized, diversified book of short-premium options.
 
     Reads every watched name's options context and builds a book of short-put /
-    short-call candidates: a green day suggests selling a call (only into
-    resistance, never a breakout), a red day suggests selling a put (preferred
-    with-trend). Drops anything with earnings inside the expiry, thin liquidity,
-    or low IV; sizes each by the market regime (smaller in poor breadth / credit
-    stress); and caps correlated names. IV is a realized-vol proxy, not live
+    short-call candidates: a green day suggests selling a call (never into a
+    breakout), a red day suggests selling a put (preferred with-trend). Drops anything with earnings inside the expiry, thin liquidity,
+    or low IV; sizes each by the market regime (the vol scalar, halved under
+    credit stress); and caps correlated names. IV is a realized-vol proxy, not live
     implied vol — treat scores as relative, and verify strikes on a live chain.
 
     Args:
@@ -27,11 +26,11 @@ def propose_options(
         min_score: Drop candidates below this 0–1 attractiveness score.
 
     Returns:
-        {"as_of", "regime", "candidates", "book_size", "book": [{symbol, side,
+        {"as_of", "regime": {label, vol_scalar} | None, "candidates",
+        "book_size", "book": [{symbol, side,
         strike, dte, expiry, credit_per_contract, pct_otm, iv_pct, score,
-        size_weight, day_move_pct, days_to_earnings, confluences,
-        price_at_level (bool — current price is itself at the support/resistance
-        it's selling against; context flag, not scored), rationale}, ...]}.
+        size_weight, day_move_pct, days_to_earnings, confluences (count of key
+        EMAs within 0.5×ATR of the strike), rationale}, ...]}.
     """
     run = generate_book(list_id=list_id, n=n, min_score=min_score)
     reg = run.regime
@@ -50,7 +49,6 @@ def propose_options(
             "day_move_pct": p.day_move_pct,
             "days_to_earnings": p.days_to_earnings,
             "confluences": p.confluence_count,
-            "price_at_level": p.price_at_level,
             "rationale": p.rationale,
         }
         for p in run.book
@@ -60,7 +58,7 @@ def propose_options(
         "regime": (
             None
             if reg is None
-            else {"label": reg.regime, "composite": jsonable(reg.composite_score)}
+            else {"label": reg.regime, "vol_scalar": reg.vol_multiplier}
         ),
         "candidates": run.candidates,
         "book_size": len(book),

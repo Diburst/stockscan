@@ -13,10 +13,13 @@ from datetime import date as _date
 from datetime import timedelta as _td
 from typing import TYPE_CHECKING
 
-from stockscan.analysis.levels import find_support_resistance
-from stockscan.analysis.momentum import compute_momentum
 from stockscan.analysis.options_context import compute_options_context
-from stockscan.analysis.state import SymbolAnalysis
+from stockscan.analysis.state import (
+    OptionsContext,
+    SymbolAnalysis,
+    TrendState,
+    VolatilityState,
+)
 from stockscan.analysis.trend import compute_trend
 from stockscan.analysis.volatility import compute_volatility
 from stockscan.data.store import get_bars
@@ -29,9 +32,9 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 
-# How many years of bars to pull. Need ≥1 year for HV percentile +
-# ADX warmup; the rolling-vol baselines all use trailing windows, so extra
-# history never changes the computed indicators — it only feeds the chart.
+# How many years of bars to pull. Need ≥1 year for the HV percentile; the
+# rolling-vol baselines all use trailing windows, so extra history never
+# changes the computed indicators — it only feeds the chart.
 # 3 years covers the longest selectable chart window (3y) on the Analysis
 # hub and detail page.
 _LOOKBACK_YEARS = 3
@@ -113,35 +116,21 @@ def _analyze(
             last_volume = None
 
     # ---- Sub-module dispatches with per-component soft-fail. ----
-    levels = _safe_call(failures, "levels", lambda: find_support_resistance(bars))
-    if levels is None:
-        levels = []
     trend = _safe_call(failures, "trend", lambda: compute_trend(bars))
     volatility = _safe_call(failures, "volatility", lambda: compute_volatility(bars))
-    momentum = _safe_call(failures, "momentum", lambda: compute_momentum(bars))
+    if trend is None:
+        trend = TrendState.unavailable()
+    if volatility is None:
+        volatility = VolatilityState.unavailable()
 
     options_ctx = _safe_call(
         failures, "options_context",
         lambda: compute_options_context(
             symbol=symbol, as_of=as_of, last_close=last_close,
-            levels=levels, trend=trend, volatility=volatility,
+            trend=trend, volatility=volatility,
             session=session,
         ),
     )
-
-    # Fall back to "unavailable" defaults if any sub-call returned None.
-    from stockscan.analysis.state import (
-        MomentumState,
-        OptionsContext,
-        TrendState,
-        VolatilityState,
-    )
-    if trend is None:
-        trend = TrendState.unavailable()
-    if volatility is None:
-        volatility = VolatilityState.unavailable()
-    if momentum is None:
-        momentum = MomentumState.unavailable()
     if options_ctx is None:
         options_ctx = OptionsContext.unavailable()
 
@@ -183,10 +172,8 @@ def _analyze(
         last_close=last_close,
         last_volume=last_volume,
         bars_count=len(bars),
-        levels=levels,
         trend=trend,
         volatility=volatility,
-        momentum=momentum,
         options_context=options_ctx,
         closes_history=closes_history,
         volumes_history=volumes_history,

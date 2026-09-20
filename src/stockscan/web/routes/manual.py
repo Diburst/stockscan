@@ -123,9 +123,9 @@ _DOCS: tuple[_DocEntry, ...] = (
         slug="regime-research",
         title="Regime Detector — Research",
         subtitle=(
-            "Background research that shaped the v2 composite regime "
-            "classifier (vol/trend/breadth/credit weights, HY OAS lead, "
-            "no-look-ahead invariants)."
+            "Background research that shaped the regime layer: trend gate "
+            "+ vol scalar + credit-stress breaker, HY OAS lead, "
+            "no-look-ahead invariants."
         ),
         filename="market_regime_detection.md",
     ),

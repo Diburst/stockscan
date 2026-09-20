@@ -97,7 +97,7 @@
         <div class="space-y-1" data-group="subpanel"></div>
       </div>
       <div>
-        <div class="uppercase tracking-wide text-ink-500 font-semibold mb-1">Levels &amp; bands</div>
+        <div class="uppercase tracking-wide text-ink-500 font-semibold mb-1">Bands</div>
         <div class="space-y-1" data-group="level"></div>
         <button type="button" id="hub-studies-reset"
                 class="mt-1 text-ink-500 hover:text-ink-900 underline text-[11px]">
@@ -110,9 +110,7 @@
 
   {% if not cards %}
     {{ empty(
-       "Nothing on this list yet — add symbols on the Watchlist page first.",
-       "📈",
-    ) }}
+       "Nothing on this list yet — add symbols on the Watchlist page first.") }}
   {% else %}
     <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
       {% for c in cards %}
@@ -172,22 +170,6 @@
                   <div class="text-ink-500 uppercase tracking-wide">30-day ±1σ</div>
                   <div class="font-mono font-semibold">${{ "%.0f"|format(er.low) }}–${{ "%.0f"|format(er.high) }}</div>
                   <div class="text-ink-500">±{{ "%.1f%%"|format(er.sigma_pct) }}</div>
-                </div>
-              {% endif %}
-              {% if a.options_context.nearest_support %}
-                {%- set s = a.options_context.nearest_support -%}
-                <div>
-                  <div class="text-ink-500 uppercase tracking-wide">Support</div>
-                  <div class="font-mono font-semibold text-ok-600">${{ "%.2f"|format(s.price) }}</div>
-                  <div class="text-ink-500">{{ "%.1f%%"|format(a.options_context.pct_to_support) }} below</div>
-                </div>
-              {% endif %}
-              {% if a.options_context.nearest_resistance %}
-                {%- set r = a.options_context.nearest_resistance -%}
-                <div>
-                  <div class="text-ink-500 uppercase tracking-wide">Resistance</div>
-                  <div class="font-mono font-semibold text-bad-600">${{ "%.2f"|format(r.price) }}</div>
-                  <div class="text-ink-500">{{ "%.1f%%"|format(a.options_context.pct_to_resistance) }} above</div>
                 </div>
               {% endif %}
             </div>

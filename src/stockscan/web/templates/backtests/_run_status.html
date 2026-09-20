@@ -1,0 +1,48 @@
+{# Background-backtest status fragment.
+
+   Rendered inside list.html and standalone by POST /backtests/run and
+   GET /backtests/run/status. While a job runs the hx-get below replaces
+   this element with the next poll's response every 2 s; the finished
+   render links to the saved report and stops polling.
+
+   Inputs:
+     job       — running BacktestJobState, or None
+     finished  — consumed finished BacktestJobState (done or error), or None
+#}
+{% from "_macros.html" import badge %}
+<div id="backtest-run-status"
+     {% if job %}
+     hx-get="/backtests/run/status"
+     hx-trigger="every 2s"
+     hx-swap="outerHTML"
+     {% endif %}
+     class="text-xs text-ink-500">
+  {% if job %}
+    <div class="inline-flex items-center gap-2">
+      <span class="inline-block w-3.5 h-3.5 border-2 border-ink-300 border-t-ink-700 rounded-full animate-spin"
+            aria-hidden="true"></span>
+      <span role="status">
+        Running <span class="font-mono text-ink-700">{{ job.strategy }}</span>
+        on {{ job.universe_label }}, {{ job.start }} → {{ job.end }}
+        {%- if job.elapsed_seconds > 0 %} · {{ job.elapsed_seconds }}s{% endif %}
+        <span class="text-ink-400">(page stays usable)</span>
+      </span>
+    </div>
+  {% elif finished and finished.error %}
+    <div class="inline-flex items-center gap-2" role="status">
+      {{ badge("failed", "bad") }}
+      <span class="font-mono text-ink-700">{{ finished.strategy }}</span>
+      <span class="text-bad-600">{{ finished.error }}</span>
+    </div>
+  {% elif finished %}
+    <div class="inline-flex items-center gap-2" role="status">
+      {{ badge("done", "ok") }}
+      <span class="font-mono text-ink-700">{{ finished.strategy }}</span>
+      finished in {{ finished.elapsed_seconds }}s ·
+      <a href="/backtests/{{ finished.run_id }}" class="underline text-ink-700">View run #{{ finished.run_id }} →</a>
+      <a href="/backtests" class="underline">Refresh list</a>
+    </div>
+  {% else %}
+    <span class="text-ink-400">No backtest running.</span>
+  {% endif %}
+</div>

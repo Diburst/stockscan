@@ -49,8 +49,8 @@ WORKDIR /app
 
 # Layer-cache the dependency install: lockfile first, source later.
 COPY pyproject.toml uv.lock ./
-# --no-dev: runtime only. Add --extra ml at build time for meta-labeling:
-#   docker compose build --build-arg INSTALL_EXTRAS="--extra ml"
+# --no-dev: runtime only. Add an extra at build time when needed, e.g. the MCP server:
+#   docker compose build --build-arg INSTALL_EXTRAS="--extra mcp"
 ARG INSTALL_EXTRAS=""
 RUN uv sync --frozen --no-dev --no-install-project ${INSTALL_EXTRAS}
 
@@ -61,7 +61,7 @@ COPY infra/crontab ./infra/crontab
 COPY infra/scripts ./infra/scripts
 # Docs rendered by the in-app /docs hub.
 COPY README.md DESIGN.md USER_STORIES.md TODO.md MIGRATION.md DEPLOY.md ./
-COPY market_regime_detection.md signal_scoring_spec.md ./
+COPY market_regime_detection.md ./
 RUN uv sync --frozen --no-dev --no-editable ${INSTALL_EXTRAS}
 
 # Freshly-built stylesheet wins over the checked-in copy.
@@ -70,14 +70,14 @@ COPY src/stockscan/web/static/htmx.min.js ./src/stockscan/web/static/htmx.min.js
 
 # Non-root user; writable dirs for logs and ML model pickles.
 RUN useradd --create-home --uid 1000 stockscan \
-    && mkdir -p /app/logs /app/models /backups \
+    && mkdir -p /app/logs /backups \
     && chown -R stockscan:stockscan /app /backups
 USER stockscan
 
 ENV PATH="/app/.venv/bin:$PATH" \
     PYTHONUNBUFFERED=1 \
     STOCKSCAN_LOG_DIR=/app/logs \
-    STOCKSCAN_MODELS_DIR=/app/models
+    STOCKSCAN_MIGRATIONS_DIR=/app/migrations
 
 EXPOSE 8000
 

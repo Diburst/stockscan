@@ -1,185 +1,286 @@
-"""Tests for the relative-strength primitive (stockscan.indicators.relative_strength).
+"""Tests for the sector-relative primitive (stockscan.indicators.relative_strength).
 
-The pure math (`relative_strength_values`) is exercised directly (no DB). The
-DB-backed `sector_relative_strength` path (composite fetch) is integration-tested
-in the user's environment; here we cover the relative-strength permutations, the
-slope, the abstain cases, the signed `raw`, and that the data-fetch wrapper
-abstains gracefully when no symbol/composite is resolvable.
+``sector_return`` / ``sector_relative_return`` read the symbol from
+``bars.attrs["symbol"]``, resolve its ``$EWSECTOR:<CODE>`` composite through
+``stockscan.sectors.store.sector_map`` and fetch the composite's closes through
+``stockscan.data.store.get_bars``. Both are patched here; the run-scoped caches
+(``_SECTOR_MAP`` / ``_COMPOSITE_CLOSES``) are cleared around every test.
 """
 
 from __future__ import annotations
+
+from datetime import date
 
 import numpy as np
 import pandas as pd
 import pytest
 
-from stockscan.indicators.relative_strength import (
-    relative_strength_values,
-    sector_relative_strength,
-)
+import stockscan.indicators.relative_strength as srs
+from stockscan.indicators import sector_relative_return, sector_return
 
 LOOK = 10
-SLOPE_W = 4
-BAND = 0.15
-SLOPE_BAND = 0.05
-N = 40
+N = 60
+START = "2024-01-01"
 
 
-def _ramp(p_then: float, p_now: float, n: int = N, look: int = LOOK) -> pd.Series:
-    """Series flat at p_then, then linear from p_then to p_now over the last
-    `look`+1 bars — so iloc[-1]/iloc[-1-look] == p_now/p_then exactly."""
-    idx = pd.date_range("2024-01-01", periods=n, freq="B")
+@pytest.fixture(autouse=True)
+def _clean_caches():
+    srs.clear_cache()
+    yield
+    srs.clear_cache()
+
+
+def _ramp(p_then: float, p_now: float, n: int = N, look: int = LOOK) -> list[float]:
+    """Flat at ``p_then``, then linear to ``p_now`` over the last ``look``+1
+    bars — so close[-1] / close[-1-look] == p_now / p_then exactly."""
     arr = np.empty(n, dtype=float)
     start = n - 1 - look
     arr[:start] = p_then
     arr[start:] = np.linspace(p_then, p_now, look + 1)
-    return pd.Series(arr, index=idx)
+    return arr.tolist()
 
 
-def _clip(x: float, lo: float = -1.0, hi: float = 1.0) -> float:
-    return max(lo, min(hi, x))
+def _stock_bars(closes: list[float], symbol: str | None = "AAPL", *, hour: int = 21) -> pd.DataFrame:
+    """Stock bars with EODHD-style timestamps (NY close in UTC, not midnight)."""
+    idx = pd.date_range(START, periods=len(closes), freq="B") + pd.Timedelta(hours=hour)
+    idx = pd.DatetimeIndex(idx, tz="UTC")
+    df = pd.DataFrame({"close": closes, "adj_close": closes}, index=idx)
+    if symbol is not None:
+        df.attrs["symbol"] = symbol
+    return df
 
 
-def _rs(stock: pd.Series, sector: pd.Series):
-    return relative_strength_values(
-        stock, sector, look=LOOK, band=BAND, slope_window=SLOPE_W, slope_band=SLOPE_BAND
+def _composite_frame(closes: list[float]) -> pd.DataFrame:
+    """Composite bars as sectors/store writes them: midnight UTC."""
+    idx = pd.date_range(START, periods=len(closes), freq="B", tz="UTC")
+    return pd.DataFrame({"close": closes}, index=idx)
+
+
+@pytest.fixture
+def wire(monkeypatch):
+    """Patch the two DB touch points; returns the call counter."""
+    calls = {"map": 0, "bars": 0, "symbols": []}
+
+    def install(sector_map: dict[str, str], composites: dict[str, pd.DataFrame]):
+        def fake_sector_map(**_):
+            calls["map"] += 1
+            return sector_map
+
+        def fake_get_bars(symbol, start=None, end=None, **_):
+            calls["bars"] += 1
+            calls["symbols"].append(symbol)
+            return composites.get(symbol, pd.DataFrame())
+
+        monkeypatch.setattr("stockscan.sectors.store.sector_map", fake_sector_map)
+        monkeypatch.setattr("stockscan.data.store.get_bars", fake_get_bars)
+        return calls
+
+    return install
+
+
+def _as_of(bars: pd.DataFrame) -> date:
+    return bars.index[-1].date()
+
+
+# ---------------------------------------------------------------------
+# Trailing-return math
+# ---------------------------------------------------------------------
+def test_sector_return_is_trailing_composite_return(wire):
+    wire({"AAPL": "Technology"}, {"$EWSECTOR:TECHNOLOGY": _composite_frame(_ramp(100, 105))})
+    bars = _stock_bars(_ramp(100, 120))
+    assert sector_return(bars, _as_of(bars), lookback=LOOK) == pytest.approx(0.05)
+
+
+def test_relative_return_is_stock_minus_sector(wire):
+    wire({"AAPL": "Technology"}, {"$EWSECTOR:TECHNOLOGY": _composite_frame(_ramp(100, 105))})
+    bars = _stock_bars(_ramp(100, 120))  # +20% vs +5%
+    assert sector_relative_return(bars, _as_of(bars), lookback=LOOK) == pytest.approx(0.15)
+
+
+def test_relative_return_laggard_is_negative(wire):
+    wire({"AAPL": "Technology"}, {"$EWSECTOR:TECHNOLOGY": _composite_frame(_ramp(100, 120))})
+    bars = _stock_bars(_ramp(100, 105))  # +5% vs +20%
+    assert sector_relative_return(bars, _as_of(bars), lookback=LOOK) == pytest.approx(-0.15)
+
+
+def test_resilient_in_falling_sector_is_positive(wire):
+    wire({"AAPL": "Technology"}, {"$EWSECTOR:TECHNOLOGY": _composite_frame(_ramp(100, 80))})
+    bars = _stock_bars(_ramp(100, 95))  # −5% vs −20%
+    assert sector_return(bars, _as_of(bars), lookback=LOOK) == pytest.approx(-0.20)
+    assert sector_relative_return(bars, _as_of(bars), lookback=LOOK) == pytest.approx(0.15)
+
+
+def test_relative_return_uses_adj_close_not_close(wire):
+    wire({"AAPL": "Technology"}, {"$EWSECTOR:TECHNOLOGY": _composite_frame(_ramp(100, 100))})
+    bars = _stock_bars(_ramp(100, 110))
+    bars["close"] = _ramp(100, 150)  # unadjusted column must be ignored
+    assert sector_relative_return(bars, _as_of(bars), lookback=LOOK) == pytest.approx(0.10)
+
+
+def test_sector_code_is_slugified(wire):
+    calls = wire(
+        {"JPM": "Financial Services"},
+        {"$EWSECTOR:FINANCIAL_SERVICES": _composite_frame(_ramp(100, 110))},
     )
+    bars = _stock_bars(_ramp(100, 100), symbol="JPM")
+    assert sector_return(bars, _as_of(bars), lookback=LOOK) == pytest.approx(0.10)
+    assert calls["symbols"] == ["$EWSECTOR:FINANCIAL_SERVICES"]
 
 
-class TestRSPermutations:
-    def test_leader_in_rising_sector(self):
-        v = _rs(_ramp(100, 120), _ramp(100, 105))  # +20% vs +5%
-        assert v["stock_ret"] == pytest.approx(0.20)
-        assert v["sector_ret"] == pytest.approx(0.05)
-        assert v["spread"] == pytest.approx(0.15)
-        assert v["rs"] == pytest.approx(1.0)  # 0.15 / 0.15 saturates
-
-    def test_laggard_in_rising_sector(self):
-        v = _rs(_ramp(100, 105), _ramp(100, 120))  # +5% vs +20%
-        assert v["spread"] == pytest.approx(-0.15)
-        assert v["rs"] == pytest.approx(-1.0)
-
-    def test_resilient_in_falling_sector_is_positive(self):
-        # "down less than sector" → relative strength → positive (a bottom tilt)
-        v = _rs(_ramp(100, 95), _ramp(100, 80))  # -5% vs -20%
-        assert v["spread"] == pytest.approx(0.15)
-        assert v["rs"] == pytest.approx(1.0)
-
-    def test_partial_spread_scales_linearly(self):
-        v = _rs(_ramp(100, 107.5), _ramp(100, 100))  # +7.5% vs 0%
-        assert v["spread"] == pytest.approx(0.075)
-        assert v["rs"] == pytest.approx(0.5)
-
-    def test_leader_has_nonnegative_slope(self):
-        v = _rs(_ramp(100, 120), _ramp(100, 105))
-        assert v["slope_n"] >= 0.0  # RS line rising as the stock outperforms
+def test_symbol_column_fallback_when_attrs_missing(wire):
+    wire({"AAPL": "Technology"}, {"$EWSECTOR:TECHNOLOGY": _composite_frame(_ramp(100, 105))})
+    bars = _stock_bars(_ramp(100, 120), symbol=None)
+    bars["symbol"] = "AAPL"
+    assert sector_return(bars, _as_of(bars), lookback=LOOK) == pytest.approx(0.05)
 
 
-class TestRawRead:
-    """The signed `raw` is the strategy-agnostic read: clip(0.7*rs + 0.3*slope).
-
-    The old per-strategy tag-branching (full strength for trend/breakout, a 0.6
-    dampen for mean-reversion, neutral for the watchlist) has been removed — a
-    consumer that wants to down-weight relative strength does so via its own
-    composite weight, not inside this primitive.
-    """
-
-    def test_raw_matches_weighted_combination(self):
-        for v in (_rs(_ramp(100, 120), _ramp(100, 105)), _rs(_ramp(100, 105), _ramp(100, 120))):
-            assert v["raw"] == pytest.approx(_clip(0.7 * v["rs"] + 0.3 * v["slope_n"]))
-
-    def test_custom_weights_respected(self):
-        v = relative_strength_values(
-            _ramp(100, 120), _ramp(100, 105),
-            look=LOOK, band=BAND, slope_window=SLOPE_W, slope_band=SLOPE_BAND,
-            rs_weight=1.0, slope_weight=0.0,
-        )
-        assert v["raw"] == pytest.approx(_clip(v["rs"]))
+# ---------------------------------------------------------------------
+# Abstain cases
+# ---------------------------------------------------------------------
+def test_none_when_no_symbol(wire):
+    calls = wire({"AAPL": "Technology"}, {})
+    bars = _stock_bars(_ramp(100, 120), symbol=None)
+    assert sector_return(bars, _as_of(bars), lookback=LOOK) is None
+    assert sector_relative_return(bars, _as_of(bars), lookback=LOOK) is None
+    assert calls["bars"] == 0
 
 
-class TestAbstain:
-    def test_too_short_returns_none(self):
-        short = pd.Series(np.arange(LOOK), dtype=float)  # len == LOOK, need > LOOK
-        assert _rs(short, short) is None
-
-    def test_all_nan_sector_returns_none(self):
-        stock = _ramp(100, 120)
-        sec = pd.Series(np.nan, index=stock.index)
-        assert _rs(stock, sec) is None
-
-    def test_zero_base_returns_none(self):
-        assert _rs(_ramp(0.0, 120), _ramp(100, 105)) is None
+def test_none_when_symbol_has_no_sector(wire):
+    calls = wire({"MSFT": "Technology"}, {"$EWSECTOR:TECHNOLOGY": _composite_frame(_ramp(100, 105))})
+    bars = _stock_bars(_ramp(100, 120), symbol="AAPL")
+    assert sector_return(bars, _as_of(bars), lookback=LOOK) is None
+    assert sector_relative_return(bars, _as_of(bars), lookback=LOOK) is None
+    assert calls["bars"] == 0
 
 
-class TestIntradayTimestampAlignment:
-    """The real-world bug surfaced in backtest runs #20 and #21: stock bars
-    from EODHD are stored at NY market close (≈ 20–21:00 UTC); sector
-    composite bars are stored at midnight UTC. The two indices share calendar
-    dates but never share intraday timestamps, so the indicator's reindex +
-    ffill produced an all-NaN sec_on and silently abstained on every call.
-    These tests pin the fix: alignment must be by calendar date regardless of
-    intraday timestamp.
-    """
-
-    def _stock_at_ny_close(self, levels: list[float], start: str = "2024-01-01"):
-        """Stock series with EODHD-style timestamps — NY market close in UTC."""
-        idx = pd.date_range(start, periods=len(levels), freq="B")
-        # NY-close → UTC (20:00 UTC during EDT, 21:00 during EST); pick one for the
-        # fixture. The real bug doesn't care which — what matters is *not midnight*.
-        idx = idx + pd.Timedelta(hours=21)
-        idx = pd.DatetimeIndex(idx, tz="UTC")
-        return pd.Series(levels, index=idx, dtype=float)
-
-    def _composite_at_midnight_utc(self, levels: list[float], start: str = "2024-01-01"):
-        """Sector composite series — midnight UTC (how sectors/store writes them)."""
-        idx = pd.date_range(start, periods=len(levels), freq="B", tz="UTC")
-        return pd.Series(levels, index=idx, dtype=float)
-
-    def test_alignment_works_across_midnight_vs_ny_close(self):
-        n = 80
-        stock_levels = list(np.linspace(100.0, 120.0, n))
-        sec_levels = list(np.linspace(100.0, 110.0, n))
-        stock = self._stock_at_ny_close(stock_levels)
-        sec = self._composite_at_midnight_utc(sec_levels)
-
-        v = relative_strength_values(
-            stock, sec,
-            look=LOOK, band=BAND, slope_window=SLOPE_W, slope_band=SLOPE_BAND,
-        )
-        assert v is not None, (
-            "stock at NY close + sector at midnight UTC must align by calendar "
-            "date — pre-fix this returned None silently (bt20/21 sector_rs bug)."
-        )
-        # Leader vs sector that rose less — expect positive rs.
-        assert v["rs"] > 0
-
-    def test_alignment_is_date_indifferent_to_swapped_intraday(self):
-        """Same data, just swap which series has the intraday hour. Result must
-        be identical — the indicator should care only about the date, not the time."""
-        n = 80
-        stock_levels = list(np.linspace(100.0, 120.0, n))
-        sec_levels = list(np.linspace(100.0, 110.0, n))
-
-        v1 = relative_strength_values(
-            self._stock_at_ny_close(stock_levels),
-            self._composite_at_midnight_utc(sec_levels),
-            look=LOOK, band=BAND, slope_window=SLOPE_W, slope_band=SLOPE_BAND,
-        )
-        v2 = relative_strength_values(
-            self._composite_at_midnight_utc(stock_levels),
-            self._stock_at_ny_close(sec_levels),
-            look=LOOK, band=BAND, slope_window=SLOPE_W, slope_band=SLOPE_BAND,
-        )
-        assert v1 is not None and v2 is not None
-        assert v1["rs"] == pytest.approx(v2["rs"])
-        assert v1["slope_n"] == pytest.approx(v2["slope_n"])
-        assert v1["raw"] == pytest.approx(v2["raw"])
+def test_none_when_composite_has_no_bars(wire):
+    wire({"AAPL": "Technology"}, {})  # get_bars returns an empty frame
+    bars = _stock_bars(_ramp(100, 120))
+    assert sector_return(bars, _as_of(bars), lookback=LOOK) is None
+    assert sector_relative_return(bars, _as_of(bars), lookback=LOOK) is None
 
 
-class TestFetchWrapperAbstains:
-    def test_no_symbol_abstains(self):
-        # A frame with enough history but no resolvable symbol → abstain (None),
-        # never raise. (Default rs_window=63, so make it comfortably longer.)
-        idx = pd.date_range("2023-01-01", periods=120, freq="B")
-        bars = pd.DataFrame({"close": np.linspace(10, 20, 120)}, index=idx)
-        assert sector_relative_strength(bars, idx[-1].date()) is None
+def test_none_when_composite_too_short(wire):
+    # Exactly ``lookback`` bars: need lookback + 1 to form a return.
+    wire({"AAPL": "Technology"}, {"$EWSECTOR:TECHNOLOGY": _composite_frame([100.0] * LOOK)})
+    bars = _stock_bars(_ramp(100, 120))
+    assert sector_return(bars, _as_of(bars), lookback=LOOK) is None
+    wire({"AAPL": "Technology"}, {"$EWSECTOR:TECHNOLOGY": _composite_frame([100.0] * (LOOK + 1))})
+    srs.clear_cache()
+    assert sector_return(bars, _as_of(bars), lookback=LOOK) == pytest.approx(0.0)
+
+
+def test_none_when_stock_too_short(wire):
+    wire({"AAPL": "Technology"}, {"$EWSECTOR:TECHNOLOGY": _composite_frame(_ramp(100, 105))})
+    bars = _stock_bars([100.0] * LOOK)
+    as_of = pd.date_range(START, periods=N, freq="B")[-1].date()  # composite's last bar
+    assert sector_return(bars, as_of, lookback=LOOK) == pytest.approx(0.05)
+    assert sector_relative_return(bars, as_of, lookback=LOOK) is None
+
+
+def test_none_when_composite_base_is_zero(wire):
+    wire({"AAPL": "Technology"}, {"$EWSECTOR:TECHNOLOGY": _composite_frame(_ramp(0.0, 105))})
+    bars = _stock_bars(_ramp(100, 120))
+    assert sector_return(bars, _as_of(bars), lookback=LOOK) is None
+
+
+def test_none_when_as_of_precedes_composite(wire):
+    wire({"AAPL": "Technology"}, {"$EWSECTOR:TECHNOLOGY": _composite_frame(_ramp(100, 105))})
+    bars = _stock_bars(_ramp(100, 120))
+    assert sector_return(bars, date(2023, 12, 1), lookback=LOOK) is None
+
+
+# ---------------------------------------------------------------------
+# No look-ahead
+# ---------------------------------------------------------------------
+def test_composite_is_sliced_to_as_of(wire):
+    # Composite: flat 100 through bar N-11, then a ramp to 200 at the end.
+    comp = _ramp(100, 200)
+    wire({"AAPL": "Technology"}, {"$EWSECTOR:TECHNOLOGY": _composite_frame(comp)})
+    bars = _stock_bars(_ramp(100, 100))
+    # Asking as of the last flat bar must see no composite move at all.
+    flat_as_of = bars.index[N - 2 - LOOK].date()
+    assert sector_return(bars, flat_as_of, lookback=LOOK) == pytest.approx(0.0)
+    # And the final bar sees the full ramp.
+    assert sector_return(bars, _as_of(bars), lookback=LOOK) == pytest.approx(1.0)
+
+
+def test_slice_is_by_calendar_date_not_intraday_time(wire):
+    """Stock bars sit at NY close (21:00 UTC); composites at midnight UTC.
+    An ``as_of`` date must include that day's composite bar."""
+    comp = _ramp(100, 105)
+    wire({"AAPL": "Technology"}, {"$EWSECTOR:TECHNOLOGY": _composite_frame(comp)})
+    bars = _stock_bars(_ramp(100, 120), hour=21)
+    as_of = _as_of(bars)
+    cached = srs._composite_closes("$EWSECTOR:TECHNOLOGY", as_of)
+    assert cached is not None
+    assert cached.index[-1] == pd.Timestamp(as_of)
+    assert cached.index.tz is None
+    assert len(cached) == N
+
+
+def test_slice_matches_date_mask_every_day(wire):
+    comp_df = _composite_frame(list(np.linspace(100, 130, N)))
+    wire({"AAPL": "Technology"}, {"$EWSECTOR:TECHNOLOGY": comp_df})
+    srs._composite_symbol_for("AAPL")
+    for ts in comp_df.index:
+        d = ts.date()
+        out = srs._composite_closes("$EWSECTOR:TECHNOLOGY", d)
+        expected = comp_df["close"][comp_df.index.date <= d]
+        assert out is not None
+        assert len(out) == len(expected)
+        assert float(out.iloc[-1]) == float(expected.iloc[-1])
+
+
+# ---------------------------------------------------------------------
+# Cache reuse
+# ---------------------------------------------------------------------
+def test_sector_map_and_composite_fetched_once_per_run(wire):
+    calls = wire(
+        {"AAPL": "Technology", "MSFT": "Technology", "JPM": "Financial Services"},
+        {
+            "$EWSECTOR:TECHNOLOGY": _composite_frame(_ramp(100, 105)),
+            "$EWSECTOR:FINANCIAL_SERVICES": _composite_frame(_ramp(100, 110)),
+        },
+    )
+    for sym in ("AAPL", "MSFT", "AAPL", "JPM", "MSFT"):
+        bars = _stock_bars(_ramp(100, 120), symbol=sym)
+        for cut in (N - 1, N - 5, N - 1):
+            assert sector_relative_return(bars, bars.index[cut].date(), lookback=LOOK) is not None
+    assert calls["map"] == 1
+    assert calls["bars"] == 2  # one fetch per distinct composite
+    assert sorted(calls["symbols"]) == ["$EWSECTOR:FINANCIAL_SERVICES", "$EWSECTOR:TECHNOLOGY"]
+    assert set(srs._COMPOSITE_CLOSES) == {"$EWSECTOR:TECHNOLOGY", "$EWSECTOR:FINANCIAL_SERVICES"}
+
+
+def test_empty_composite_is_cached_too(wire):
+    calls = wire({"AAPL": "Technology"}, {})
+    bars = _stock_bars(_ramp(100, 120))
+    for _ in range(3):
+        assert sector_return(bars, _as_of(bars), lookback=LOOK) is None
+    assert calls["bars"] == 1
+    assert srs._COMPOSITE_CLOSES["$EWSECTOR:TECHNOLOGY"].empty
+
+
+def test_clear_cache_forces_refetch(wire):
+    calls = wire({"AAPL": "Technology"}, {"$EWSECTOR:TECHNOLOGY": _composite_frame(_ramp(100, 105))})
+    bars = _stock_bars(_ramp(100, 120))
+    sector_return(bars, _as_of(bars), lookback=LOOK)
+    assert (calls["map"], calls["bars"]) == (1, 1)
+    assert srs._COMPOSITE_CLOSES
+
+    srs.clear_cache()
+    assert srs._COMPOSITE_CLOSES == {}
+    assert srs._SECTOR_MAP is None
+    sector_return(bars, _as_of(bars), lookback=LOOK)
+    assert (calls["map"], calls["bars"]) == (2, 2)
+
+
+def test_cached_closes_are_pre_normalised(wire):
+    wire({"AAPL": "Technology"}, {"$EWSECTOR:TECHNOLOGY": _composite_frame(_ramp(100, 105))})
+    bars = _stock_bars(_ramp(100, 120))
+    sector_return(bars, _as_of(bars), lookback=LOOK)
+    cached = srs._COMPOSITE_CLOSES["$EWSECTOR:TECHNOLOGY"]
+    assert cached.index.tz is None
+    assert (cached.index == cached.index.normalize()).all()
+    assert cached.dtype == float

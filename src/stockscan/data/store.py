@@ -14,7 +14,7 @@ from decimal import Decimal
 from typing import Any
 
 import pandas as pd
-from sqlalchemy import bindparam, text
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from stockscan.data.providers.base import BarRow

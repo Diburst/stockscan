@@ -1,3 +1,4 @@
+{% from "_macros.html" import money %}
 {% set sw = result.sweep %}
 <h2 class="text-sm font-semibold text-ink-700 mb-2">Result — sweep over {{ result.over }} · {{ result.spec.option }}</h2>
 <p class="text-xs text-ink-400 mb-3">Same path ({{ sw.path_label }}) across each setting. Tighter bands trade more (higher cost) but track closer — pick the row with the best net for your tolerance.</p>
@@ -19,9 +20,9 @@
       <tr class="border-b border-ink-300/40">
         <td class="p-2 font-medium">{{ r.variation }}</td>
         <td class="text-right p-2 tabular-nums">{{ r.num_trades }}</td>
-        <td class="text-right p-2 tabular-nums text-ink-500">${{ "{:,.0f}".format(r.transaction_cost) }}</td>
+        <td class="text-right p-2 text-ink-500">${{ money(r.transaction_cost, signed=False) }}</td>
         <td class="text-right p-2 tabular-nums">{{ r.tracking_error_shares }}</td>
-        <td class="text-right p-2 tabular-nums font-semibold {{ 'text-ok-600' if r.net_pnl >= 0 else 'text-bad-600' }}">{{ "{:+,.0f}".format(r.net_pnl) }}</td>
+        <td class="text-right p-2 font-semibold">{{ money(r.net_pnl) }}</td>
         <td class="p-2">
           <div class="h-3 rounded {{ 'bg-ok-600/70' if r.net_pnl >= 0 else 'bg-bad-600/70' }}"
                style="width: {{ (r.net_pnl|abs / result.max_abs * 100)|round(1) }}%"></div>

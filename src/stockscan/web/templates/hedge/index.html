@@ -1,7 +1,6 @@
 {% extends "base.html" %}
 {% block title %}Delta Hedging{% endblock %}
-
-{% macro pnl_cell(v) %}<span class="{{ 'text-ok-600' if v >= 0 else 'text-bad-600' }}">{{ "{:+,.0f}".format(v) }}</span>{% endmacro %}
+{% from "_macros.html" import money %}
 
 {% block content %}
 <div class="max-w-6xl mx-auto px-4 py-6">
@@ -135,10 +134,10 @@
             <td class="text-right p-2 tabular-nums">{{ "{:.0f}".format(p.last_delta|float) if p.last_delta is not none else '—' }}</td>
             <td class="text-right p-2 tabular-nums">{{ p.held_shares }}</td>
             <td class="text-right p-2 tabular-nums">{{ p.last_target_shares if p.last_target_shares is not none else '—' }}</td>
-            <td class="text-right p-2 tabular-nums text-ink-500">{{ "{:,.0f}".format(p.premium|float) }}</td>
-            <td class="text-right p-2 tabular-nums">{{ pnl_cell(n.option_open_pnl) }}</td>
-            <td class="text-right p-2 tabular-nums">{{ pnl_cell(n.realized_hedge_pnl + n.hedge_unrealized_pnl) }}</td>
-            <td class="text-right p-2 tabular-nums font-semibold">{{ pnl_cell(n.net_open_pnl) }}</td>
+            <td class="text-right p-2 text-ink-500">{{ money(p.premium, signed=False) }}</td>
+            <td class="text-right p-2 tabular-nums">{{ money(n.option_open_pnl) }}</td>
+            <td class="text-right p-2 tabular-nums">{{ money(n.realized_hedge_pnl + n.hedge_unrealized_pnl) }}</td>
+            <td class="text-right p-2 tabular-nums font-semibold">{{ money(n.net_open_pnl) }}</td>
             <td class="p-2 text-right whitespace-nowrap">
               <form method="post" action="/hedge/{{ p.hedge_position_id }}/toggle" class="inline">
                 <button class="text-xs text-ink-500 hover:text-ink-900">{{ 'resume' if p.status == 'paused' else 'pause' }}</button>
@@ -173,7 +172,7 @@
             </td>
             <td class="text-right p-2 tabular-nums">{{ "{:.2f}".format(p.settlement_spot|float) if p.settlement_spot is not none else '—' }}</td>
             <td class="text-right p-2 text-ink-500">{{ p.close_reason }}</td>
-            <td class="text-right p-2 tabular-nums font-semibold">{{ pnl_cell(p.realized_pnl|float) if p.realized_pnl is not none else '—' }}</td>
+            <td class="text-right p-2 tabular-nums font-semibold">{{ money(p.realized_pnl) }}</td>
           </tr>
           {% endfor %}
         </tbody>

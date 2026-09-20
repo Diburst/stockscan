@@ -25,8 +25,8 @@ Moving data between hosts (pg_dump / pg_restore) is covered by
 | `web` | uvicorn serving the UI on port 8000. Healthchecked via `/health`. |
 | `scheduler` | supercronic running `infra/crontab` in ET: nightly scan (M–F 20:00), DB backup (02:00), weekly fundamentals refresh (Sun 03:00). |
 
-Named volumes: `pgdata` (database), `logs` (rotating app logs), `models`
-(ML pickles), `backups` (rotated pg_dump output).
+Named volumes: `pgdata` (database), `logs` (rotating app logs), `backups`
+(rotated pg_dump output).
 
 ### Fresh host, step by step
 
@@ -112,12 +112,6 @@ docker compose up -d db    # now also on 127.0.0.1:5432 (loopback only)
 | `STOCKSCAN_DB_TUNE_MEMORY` / `_CPUS` | `4GB` / `4` | timescaledb-tune sizing for the DB container |
 | `STOCKSCAN_LOG_LEVEL` | `INFO` | App log level |
 | `STOCKSCAN_SLOW_REQUEST_MS` | `750` | Threshold for `[slow]` request warnings |
-
-ML extra (XGBoost meta-labeling) isn't installed by default; build with:
-
-```bash
-docker compose build --build-arg INSTALL_EXTRAS="--extra ml"
-```
 
 ### Constraints worth knowing
 

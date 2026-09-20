@@ -5,8 +5,8 @@ Covers:
   * ``compute_options_context`` emits one StrikeSet per configured tenor,
     with the right days-to-expiry, target delta, expiry date, and OTM
     direction (put below spot, call above).
-  * ``_strike_confluences`` flags an EMA / S/R level within 0.5×ATR and
-    ignores ones outside the band (and no-ops when ATR is unknown).
+  * ``_strike_confluences`` flags an EMA within 0.5×ATR and ignores ones
+    outside the band (and no-ops when ATR is unknown).
   * The confluence shows up end-to-end on the produced OptionStrike and in
     the observations.
 """
@@ -25,7 +25,7 @@ from stockscan.analysis.options_context import (
     _strike_confluences,
     compute_options_context,
 )
-from stockscan.analysis.state import Level, TrendState, VolatilityState
+from stockscan.analysis.state import TrendState, VolatilityState
 from stockscan.analysis.trend import _EMA_PERIODS, compute_trend
 
 
@@ -48,7 +48,7 @@ def _bars(n: int = 300, base: float = 100.0, seed: int = 1) -> pd.DataFrame:
 def _vol_state(atr_14: float | None = 3.0, ewma_vol_pct: float | None = 22.0) -> VolatilityState:
     return VolatilityState(
         available=True, realized_vol_21d_pct=28.5, realized_vol_63d_pct=26.0,
-        atr_14=atr_14, atr_pct_of_price=2.0, bb_width_pct=8.0, hv_percentile=55.0,
+        atr_14=atr_14, atr_pct_of_price=2.0, hv_percentile=55.0,
         expected_7d=None, expected_30d=None, bucket="normal", label="Normal",
         explanation="", ewma_vol_pct=ewma_vol_pct,
     )
@@ -71,7 +71,7 @@ def test_compute_trend_populates_emas():
 def test_strike_sets_match_configured_tenors():
     ctx = compute_options_context(
         symbol="AAPL", as_of=date(2026, 6, 13), last_close=150.0,
-        levels=[], trend=TrendState.unavailable(), volatility=_vol_state(),
+        trend=TrendState.unavailable(), volatility=_vol_state(),
         session=None,
     )
     assert len(ctx.strike_sets) == len(_STRIKE_TENORS)
@@ -89,7 +89,7 @@ def test_expiries_land_on_the_two_fridays_from_a_saturday():
     # Sat 2026-06-13: 6 days → Fri 06-19, 13 days → Fri 06-26.
     ctx = compute_options_context(
         symbol="X", as_of=date(2026, 6, 13), last_close=100.0,
-        levels=[], trend=TrendState.unavailable(), volatility=_vol_state(),
+        trend=TrendState.unavailable(), volatility=_vol_state(),
         session=None,
     )
     by_days = {ss.days_to_expiry: ss for ss in ctx.strike_sets}
@@ -102,7 +102,7 @@ def test_expiries_land_on_the_two_fridays_from_a_saturday():
 def test_no_strike_sets_without_vol():
     ctx = compute_options_context(
         symbol="X", as_of=date(2026, 6, 13), last_close=100.0,
-        levels=[], trend=TrendState.unavailable(),
+        trend=TrendState.unavailable(),
         volatility=VolatilityState.unavailable(), session=None,
     )
     assert ctx.strike_sets == []
@@ -111,26 +111,24 @@ def test_no_strike_sets_without_vol():
 # ---------------------------------------------------------------------------
 # Confluence helper
 # ---------------------------------------------------------------------------
-def _trend_with_ema(period: int, value: float) -> TrendState:
+def _trend_with_emas(emas: dict[int, float]) -> TrendState:
     return TrendState(
         available=True, bucket="neutral", label="", explanation="",
         return_5d=None, return_21d=None, return_63d=None, ma_alignment="mixed",
-        sma_20=None, sma_50=None, sma_200=None, adx_14=None,
+        sma_20=None, sma_50=None, sma_200=None,
         pct_above_sma20=None, pct_above_sma50=None, pct_above_sma200=None,
-        emas={period: value},
+        emas=emas,
     )
 
 
-def _level(price: float, kind: str = "resistance") -> Level:
-    return Level(price=price, kind=kind, strength=0.8, touches=3,
-                 last_touch_days_ago=5, distance_pct=1.0,
-                 origin="pivot_high" if kind == "resistance" else "pivot_low")
+def _trend_with_ema(period: int, value: float) -> TrendState:
+    return _trend_with_emas({period: value})
 
 
 def test_confluence_flags_nearby_ema():
     # band = 0.5 * ATR(2.0) = 1.0; EMA 0.5 away → hit.
     out = _strike_confluences(
-        strike=100.0, levels=[], trend=_trend_with_ema(50, 100.5), atr14=2.0
+        strike=100.0, trend=_trend_with_ema(50, 100.5), atr14=2.0
     )
     assert any("50 EMA" in c for c in out)
 
@@ -138,24 +136,29 @@ def test_confluence_flags_nearby_ema():
 def test_confluence_ignores_far_ema():
     # EMA 5 away, band = 1.0 → no hit.
     out = _strike_confluences(
-        strike=100.0, levels=[], trend=_trend_with_ema(50, 105.0), atr14=2.0
+        strike=100.0, trend=_trend_with_ema(50, 105.0), atr14=2.0
     )
     assert out == ()
 
 
-def test_confluence_flags_nearby_level():
+def test_confluence_orders_by_proximity():
+    # band = 1.0; the 200 EMA is out of band, the 9 EMA is nearer than the 50.
     out = _strike_confluences(
-        strike=100.0, levels=[_level(100.8), _level(120.0)],
-        trend=TrendState.unavailable(), atr14=2.0,
+        strike=100.0, trend=_trend_with_emas({9: 100.2, 50: 100.8, 200: 120.0}), atr14=2.0
     )
-    assert len(out) == 1
-    assert "resistance $100.80" in out[0]
+    assert len(out) == 2
+    assert out[0].startswith("9 EMA") and out[1].startswith("50 EMA")
 
 
 def test_confluence_noop_without_atr():
     assert _strike_confluences(
-        strike=100.0, levels=[_level(100.0)],
-        trend=_trend_with_ema(50, 100.0), atr14=None,
+        strike=100.0, trend=_trend_with_ema(50, 100.0), atr14=None,
+    ) == ()
+
+
+def test_confluence_noop_when_trend_unavailable():
+    assert _strike_confluences(
+        strike=100.0, trend=TrendState.unavailable(), atr14=2.0,
     ) == ()
 
 
@@ -164,27 +167,27 @@ def test_confluence_band_uses_configured_mult():
     atr = 4.0
     band = _CONFLUENCE_ATR_MULT * atr
     just_in = _strike_confluences(
-        strike=100.0, levels=[], trend=_trend_with_ema(9, 100.0 + band - 0.01), atr14=atr
+        strike=100.0, trend=_trend_with_ema(9, 100.0 + band - 0.01), atr14=atr
     )
     just_out = _strike_confluences(
-        strike=100.0, levels=[], trend=_trend_with_ema(9, 100.0 + band + 0.01), atr14=atr
+        strike=100.0, trend=_trend_with_ema(9, 100.0 + band + 0.01), atr14=atr
     )
     assert just_in and not just_out
 
 
 def test_confluence_surfaces_end_to_end():
-    # Put an S/R level right on top of the 30-day call strike and confirm it
+    # Put an EMA right on top of the 30-day call strike and confirm it
     # reaches both the OptionStrike.confluences and the observations.
     ctx = compute_options_context(
         symbol="AAPL", as_of=date(2026, 6, 13), last_close=150.0,
-        levels=[], trend=TrendState.unavailable(), volatility=_vol_state(atr_14=3.0),
+        trend=TrendState.unavailable(), volatility=_vol_state(atr_14=3.0),
         session=None,
     )
     call_30 = {ss.days_to_expiry: ss for ss in ctx.strike_sets}[30].call
-    # Now rebuild with a level sitting on that strike.
+    # Now rebuild with the 200 EMA sitting on that strike.
     ctx2 = compute_options_context(
         symbol="AAPL", as_of=date(2026, 6, 13), last_close=150.0,
-        levels=[_level(call_30.strike)], trend=TrendState.unavailable(),
+        trend=_trend_with_ema(200, call_30.strike),
         volatility=_vol_state(atr_14=3.0), session=None,
     )
     call_30b = {ss.days_to_expiry: ss for ss in ctx2.strike_sets}[30].call
@@ -197,7 +200,7 @@ def test_confluence_surfaces_end_to_end():
 # ---------------------------------------------------------------------------
 def test_strikes_use_ewma_forward_vol():
     ctx = compute_options_context(
-        symbol="X", as_of=date(2026, 6, 13), last_close=150.0, levels=[],
+        symbol="X", as_of=date(2026, 6, 13), last_close=150.0,
         trend=TrendState.unavailable(),
         volatility=_vol_state(ewma_vol_pct=20.0), session=None,
     )
@@ -210,7 +213,7 @@ def test_strikes_use_ewma_forward_vol():
 
 def test_strikes_fall_back_to_trailing_hv_without_ewma():
     ctx = compute_options_context(
-        symbol="X", as_of=date(2026, 6, 13), last_close=150.0, levels=[],
+        symbol="X", as_of=date(2026, 6, 13), last_close=150.0,
         trend=TrendState.unavailable(),
         volatility=_vol_state(ewma_vol_pct=None), session=None,
     )

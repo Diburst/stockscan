@@ -1,0 +1,74 @@
+{# "Run a backtest" card — same inputs and defaults as `stockscan backtest run`.
+
+   Submits via HTMX to POST /backtests/run and swaps the response into
+   #backtest-run-status (the polling fragment). Without JS it's a plain
+   form POST that redirects back here with a flash.
+
+   Inputs:
+     strategies            — registered strategy classes for the select
+     default_start/_end    — ISO dates (5y window ending today)
+     default_capital, default_slippage_bps, default_commission
+     job                   — running job, or None (disables the Run button)
+#}
+{% from "_macros.html" import card, field_label %}
+{% call card("Run a backtest", subtitle="Same inputs as `stockscan backtest run`; runs in the background and lands in the list below") %}
+  <form method="post" action="/backtests/run"
+        hx-post="/backtests/run"
+        hx-target="#backtest-run-status"
+        hx-swap="outerHTML"
+        hx-disabled-elt="find button[type=submit]"
+        class="grid grid-cols-2 sm:grid-cols-4 gap-3">
+    <div class="col-span-2">
+      {{ field_label("bt_strategy", "Strategy", required=True) }}
+      <select id="bt_strategy" name="strategy" required
+              class="w-full px-3 py-2 rounded border border-ink-300 text-sm bg-white">
+        {% for st in strategies %}
+          <option value="{{ st.name }}">{{ st.display_name }} v{{ st.version }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    <div>
+      {{ field_label("bt_start", "From", help="Blank = 5 years before To") }}
+      <input id="bt_start" name="start" type="date" value="{{ default_start }}"
+             class="w-full px-3 py-2 rounded border border-ink-300 text-sm font-mono">
+    </div>
+    <div>
+      {{ field_label("bt_end", "To", help="Blank = today") }}
+      <input id="bt_end" name="end" type="date" value="{{ default_end }}"
+             class="w-full px-3 py-2 rounded border border-ink-300 text-sm font-mono">
+    </div>
+    <div>
+      {{ field_label("bt_capital", "Capital ($)") }}
+      <input id="bt_capital" name="capital" type="number" min="1" step="1000" value="{{ default_capital }}" required
+             class="w-full px-3 py-2 rounded border border-ink-300 text-sm font-mono">
+    </div>
+    <div>
+      {{ field_label("bt_slippage", "Slippage (bps)") }}
+      <input id="bt_slippage" name="slippage_bps" type="number" min="0" step="0.5" value="{{ default_slippage_bps }}" required
+             class="w-full px-3 py-2 rounded border border-ink-300 text-sm font-mono">
+    </div>
+    <div>
+      {{ field_label("bt_commission", "Commission ($/trade)") }}
+      <input id="bt_commission" name="commission" type="number" min="0" step="0.01" value="{{ default_commission }}" required
+             class="w-full px-3 py-2 rounded border border-ink-300 text-sm font-mono">
+    </div>
+    <div>
+      {{ field_label("bt_note", "Note") }}
+      <input id="bt_note" name="note" type="text" maxlength="200" placeholder="optional"
+             class="w-full px-3 py-2 rounded border border-ink-300 text-sm">
+    </div>
+    <div class="col-span-2 sm:col-span-3">
+      {{ field_label("bt_symbols", "Symbols", help="Space or comma separated. Blank = point-in-time S&P 500 membership") }}
+      <input id="bt_symbols" name="symbols" type="text" placeholder="AAPL MSFT NVDA — blank for the S&P 500"
+             class="w-full px-3 py-2 rounded border border-ink-300 text-sm font-mono uppercase">
+    </div>
+    <div class="flex items-end">
+      <button type="submit"
+              {% if job %}disabled{% endif %}
+              class="inline-flex items-center gap-1.5 text-xs px-3 py-1.5 rounded border border-ink-300 hover:bg-ink-100 transition-colors min-h-[36px] disabled:opacity-50 disabled:cursor-wait"
+              title="Start the backtest in the background; the list refreshes when it finishes">
+        ▶ Run
+      </button>
+    </div>
+  </form>
+{% endcall %}

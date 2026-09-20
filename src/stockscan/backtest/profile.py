@@ -71,8 +71,7 @@ def build_profile_config(
     end: date,
     symbols: Iterable[str] | None = None,
     sp500: bool = False,
-    capital: Decimal = Decimal("1000000"),
-    risk_pct: Decimal = Decimal("0.01"),
+    capital: Decimal = Decimal("100000"),
     slippage_bps: Decimal = Decimal("5"),
 ) -> BacktestConfig:
     """Assemble a :class:`BacktestConfig` from profile-tool arguments.
@@ -97,11 +96,9 @@ def build_profile_config(
 
     return BacktestConfig(
         strategy_cls=strategy_cls,
-        params=strategy_cls.params_model() if strategy_cls.params_model is not None else None,
         start_date=start,
         end_date=end,
         starting_capital=capital,
-        risk_pct=risk_pct,
         slippage=FixedBpsSlippage(bps=slippage_bps),
         universe=universe,
     )

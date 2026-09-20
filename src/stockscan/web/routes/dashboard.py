@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from datetime import date
-
 from fastapi import APIRouter, Depends, Request
 from sqlalchemy import text
 from sqlalchemy.orm import Session
@@ -15,13 +13,12 @@ from stockscan.econ_events import upcoming_events
 from stockscan.news import last_fetched_at as news_last_fetched_at
 from stockscan.news import recent_general as recent_news
 from stockscan.positions import list_open_trades
-from stockscan.regime import build_strategy_factors, latest_regime
+from stockscan.regime import latest_regime
 from stockscan.strategies import (
     STRATEGY_REGISTRY,
     current_version_filter,
     discover_strategies,
 )
-from stockscan.structure import compute_index_structure
 from stockscan.watchlist import watchlist_symbols
 from stockscan.web.deps import get_session, render
 
@@ -30,10 +27,10 @@ router = APIRouter()
 
 @router.get("/")
 def dashboard(request: Request, s: Session = Depends(get_session)):
-    """Top-level overview — latest equity, this month's current-version
-    signals, open trades, and the regime banner with per-strategy sizing
-    factors. The news, calendar, index-structure, macro, and earnings cards
-    each soft-fail independently so one failure never blanks the page."""
+    """Top-level overview — latest equity, the latest scan's passing
+    current-version signals, open trades, and the regime card with each strategy's sizing
+    rule. The news, calendar, macro, and earnings cards each soft-fail
+    independently so one failure never blanks the page."""
     discover_strategies()
 
     # Latest equity (or fallback)
@@ -44,26 +41,43 @@ def dashboard(request: Request, s: Session = Depends(get_session)):
         )
     ).first()
 
-    # Latest signals across all strategies — filtered to the CURRENT
-    # registered version of each strategy. Older-version signals stay
-    # in the DB for offline comparison but the live dashboard never
-    # mixes them with current-version signals.
+    # Latest scan: passing signals from the most recent scan date, filtered
+    # to the CURRENT registered version of each strategy. Older-version
+    # signals stay in the DB for offline comparison but the live dashboard
+    # never mixes them with current-version signals.
     version_clause, version_params = current_version_filter(prefix="s")
-    sig_rows = s.execute(
+    passing_row = s.execute(
         text(
             f"""
-            SELECT s.signal_id, s.strategy_name, s.symbol, s.side, s.score,
-                   s.status, s.suggested_entry, s.suggested_stop,
-                   s.rejected_reason, s.as_of_date
+            SELECT s.as_of_date, count(*) AS n
             FROM signals s
-            WHERE s.as_of_date >= :d
-              AND {version_clause}
-            ORDER BY s.as_of_date DESC, s.score DESC NULLS LAST
-            LIMIT 25
+            WHERE s.status = 'new' AND {version_clause}
+            GROUP BY s.as_of_date
+            ORDER BY s.as_of_date DESC
+            LIMIT 1
             """
         ),
-        {"d": date.today().replace(day=1), **version_params},
-    ).all()
+        version_params,
+    ).first()
+    passing_count = passing_row.n if passing_row else 0
+    passing_as_of = passing_row.as_of_date if passing_row else None
+    sig_rows = []
+    if passing_as_of is not None:
+        sig_rows = s.execute(
+            text(
+                f"""
+                SELECT s.signal_id, s.strategy_name, s.symbol, s.side, s.score,
+                       s.suggested_entry, s.suggested_stop, s.suggested_qty,
+                       s.as_of_date
+                FROM signals s
+                WHERE s.status = 'new'
+                  AND s.as_of_date = :d
+                  AND {version_clause}
+                ORDER BY s.score DESC NULLS LAST, s.symbol
+                """
+            ),
+            {"d": passing_as_of, **version_params},
+        ).all()
 
     open_trades = list_open_trades(session=s)
     health = healthcheck()
@@ -71,19 +85,6 @@ def dashboard(request: Request, s: Session = Depends(get_session)):
     regime = latest_regime(session=s)
 
     all_strategies = STRATEGY_REGISTRY.all()
-
-    # ---- v2 soft sizing: per-strategy multiplier breakdown for the banner.
-    # Helper lives in stockscan.regime so the regime-refresh route can
-    # rebuild this same shape after a forced recompute.
-    strategy_factors = build_strategy_factors(regime, all_strategies)
-    if regime is not None:
-        active_strategies = [sf["cls"] for sf in strategy_factors if (sf["effective"] or 0.0) > 0]
-        inactive_strategies = [
-            sf["cls"] for sf in strategy_factors if (sf["effective"] or 0.0) == 0
-        ]
-    else:
-        active_strategies = all_strategies
-        inactive_strategies = []
 
     # ---- News card data ----
     # Soft-fail per call (independent try/except per fetch) so an issue
@@ -112,13 +113,6 @@ def dashboard(request: Request, s: Session = Depends(get_session)):
     except Exception as exc:
         _log.warning("dashboard: compute_calendar_state() failed: %s", exc, exc_info=True)
         calendar_state = None
-
-    # ---- Index Structure card data (SPY ADX + Bollinger) ----
-    try:
-        structure_state = compute_index_structure(session=s)
-    except Exception as exc:
-        _log.warning("dashboard: compute_index_structure() failed: %s", exc, exc_info=True)
-        structure_state = None
 
     # ---- Macro this week card data (econ_events) ----
     # Default to "medium" importance min so the dashboard shows real
@@ -159,12 +153,11 @@ def dashboard(request: Request, s: Session = Depends(get_session)):
         "dashboard.html",
         equity=eq_row,
         signals=sig_rows,
+        passing_count=passing_count,
+        passing_as_of=passing_as_of,
         open_trades=open_trades,
         health=health,
         strategies=all_strategies,
-        active_strategies=active_strategies,
-        inactive_strategies=inactive_strategies,
-        strategy_factors=strategy_factors,
         regime=regime,
         watching=watching,
         news_articles=news_articles,
@@ -172,7 +165,6 @@ def dashboard(request: Request, s: Session = Depends(get_session)):
         news_refresh_error=None,
         news_refresh_summary=None,
         calendar_state=calendar_state,
-        structure_state=structure_state,
         macro_events=macro_events,
         watch_earnings=watch_earnings,
     )

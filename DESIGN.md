@@ -1,85 +1,14 @@
 # Personal Stock Trading App — Design Document
 
 **Author:** Thomas
-**Status:** Draft v0.9 — Phases 0–3 implemented + hardening pass (logging, deploy, background refresh)
-**Date:** 2026-06-12 (v0.8 dated 2026-04-29)
+**Status:** v1.0 — Phases 0–3 implemented; strategy canon and regime layer settled at the 2026-09 review
+**Date:** 2026-09-19
 
-> **v0.9 changes** (hardening refactor — see `refactor_plan_hardening.md` for the full plan):
-> - **Two sections of this document are superseded and marked inline:**
->   §4.11's parameter-management subsection (the `strategy_configs` table was
->   retired in migration 0016 — knobs live in the strategy file, edit-and-bump)
->   and §4.14 (the `technical` module + `technical_scores` table were retired in
->   migration 0015 — each strategy owns its score; breakdown persists in
->   `signals.metadata`). The sections remain as historical record; `refactor_plan.md`
->   documents the inside-out scoring refactor that replaced them.
-> - **Centralized logging** (`stockscan.logging_setup`): one `setup_logging()` per
->   entrypoint; human-readable single-line format; rotating per-component files
->   under `logs/` (`web` / `cli` / `nightly`); request-timing middleware logs every
->   request with a configurable slow-request threshold (`STOCKSCAN_SLOW_REQUEST_MS`).
-> - **Sync route handlers everywhere** (`web/routes/__init__.py` documents the rule):
->   handlers are `def`, not `async def`, so SQLAlchemy/pandas work runs in the
->   threadpool instead of blocking the event loop. Previously a slow request
->   (notably Fetch Latest) froze the entire UI for its duration.
-> - **Fetch Latest is a background job** (`scan/refresh_job.py`): POST starts a
->   single-flight worker thread; the Signals page polls `/signals/refresh/status`
->   every 2 s and swaps in the refreshed content when done. In-process job state →
->   the web service runs exactly one uvicorn worker (documented in DEPLOY.md).
-> - **Provider hardening**: 429 rate-limit retries honor Retry-After (capped 30 s);
->   read-timeouts retried once on light endpoints, never on the heavy bulk payload;
->   per-retry WARNINGs with the API token redacted. Bulk refresh reports per-day
->   partial failures (`BulkRefreshResult.failed_days`) instead of failing silently.
-> - **Nightly job accountability**: per-step durations logged; step failures are
->   collected and appended to the summary notification (subject gains `DEGRADED`),
->   so an overnight failure reaches Discord/email rather than dying in a log.
-> - **Full Docker Compose deployment** (DEPLOY.md): app `Dockerfile` (multi-stage,
->   Tailwind assets stage, non-root), `db` + one-shot `migrate` + `web` + `scheduler`
->   (supercronic, `infra/crontab`, ET times) services; DB is compose-network-only.
->   launchd remains the macOS bare-metal path. `uv.lock` is now committed.
-> - **Self-hosted UI assets**: built Tailwind stylesheet + vendored htmx replace the
->   Play CDN (dev-only tooling, broke offline). `make css` / Docker assets stage
->   rebuild it; config in `tailwind.config.js`.
-> - **HTMX failure UX**: HX-aware error responses (empty body + `HX-Reswap: none` +
->   friendly message in `X-Error-Message`) + global `htmx:responseError`/`sendError`
->   listeners → every failed fragment action surfaces as an error toast; the page
->   DOM is never mangled by an error body. Dashboard watch pill is now a two-way
->   HTMX toggle (`/watchlist/unwatch`). Watchlist reversal scores memoized per
->   (symbol, last-bar, day).
-> - **Startup config sanity**: degraded capabilities (missing EODHD/FRED keys, no
->   notification channel, placeholder DB password) are announced as WARNINGs at
->   web/scheduler startup (`config.config_warnings`).
-
-> **v0.8 changes** (regime detection v2 — composite + soft sizing; migration 0010):
-> - **Composite regime score** replaces the v1 ADX/SMA-only label as the primary regime output. Four components in [0, 1] (1 = healthy/calm), weighted per the research synthesis: **vol 0.40 / trend 0.25 / breadth 0.20 / credit 0.15**. The discrete `trending_up / trending_down / choppy / transitioning` label is preserved for the dashboard banner and back-compat, but it no longer drives sizing.
-> - **No look-ahead is the load-bearing invariant.** Every percentile, z-score, and slope uses *trailing* rolling windows (default 252 trading days). `tests/test_regime_composite.py` enforces this with truncation-invariance property tests on each windowed function plus an end-to-end pipeline test.
-> - **VIX-aware vol score** via EODHD's `.INDX` exchange path (`get_bars("VIX", ..., exchange="INDX")`). VIX OHLC is stored in the existing `bars` hypertable. `vol_score = 1 - rolling_pct_rank(VIX, 252)`.
-> - **HY OAS credit-stress signal** via FRED (series `BAMLH0A0HYM2`). New `FredProvider` mirrors `EODHDProvider`'s retry/transport pattern; new `macro_series` table holds level-only daily series. Two outputs: a smooth `credit_score = 1 - rolling_pct_rank(HY OAS, 252)` and a discrete `credit_stress_flag` (rank > 0.92 AND rising over 5 days) — the latter is wired as a tail-risk circuit breaker (0.5x size, block new long entries).
-> - **Soft sizing replaces the hard regime gate.** `Strategy.applicable_regimes` is deprecated; strategies declare `regime_affinity: dict[label, weight in [0,1]]` instead. The scanner runner computes `effective_qty = round(base_qty * affinity * (0.5 + 0.5*composite) * stress_mult)` per signal. The runner's `_check_regime` skip-path is gone; `_resolve_regime_factor` returns a `RegimeFactor` dataclass instead. A back-compat shim in `Strategy.__init_subclass__` auto-derives `regime_affinity` from any legacy `applicable_regimes` declaration (in-set → 1.0, out → 0.0) and emits a `DeprecationWarning`. The three shipped strategies were migrated to declare `regime_affinity` directly.
-> - **Schema**: migration 0010 adds `macro_series` + 13 new columns on `market_regime` (composite + 4 components + VIX/HY OAS levels and ranks/z + `credit_stress_flag` + `methodology_version`). All v2 score columns are NULLABLE so partial rows persist when a data source is degraded.
-> - **Graceful degradation per source**: if VIX bars are missing, `vol_score` is NULL and the composite renormalizes weights over the remaining 3 components. Same for RSP (breadth) and HY OAS (credit). The composite is NULL only when every component is missing. Tests cover each missing-source path individually in `tests/test_regime_detect_v2.py`.
-> - **Dashboard banner** redesigned: composite score with a coloured bar, four per-component bars (vol/trend/breadth/credit), underlying levels (VIX, HY OAS rank + z), credit-stress badge when fired, and a per-strategy effective-sizing table (`affinity × composite × stress = effective`). Mobile-responsive layout preserved (banner stacks vertically below the sm breakpoint).
-> - **Cache discipline**: `detect_regime` returns cached v2 rows (`methodology_version >= 2`) as-is; v1 cached rows get re-detected on first call so the composite columns can backfill. `force_recompute=True` bypasses the cache for backtest replay.
-> - **Skipped per the research doc** (deferred, *not* a v0.8 limitation): HMMs (Tier 2 in the research doc), BOCPD/PELT change-point detection, regime-switching GARCH, ML/deep-learning regime classifiers, multi-state HMMs, and trader-blog indicators (Aroon, Vortex, Choppiness, Fisher, MESA).
-
-> **v0.7 changes** (post-implementation reality check, reflecting what shipped):
-> - **Watchlist** (§4.13): manually-tracked symbols with optional `(target_price, target_direction)` alerts. Auto-disable on fire to prevent re-spam. Discord/email via the nightly hook. UI on `/watchlist` + Dashboard "+ Watch" quick-adds (HTMX in-place swap, no page reload).
-> - **Technical Confirmation Score** (§4.14): per-signal score in `[-1, +1]` derived from RSI(14) + MACD(12,26,9), with strategy-tag-aware scoring (mean_reversion vs trend_following branches). Plugin pattern mirrors strategies — drop a file in `technical/indicators/`, restart, it's live. Persisted to `technical_scores`. Displayed on Signals + Watchlist. Backfillable for historical signals via `stockscan technical backfill` (no API calls — uses local bars).
-> - **Fundamentals layer** (§4.15): per-symbol latest snapshot from EODHD `/fundamentals/{TICKER}`, 38 typed columns + raw_payload JSONB. Powers the new Largecap Rebound strategy's market-cap percentile filter. Refresh via `stockscan refresh fundamentals`.
-> - **Largecap Rebound strategy** (new in §6.3): counter-trend long entries on top-quintile-by-market-cap S&P 500 names trading below SMA(200), confirmed by RSI + MACD turning bullish.
-> - **Bulk EOD endpoint** (§4.1): `/eod-bulk-last-day/{exchange}` provider method — one API call per trading day for all symbols. Used by the nightly daily-refresh path; per-symbol path stays for initial backfills.
-> - **Migration runner internals** (§4.x): SQL files run statement-by-statement under AUTOCOMMIT to handle TimescaleDB continuous aggregates (which can't be in a transaction). `_split_sql_statements` strips comments + splits on top-level `;`.
-> - **Schema**: 5 migrations now (0001 initial, 0002 backtest, 0003 watchlist, 0004 technical_scores, 0005 fundamentals).
-
-> **v0.6 changes:** added **§4.12 Strategy Plugin System** — strategies are auto-discovered Python modules dropped into `stockscan/strategies/`, registered via `__init_subclass__` on the `Strategy` ABC. Each strategy declares a Pydantic parameter schema; the UI auto-renders editors from it. Strategies are **versioned** — historical signals reference `(strategy_name, strategy_version, params_hash)` so changing a strategy's logic or default params never invalidates past results. Schema gains `strategy_configs` and `strategy_versions` tables. Reference implementations in §6 are now explicit examples of the contract. Adding a new strategy is a ~50-line file drop, no framework edits required.
-
-> **v0.5 changes:** mobile/responsive UI elevated to a v1 requirement (was v2). Web UI is **mobile-first responsive** — must be functional on a ~390px viewport from the user's existing WireGuard-connected phone. Tables collapse to cards, modals become full-screen routes on mobile, sidebar collapses to hamburger, tap targets ≥44px. No PWA in v1. Phase 2 extended by ~0.5 weeks to absorb the responsive work and on-device verification (iOS Safari + Android Chrome). Deployment notes added for one-time `mkcert` root-CA install on the phone.
-
-> **v0.4 changes (from USER_STORIES.md):** added **base-rate analyzer module** (now §4.12) for per-signal historical outcome analysis including filter-rejected past setups; added explicit **`trades` round-trip table** to anchor notes and journal entries; added **`trade_notes`** table with optional templated fields and Postgres full-text search; scanner UI spec'd to display **rejected signals with badged reasons**; scanner extended to support **backdated `as_of` parameter** for research scans.
-
-> **v0.3 changes:** storage moved from SQLite + Parquet to **PostgreSQL 16 + TimescaleDB** (community edition). Bars are now a TimescaleDB hypertable inside the same database as transactional data, with native compression and continuous aggregates for weekly/monthly rollups. Single source of truth simplifies joins (bars × earnings × signals × positions in one query) and backups (`pg_dump`). Database runs in Docker on the Mac mini. Optional nightly Parquet export is kept for portability.
-
-> **v0.2 changes:** locked target = Apple Silicon Mac mini; indicator lib = `pandas-ta`; capital = $1M with integer shares only; earnings filter on both strategies (5-day exclusion); EODHD upgraded to All-In-One ($99.99/mo) to bundle EOD + Fundamentals + intraday and remove SKU-bundling ambiguity; tax-lot accounting = specific-lot (manual selection at exit); single-account v1 with `account_id` plumbed through schema for future multi-account; notifications = email + Discord webhook; $1M-specific liquidity and concentration limits tightened.
-
----
+This document describes the system as it runs today. Earlier revisions carried
+per-version changelogs; those were dropped at the 2026-09 canon review and live in
+git history. The decision record behind that review is
+`market_regime_detection.md` (regime layer) and the 2026-09 canon review notes
+(strategy roster).
 
 ## 1. Goals
 
@@ -108,17 +37,17 @@ Build a personal swing-trading toolkit that:
 |------|---------|
 | Trading horizon | Swing (days–weeks), end-of-day bars, signals at close → orders at next open |
 | Universe | S&P 500 (with historical constituents for survivorship correction) |
-| Strategies (v1) | One mean-reversion (RSI(2)), one trend-following (Donchian) — see §6 |
-| Capital | $1,000,000 starting equity, integer shares only (no fractional) |
-| Risk per trade | 1% of equity default ($10k), configurable per strategy |
+| Strategies | One mean-reversion (`rsi2_meanrev`), one trend-following (`momentum_52w_high`) — see §6. Nothing else is in the book |
+| Capital | `STOCKSCAN_STARTING_EQUITY` (default $100,000) until the first `equity_history` row; integer shares only |
+| Risk per trade | Declared on the strategy: momentum risks 0.75% of equity against its 15% stop; RSI(2) carries no stop and takes a fixed 10% of equity per position |
 | Earnings filter | Skip both MR and TF entries within 5 trading days of next reported earnings |
 | Brokerage | E*TRADE first, behind a `Broker` abstraction; "Suggestion Mode" is a first-class no-broker output |
 | Accounts | Single account v1; schema includes `account_id` everywhere for future multi-account |
 | Tax lots | Specific-lot tracking; user selects lots at exit time; FIFO as default suggestion |
 | Data provider | EODHD All-In-One ($99.99/mo) — bundles EOD + intraday + fundamentals + historical S&P 500 constituents (see §7) |
-| Tech stack | Python 3.12+, FastAPI, HTMX, **PostgreSQL 16 + TimescaleDB** (Docker), SQLAlchemy 2 + Alembic, pandas/NumPy, `pandas-ta` |
+| Tech stack | Python 3.12+, FastAPI, HTMX, **PostgreSQL 16 + TimescaleDB** (Docker), SQLAlchemy 2 + raw-SQL migrations, pandas/NumPy, hand-rolled indicators (`stockscan.indicators`) |
 | Storage philosophy | Single source of truth: Postgres holds everything (bars, transactional). TimescaleDB hypertable for bars with compression + continuous aggregates. Optional nightly Parquet export for portability. |
-| Hosting | Apple Silicon Mac mini, launchd scheduler, web UI on LAN over HTTPS |
+| Hosting | Apple Silicon Mac mini (launchd) or any Docker host (supercronic scheduler); web UI on LAN over HTTPS |
 | Notifications | Email (Postmark) + Discord webhook |
 
 ---
@@ -194,7 +123,7 @@ Build a personal swing-trading toolkit that:
 **Key invariants:**
 - The `bars` table stores **both** raw and adjusted prices: `open / high / low / close / volume` are the unadjusted quotes from the exchange, and `adj_close` is EODHD's split- and dividend-adjusted close. Storing both lets us answer "what did this stock actually trade for on date X" (tax-lot accounting, live-order routing) and "what does the historical price series look like on a continuous total-return basis" (indicators, backtests) from the same row.
 - `get_bars(symbol, start, end)` returns the **adjusted** view by default (`adjust=True`): OHLCV is rescaled by the per-bar ratio `adj_factor = adj_close / close`, with `close` set exactly to `adj_close` and `volume` divided by the factor (a 4:1 split quadruples shares). The unadjusted source values are preserved in `open_raw / high_raw / low_raw / close_raw / volume_raw`. Pass `adjust=False` to opt out and read raw bars verbatim. Edge cases (NULL `adj_close`, `close <= 0`) fall back to `adj_factor = 1.0` so the returned frame never contains NaN or inf from the adjustment step.
-- All historical analysis (indicators, returns, backtest entry/exit, charts, ML features, regime composite) reads from `get_bars()` and so is **automatically split- and dividend-corrected** without per-strategy code. Around AAPL's 2014 7:1 and 2020 4:1 splits, this eliminates the ~75% fake one-day drawdowns that would otherwise pop entries, trip stops, and blow out ATR for weeks.
+- All historical analysis (indicators, returns, backtest entry/exit, charts, the regime frame) reads from `get_bars()` and so is **automatically split- and dividend-corrected** without per-strategy code. Around AAPL's 2014 7:1 and 2020 4:1 splits, this eliminates the ~75% fake one-day drawdowns that would otherwise pop entries, trip stops, and blow out ATR for weeks.
 - Bar timestamps are `TIMESTAMPTZ` set to **16:00 America/New_York** for daily bars (ready for intraday later, where the timestamp is the bar's open/close depending on convention).
 - Ingest is **idempotent**: re-fetching the same date for the same symbol updates the row in place but never duplicates. Indispensable for retries and corporate-action re-adjustments.
 - The DB is the source of truth; the provider is just a refresh source. Backtests, scans, and analytics all read from the DB, never directly from the API.
@@ -211,34 +140,38 @@ Build a personal swing-trading toolkit that:
 
 ### 4.3 Scanner (`stockscan.scan`)
 
-**Responsibilities:** Apply each strategy's entry rules to today's bars across the universe; emit ranked signals.
+**Responsibilities:** Apply each strategy's entry rules to today's bars across the universe; size, filter and persist ranked signals.
 
-- Strategies are **discovered dynamically** from `stockscan/strategies/` at startup — see §4.11 for the plugin system. The scanner does not import strategies directly; it iterates `STRATEGY_REGISTRY` and calls each strategy's contract methods.
-- Each strategy implements the `Strategy` ABC defined in §4.11 (declared `name`, `version`, `params_model`, `signals()`, `exit_rules()`, `required_history()`, optional `tags`).
-- Signals carry: `(symbol, side, strategy, strategy_version, score, suggested_stop, suggested_target, metadata)`.
-- The scanner runs the **filter chain** (`stockscan.risk`) over each raw signal: passing signals get `status='new'`; failing signals get `status='rejected'` with `rejected_reason` populated. **Both are persisted** so the scanner UI can display passing and rejected with badged reasons (USER_STORIES Story 1).
-- The scanner accepts an `as_of` parameter (default = today) so the same engine can be invoked for **backdated research scans** ("what would have triggered on 2024-03-15?"). Backdated scans use historical S&P 500 membership and historical bars only — no leakage.
-- Scanner persists signals to the `signals` table and emits a notification.
+- Strategies are **discovered dynamically** from `stockscan/strategies/` at startup — see §4.11. The scanner iterates `STRATEGY_REGISTRY` and calls each strategy's contract methods; it never imports a strategy by name.
+- Per run (`ScanRunner.run(strategy, as_of)`):
+  1. Resolve the point-in-time S&P 500 universe for `as_of`.
+  2. Read the day's market regime (§4.14): the trend gate, the vol scalar and the credit-stress flag. A missing regime row sizes neutrally and logs a warning.
+  3. Build a `PortfolioContext` from the DB: equity (latest `equity_history` row, else `STOCKSCAN_STARTING_EQUITY`), open positions, sector map and current sector exposure, earnings within 5 days, 20-day dollar volume.
+  4. For every symbol with enough history, call `strategy.signals(bars, as_of)`. New longs are rejected outright with `trend_gate_closed` or `credit_stress_long_block` while the regime blocks them; otherwise each signal is sized by `size_for_strategy` (§4.7).
+  5. Run the filter chain over the survivors, best score first, so the strongest candidates claim contended slots. Passing candidates count against the caps for the rest of the pass.
+  6. Persist a `strategy_runs` row plus one `signals` row per candidate — `status='new'` for passing, `'rejected'` with `rejected_reason` for everything else — so the UI shows both.
+- Signals carry `(symbol, side, strategy, strategy_version, score, suggested_entry, suggested_stop | None, suggested_target, metadata)`. `metadata` holds the indicator values behind the signal; the signal-detail page renders it.
+- `as_of` defaults to today; a backdated scan uses historical membership and historical bars only.
 
 ### 4.4 Backtester (`stockscan.backtest`)
 
-**Design choice: event-driven, sharing strategy code with the live engine.** This avoids the classic "backtest looked great, live diverged" gap.
+**Design choice: event-driven, sharing strategy, sizing and regime code with the live engine.** A backtest measures the system that trades live, not a simplified cousin.
 
-- Iterates day by day over a historical date range.
-- For each date, restricts the universe to **historical S&P 500 members on that date**.
-- Calls `strategy.signals(...)` and `strategy.exit_rules(...)` exactly as the live scanner does.
-- A `PaperBroker` simulates fills at next-day open with configurable slippage (default: 5 bps).
-- Commission model: configurable; default `$0` for E*TRADE US equities.
-- Outputs:
-  - Equity curve persisted as a `backtest_equity_curve` table (one row per (run_id, date)).
-  - Trade log persisted as a `backtest_trades` table; CSV export available on demand.
-  - Metrics: CAGR, Sharpe, Sortino, max drawdown, max DD duration, win rate, avg win/loss, profit factor, expectancy, exposure %.
-  - Optional: walk-forward analysis (rolling train/test windows).
-- CLI: `stockscan backtest run rsi2_meanrev --from 2010-01-01 --to 2024-12-31 --capital 100000`.
+Loop, one trading day at a time (`BacktestEngine.run()`):
+
+1. **Exits.** For each open position run `strategy.exit_rules()` on `bars[≤ today]`. Exits — stops included — are the strategy's decision; **the engine applies no stop of its own.** Triggered exits fill at tomorrow's open.
+2. **Entries.** Look up today's row of the regime frame (§4.14). If new longs are blocked, skip entries for the day. Otherwise run `strategy.signals()` over the point-in-time universe, size each signal with `size_for_strategy` (the strategy's rule × the vol scalar where it opts in), sort by score, and run the same `FilterChain` the scanner uses — with `sectors`, `sector_exposure` and `avg_dollar_volume_20d` populated, so the sector and ADV caps bind. Survivors fill at tomorrow's open.
+3. **Mark to market** end-of-day equity from today's close.
+
+- The regime frame is computed once per run from SPY bars (800 calendar days of warmup) and the HY OAS series via `stockscan.regime.rules.regime_frame` — the function the live detector reads its last row from. No SPY bars → controls disabled for the run, logged once.
+- Fills: next-day open, `FixedBpsSlippage` (default 5 bp) in the direction that hurts, commission default $0.
+- `BacktestConfig` carries the portfolio caps (15 positions, 8% per position, 25% per sector, 5% of ADV, 15% drawdown breaker), matching the live defaults.
+- Outputs: `backtest_runs`, `backtest_trades` (with entry stop, R-multiple, MAE/MFE and the entry metadata snapshot), `backtest_equity_curve`; metrics via `stockscan.metrics` (CAGR, Sharpe, Sortino, max drawdown and duration, win rate, profit factor, expectancy, exposure).
+- CLI: `stockscan backtest run STRATEGY [--from/--to] [-s SYMBOL ...] [--capital] [--slippage-bps]`, `backtest list`, `backtest debug STRATEGY SYMBOL` (replays `signals()` per day and tabulates fired / score / every metadata key), `backtest export RUN_ID` (JSON: trades + entry metadata + equity + regime overlay), `backtest profile STRATEGY`.
 
 #### 4.4.1 Performance shape
 
-The backtest's working baseline on a 10-symbol × 1-year `reversal_swing` run is ~12 seconds; full S&P 500 × 4 years extrapolates to ~40 minutes. Three architectural facts about where the time goes — keep these in mind before any perf change:
+The backtest's working baseline on a 10-symbol × 1-year run is on the order of ten seconds; full S&P 500 × 4 years extrapolates to ~40 minutes. Three architectural facts about where the time goes — keep these in mind before any perf change:
 
 **The DB is not the bottleneck.** Counter-intuitive but well-established by profiling. Three caches do the heavy lifting:
 
@@ -248,7 +181,7 @@ The backtest's working baseline on a 10-symbol × 1-year `reversal_swing` run is
 
   For a 4-year × 500-symbol run that's ~1,500 DB queries total against ~500K (symbol, day) strategy evaluations. The cost is in compute, not I/O. If a profile ever shows `get_bars` or `psycopg` in the top of `cumtime`, a cache is stale or someone introduced a new DB-touching primitive — fix that, don't reach for more caching.
 
-**The cost lives in the per-(symbol, day) indicator recompute.** Every scoring call runs RSI(2), RSI(14), ATR(14), the pivot scan, the 5-bar volume scan, and the relative-strength reindex on a 235-bar trailing tail. ~500 × 1,000 days = 500K scoring calls × ~10 pandas-heavy operations each. That's the floor.
+**The cost lives in the per-(symbol, day) indicator recompute.** Every `signals()` call recomputes its moving averages, RSI, realized vol or regression slope, and the sector-relative return reindex on a trailing tail of a few hundred bars. ~500 × 1,000 days = 500K calls × several pandas-heavy operations each. That's the floor.
 
 **The pandas anti-pattern that catches you twice.** Two history-worthy fixes both took the same shape — writing into a pandas Series one cell at a time:
 
@@ -262,10 +195,10 @@ The backtest's working baseline on a 10-symbol × 1-year `reversal_swing` run is
   | After | Total run | Top function | Cumulative speedup |
   | --- | --- | --- | --- |
   | (baseline) | 69.0s | `_wilder_smoothing` 55.7s | 1.0× |
-  | Wilder fix | 13.7s | `reversal_score` 11.8s | 5.0× |
-  | RS date-handling fix | 11.7s | `reversal_score` 9.9s | 5.9× |
+  | Wilder fix | 13.7s | strategy scoring 11.8s | 5.0× |
+  | RS date-handling fix | 11.7s | strategy scoring 9.9s | 5.9× |
 
-  Past 5.9× the top of the profile becomes diffuse — `series.__init__`, `where`, `clip`, `__getitem__`, `_arith_method` — death by a thousand cuts. The next meaningful jump would require a per-symbol feature cache (precompute RSI/ATR/SMA series once per symbol when bars are first loaded; strategies look up at `today`'s index instead of recomputing the rolling window). That's the natural Phase-N optimization if S&P 500 × 4y becomes painful in the iterative loop.
+  Past 5.9× the top of the profile becomes diffuse — `series.__init__`, `where`, `clip`, `__getitem__`, `_arith_method` — death by a thousand cuts. The next meaningful jump would require a per-symbol feature cache (precompute RSI/SMA series once per symbol when bars are first loaded; strategies look up at `today`'s index instead of recomputing the rolling window). That's the natural Phase-N optimization if S&P 500 × 4y becomes painful in the iterative loop.
 
 ### 4.5 Position Manager (`stockscan.positions`)
 
@@ -307,17 +240,29 @@ class SuggestionBroker(Broker):...  # never executes; logs/emails ideas
 
 ### 4.7 Risk Engine & Sizer (`stockscan.risk`)
 
-- **Default rule:** Risk 1% of current equity per trade ($10k at $1M).
-- Position size = `floor((equity × risk_pct) / (entry_price − stop_price))`. Integer shares only — no fractional support on E*TRADE.
-- Per-strategy override (TF defaults to 0.75% because of wider stops and more positions).
-- **$1M-tuned portfolio constraints** (configurable):
-  - Max concurrent positions: **15** (10 MR + 5 TF, roughly).
-  - Max single position: **8% of equity** ($80k) — capping outsized winners.
-  - Max gross exposure: **100%** of equity (no leverage).
-  - Max sector concentration: **25%** of equity (tighter than the 30% rule of thumb because $1M makes single-sector blowups material).
-  - **Liquidity floor:** position size ≤ **5%** of the symbol's 20-day average dollar volume. At $1M, even the 1% risk on a low-ADV name can be a meaningful share of daily volume — this prevents being the marginal bid.
-  - **Circuit breaker:** no new entries if equity has drawn down >15% from high-water mark (tightened from 20% — at $1M, a 15% DD is $150k and warrants a manual review).
-- All constraints checked at signal-generation time; rejected signals are logged with rejection reason and surfaced in the UI so you see *why* a setup didn't make the cut.
+**Sizer (`sizer.py`).** Two rules, chosen by whether the signal carries a stop; both cap notional at `max_position_pct` of equity and round down to integer shares:
+
+- **Stop-based** — `qty = floor(equity × risk_pct / (entry − stop))`. Momentum: `default_risk_pct = 0.0075` against its 15% stop (≈5% of equity per position).
+- **Fixed fraction** — `qty = floor(equity × position_pct / entry)`, `risk_dollars` = the full notional. RSI(2): `position_pct = 0.10`, no stop (stops cut this trade's returns more than its drawdown — Kaminski & Lo 2014; Alvarez).
+
+`size_for_strategy(strategy_cls, equity, entry, stop, *, vol_scalar, max_position_pct)` applies the strategy's declared rule, then multiplies by the regime layer's vol scalar **only if** `strategy_cls.sizes_down_in_high_vol` is true (momentum yes, RSI(2) no — §4.14). It is the one sizing path; the live runner and the backtest engine both call it.
+
+**Filter chain (`filters.py`).** Pure functions of `(signal, qty, PortfolioContext)`; first rejection wins, and the reason is persisted on the signal:
+
+| Filter | Rejects when |
+|---|---|
+| drawdown circuit breaker | equity is more than `STOCKSCAN_DRAWDOWN_CIRCUIT_BREAKER` (15%) below its high-water mark |
+| already in position | the symbol is held by any strategy |
+| earnings within 5 trading days | gap risk on a small-edge trade |
+| max positions | `STOCKSCAN_MAX_POSITIONS` (15) open positions portfolio-wide |
+| per-strategy positions | the strategy's own `max_open_positions` (momentum: 10) |
+| max position pct | notional > 8% of equity |
+| max sector pct | sector exposure incl. this order > 25% of equity (unknown sector passes) |
+| max ADV pct | notional > 5% of the symbol's 20-day average dollar volume (unknown ADV passes) |
+
+Both the scanner and the engine populate `sectors`, `sector_exposure` and `avg_dollar_volume_20d` on the context, so the sector and ADV caps bind in both paths. Equity comes from the latest `equity_history` row, else `STOCKSCAN_STARTING_EQUITY` (default $100,000).
+
+Regime entry blocks (trend gate closed, credit stress) are applied by the runner and the engine *before* sizing, not by the chain.
 
 ### 4.8 Web UI (`stockscan.web`)
 
@@ -330,8 +275,9 @@ class SuggestionBroker(Broker):...  # never executes; logs/emails ideas
 - **Trade detail** — single-trade page with lots, sales, notes thread, base-rate-as-taken snapshot.
 - **Base rates** — per-signal historical outcome analyzer page (Story 4).
 - **Backtests** — list of saved runs, comparison view, equity curves, trade logs.
-- **Strategies** — view/edit parameter YAML, trigger ad-hoc scans.
-- **Settings** — broker config, risk caps, notification channels, universe overrides.
+- **Strategies** — each strategy's manual, sizing rule and tuning knobs (read off the class), data-input freshness.
+- **Analysis** — per-symbol trend bucket, realized-volatility state, options context, insider activity.
+- **Regime card** (Dashboard) — trend gate with days on side, vol scalar with realized vol and rank, credit-stress flag, per-strategy sizing line.
 
 **Mobile-first responsive (v1 requirement, USER_STORIES §Responsive):**
 
@@ -348,14 +294,19 @@ The same FastAPI + HTMX + Tailwind stack delivers both desktop and mobile from a
 
 **Verification:** before Phase 2 sign-off, every primary workflow (scan → ticket → submit → view trade → add note → exit review → check base rates) is manually verified on a real iPhone (Safari) and a real Android (Chrome) via the WireGuard tunnel.
 
-### 4.9 Scheduler (`stockscan.scheduler`)
+### 4.9 Scheduler and nightly job (`stockscan.jobs`)
 
-- Use **launchd** (Mac mini target). Declarative, survives reboots, integrates with the system log.
-- Three jobs:
-  - `refresh-and-scan` (20:00 ET, daily M–F): pull bars, compute indicators, run scanners, run exit checks on open positions, send notification.
-  - `place-orders` (09:25 ET, M–F): if broker is connected, transmit pending orders.
-  - `reconcile` (16:05 ET, M–F): pull broker positions/orders, diff with local state, alert on drift.
-- Each job is a CLI subcommand (`stockscan run refresh-and-scan`) so they're triggerable manually for testing.
+`stockscan jobs nightly-scan` (20:00 ET, Mon–Fri) is the one scheduled entry point — supercronic via `infra/crontab` in the Compose stack, launchd plists on a bare Mac. Steps, in order, each individually fault-tolerant (a failure is logged, recorded in `step_failures`, and the run continues):
+
+1. **Bars** — bulk-EOD refresh of recent days for every known symbol.
+2. **Macro** — FRED series (`BAMLH0A0HYM2` HY OAS for the credit-stress flag; `DGS1MO`/`DGS3MO` for the options analysis). Skipped with a warning when `FRED_API_KEY` is unset.
+3. **Regime** — `detect_regime(as_of, force_recompute=True)` from the fresh bars and macro, so a row cached earlier in the day is replaced before anything sizes against it.
+4. **Sector composites** — rebuild the equal-weight composites the strategies rank against (local, no API calls).
+5. **Scans** — `ScanRunner.run()` for every registered strategy.
+6. **Watchlist alerts** — price-target checks against the fresh bars.
+7. **Summary** — email + Discord; the subject gains `DEGRADED` when any step failed.
+
+Daily DB backup (02:00 ET) and the weekly fundamentals refresh (Sun 03:00 ET) are separate cron lines. Broker order placement and reconciliation jobs arrive with Phase 4.
 
 ### 4.10 Notifications (`stockscan.notify`)
 
@@ -367,170 +318,99 @@ The same FastAPI + HTMX + Tailwind stack delivers both desktop and mobile from a
 
 ### 4.11 Strategy Plugin System (`stockscan.strategies`)
 
-**Goal:** adding a new strategy is a single-file drop into `stockscan/strategies/`. No registry edits, no framework changes, no UI changes — the scanner picks it up on the next restart, the UI auto-renders an editor for its parameters, the backtester and base-rate analyzer can immediately run it.
+**Goal:** a strategy is one file that reads like a book. Drop it into `stockscan/strategies/`, restart, and the scanner, backtester, base-rate analyzer and UI pick it up. No registry edits, no framework changes.
 
 #### Contract
 
-Every strategy is a subclass of `Strategy` (an ABC):
+Every strategy subclasses `Strategy` (`base.py`); subclassing registers it in `STRATEGY_REGISTRY` via `__init_subclass__`.
 
 ```python
-# stockscan/strategies/base.py
-
-from abc import ABC, abstractmethod
-from datetime import date
-from typing import ClassVar
-import pandas as pd
-from pydantic import BaseModel
-
-class StrategyParams(BaseModel):
-    """Subclass per strategy. Pydantic gives us validation + UI form rendering."""
-    pass
-
 class Strategy(ABC):
-    # --- declarative metadata (class attributes) ---
-    name: ClassVar[str]                  # unique, snake_case ('rsi2_meanrev')
-    version: ClassVar[str]               # semver-ish ('1.0.0'); bump on logic change
-    display_name: ClassVar[str]          # human-readable ('RSI(2) Mean-Reversion')
-    description: ClassVar[str]           # one paragraph, shown in UI
-    tags: ClassVar[tuple[str, ...]] = ()  # 'mean_reversion', 'long_only', etc.
-    params_model: ClassVar[type[StrategyParams]]
-    default_risk_pct: ClassVar[float] = 0.01  # may be overridden per strategy
+    # declarative metadata
+    name: ClassVar[str]                     # "rsi2_meanrev"
+    version: ClassVar[str]                  # "2.0.0" — bump on any logic or knob change
+    display_name: ClassVar[str]
+    description: ClassVar[str] = ""         # one paragraph (UI cards)
+    manual: ClassVar[str] = ""              # long-form walkthrough, rendered on /strategies/<name>
+    tags: ClassVar[tuple[str, ...]] = ()
+    data_dependencies: ClassVar[tuple[str, ...]] = ()   # non-bar inputs, e.g. ("sector_composites",)
 
-    def __init__(self, params: StrategyParams):
-        self.params = params
+    # sizing (read by size_for_strategy and the filter chain)
+    default_risk_pct: ClassVar[float] = 0.01        # stop-based sizing
+    position_pct: ClassVar[float | None] = None     # fixed-fraction sizing (stop-less strategies)
+    max_open_positions: ClassVar[int | None] = None
+    sizes_down_in_high_vol: ClassVar[bool] = True   # does the regime vol scalar apply?
 
-    @abstractmethod
-    def required_history(self) -> int:
-        """Bars needed before signals() can produce output (e.g., 200 for SMA200)."""
+    def required_history(self) -> int: ...
+    def signals(self, bars: pd.DataFrame, as_of: date) -> list[RawSignal]: ...   # pure; never reads past as_of
+    def exit_rules(self, position: PositionSnapshot, bars, as_of) -> ExitDecision | None: ...
 
-    @abstractmethod
-    def signals(self, bars: pd.DataFrame, as_of: date) -> list[RawSignal]:
-        """Pure function. bars indexed by date, as_of is the close to evaluate.
-        MUST NOT use any data after as_of (look-ahead = bug)."""
-
-    @abstractmethod
-    def exit_rules(
-        self, position: PositionSnapshot, bars: pd.DataFrame, as_of: date
-    ) -> ExitDecision | None:
-        """Returns an exit decision (sell with reason) or None to hold."""
-
-    # --- auto-registration ---
-    def __init_subclass__(cls, **kwargs):
-        super().__init_subclass__(**kwargs)
-        if not getattr(cls, '__abstract__', False):
-            STRATEGY_REGISTRY.register(cls)
+    @classmethod
+    def knobs(cls) -> dict[str, int | float | str | bool]: ...   # every tunable constant on the class
+    @classmethod
+    def knobs_hash(cls) -> str: ...                             # identity of "which settings produced this run"
+    @classmethod
+    def code_fingerprint(cls) -> str: ...                       # SHA-256 of the source file
 ```
 
-`__init_subclass__` is the magic: defining a non-abstract subclass of `Strategy` registers it as a side effect of class creation. No decorators required.
+- **Knobs are class constants.** Every tunable is a `ClassVar` on the class; the strategy is instantiated with no arguments. `knobs()` collects every public int/float/str/bool attribute across the MRO (sizing attributes included, metadata excluded) for the strategy page, the run record and `stockscan strategies show`. To change a knob: edit the file, bump `version`. There is no parameter object, no DB shadow, no runtime override. Tests override per instance (`s = RSI2MeanReversion(); s.rsi_entry = 5.0`).
+- **Exits are the strategy's alone.** `exit_rules()` returns an `ExitDecision(reason, qty)` or `None`; any stop — a price stop, a trend break, a time stop — is expressed there. Neither the runner nor the engine applies a stop of its own. A strategy that trades without a price stop emits `suggested_stop=None` and sets `position_pct`.
+- **Regime is the runner's job.** Strategies declare `sizes_down_in_high_vol`; the runner and engine apply the trend gate, the vol scalar and the credit breaker (§4.14). Strategy code never reads the regime.
+- `RawSignal` (frozen dataclass): `strategy_name, strategy_version, symbol, side, score, suggested_entry, suggested_stop | None, suggested_target, metadata`. `score` is the strategy's ranking metric; `metadata` holds the inputs behind it.
 
 #### Auto-discovery
 
-At process startup the framework calls `discover_strategies()`:
+`discover_strategies()` imports every module in the package (skipping `_*` and `base`); subclassing does the registering. The scanner, backtester and analyzer consume `STRATEGY_REGISTRY` and never import a strategy by name.
+
+#### Indicator primitives (`stockscan.indicators`)
+
+Pure functions, Series in, Series (or float) out, NaN for insufficient history, no strategy argument and no registry. Strategies call them by name inside `signals()` / `exit_rules()` and keep the combining logic inline with comments in trader's language.
+
+| Primitive | Module | Notes |
+|---|---|---|
+| `sma`, `ema`, `rsi`, `atr`, `true_range` | `ta.py` | Wilder smoothing runs on an ndarray (§4.4.1) |
+| `avg_dollar_volume` | `ta.py` | 20-day default; feeds the ADV cap |
+| `yang_zhang_volatility`, `yang_zhang_volatility_ewm` | `ta.py` | OHLC realized-vol estimators for the analysis page |
+| `sector_return`, `sector_relative_return` | `relative_strength.py` | The one primitive that touches the DB: a symbol's sector composite (run-scoped caches for the sector map and composite bars) |
+
+That is the whole set. Anything a strategy needs beyond it is computed inline in the strategy file.
+
+#### Adding a strategy
 
 ```python
-# stockscan/strategies/__init__.py
+# stockscan/strategies/example_pullback.py
+from typing import ClassVar
 
-import importlib, pkgutil
-from pathlib import Path
+from stockscan.indicators import rsi, sma
+from stockscan.strategies import ExitDecision, PositionSnapshot, RawSignal, Strategy
 
-STRATEGY_REGISTRY = StrategyRegistry()
-
-def discover_strategies():
-    """Import every .py file in this package. Subclassing Strategy auto-registers."""
-    pkg_path = Path(__file__).parent
-    for module_info in pkgutil.iter_modules([str(pkg_path)]):
-        if module_info.name.startswith('_') or module_info.name == 'base':
-            continue
-        importlib.import_module(f'stockscan.strategies.{module_info.name}')
-    return STRATEGY_REGISTRY
-```
-
-The scanner, backtester, and base-rate analyzer all consume from `STRATEGY_REGISTRY` — never import a strategy by name.
-
-#### Parameter management
-
-> **⚠ SUPERSEDED (v0.9 / migration 0016).** The `strategy_configs` table is
-> retired. Knobs live in the strategy FILE — either ClassVar constants or
-> `StrategyParams` Field defaults — and a version bump is the unit of change.
-> There is no DB shadow of parameters and no `params_hash` lookup at scan
-> time. The text below is kept as historical record of the original design.
-
-Each strategy declares its params as a Pydantic model. **Code defines the shape; the database holds the current values**:
-
-- The `strategy_versions` table (§8) records every (strategy_name, version) the framework has seen, with the JSON Schema of its params model. New versions are detected and registered at startup.
-- The `strategy_configs` table holds the *current* parameter values per strategy. Editing a config writes a new row with a new `params_hash`; old rows are kept for audit and reproducibility. The active config per strategy is the most recent.
-- The web UI's "Strategies" page renders an editable form for each strategy's params from the Pydantic schema (Pydantic → JSON Schema → form fields, via a small renderer).
-- Every signal, order, and trade record in the DB references `(strategy_name, strategy_version, params_hash)`. **Past signals are immutable** — changing today's params doesn't rewrite yesterday's signal history.
-
-#### Adding a new strategy: walkthrough
-
-To add a new strategy, e.g., a Bollinger Band squeeze breakout:
-
-```python
-# stockscan/strategies/bbsqueeze_breakout.py
-
-from pydantic import Field
-from .base import Strategy, StrategyParams, RawSignal, ExitDecision
-
-class BBSqueezeBreakoutParams(StrategyParams):
-    bb_period: int = Field(20, ge=10, le=50, description="Bollinger Band lookback")
-    bb_stddev: float = Field(2.0, ge=1.0, le=3.0)
-    squeeze_pct: float = Field(0.02, description="Band width threshold for squeeze")
-    atr_stop_mult: float = Field(2.0, ge=1.0, le=4.0)
-
-class BBSqueezeBreakout(Strategy):
-    name = "bb_squeeze_breakout"
+class ExamplePullback(Strategy):
+    name = "example_pullback"
     version = "1.0.0"
-    display_name = "Bollinger Band Squeeze Breakout"
-    description = "Enters long on close above upper Bollinger Band after a squeeze period."
-    tags = ("trend_following", "breakout", "long_only")
-    params_model = BBSqueezeBreakoutParams
-    default_risk_pct = 0.01
+    display_name = "Example Pullback"
+    tags = ("mean_reversion", "long_only")
 
-    def required_history(self) -> int:
-        return max(self.params.bb_period, 20) + 50  # buffer for ATR
+    position_pct = 0.05          # fixed fraction, no price stop
+    sizes_down_in_high_vol = False
 
-    def signals(self, bars, as_of):
-        # ... computation using self.params.bb_period etc.
-        return []
+    rsi_period: ClassVar[int] = 2
+    rsi_entry: ClassVar[float] = 10.0
+    max_holding_bars: ClassVar[int] = 10
 
-    def exit_rules(self, position, bars, as_of):
-        # ... ATR trailing stop, time stop, etc.
-        return None
+    def required_history(self) -> int: ...
+    def signals(self, bars, as_of) -> list[RawSignal]: ...
+    def exit_rules(self, position, bars, as_of) -> ExitDecision | None: ...
 ```
 
-That's it. Drop the file, restart the server, and:
-- The "Strategies" page shows a new card with the description, tags, and an editable form for the four parameters.
-- The daily scanner runs it.
-- The backtester can backtest it.
-- The base-rate analyzer can analyze any signal it produces.
-- All historical scans before today are unaffected.
+Drop the file, restart: the Strategies page shows the card with its knobs, the nightly job scans it, the backtester and base-rate analyzer can run it, and `strategy_versions` records its fingerprint on first use.
 
 #### Testing contract
 
-Every concrete strategy is auto-tested by a parameterized base test in `tests/strategies/test_contract.py`:
+`tests/test_strategy_contract.py` parametrizes over every registered strategy: instantiates with no arguments; `required_history()` is positive and covers the longest lookback; a sizing basis is declared (`position_pct` or a positive `default_risk_pct`); `signals()` returns only `RawSignal`s carrying the strategy's own name and version, is idempotent, and is invariant to truncating `bars` at `as_of`; `exit_rules()` returns `None` or an `ExitDecision` and has no look-ahead; `knobs()` contains only primitives, includes the sizing attributes and excludes metadata; `knobs_hash()` is stable and sensitive to a knob change. A new strategy that violates the contract fails the suite before it is ever scanned.
 
-- `signals()` returns only `RawSignal` instances with the strategy's own name and version.
-- `signals()` is **idempotent** (same inputs → same outputs).
-- `signals()` has **no look-ahead** — slicing `bars` to `bars.index <= as_of` and re-running yields identical output.
-- `exit_rules()` is monotonic given the same position state.
-- The Pydantic params model has at least one valid default instance.
-- `required_history()` returns a positive integer bounded by some sane max (say, 1000 bars).
+#### Out of scope
 
-CI runs the contract tests against every registered strategy. A new strategy that violates the contract fails CI before merge.
-
-#### What this enables
-
-- **Parameter sweeps**: the backtester accepts a parameter grid (`bb_period in [15,20,25] × bb_stddev in [1.5,2.0,2.5]`) and runs the cartesian product in parallel. Output is a heatmap of expectancy by param combination. (Defer the UI for sweeps to v1.5; the engine supports it from day 1.)
-- **A/B comparisons**: backtest two versions of the same strategy side-by-side on identical bars and compare metrics.
-- **Strategy retirement**: deactivate a strategy in `strategy_configs` (set `active=false`) without deleting its history. Past trades remain attributed; no new signals fire.
-- **Strategy library growth without framework drag**: in three years, you can have 30 strategies in the folder and the framework code hasn't changed.
-
-#### Out of scope for v1 (see §13)
-
-- Hot reload of strategy modules without restart.
-- Strategy upload/edit through the web UI (security: arbitrary code execution).
-- Strategies as separately installable Python packages via entry points.
+Hot reload without restart; strategy upload or editing through the web UI (arbitrary code execution); strategies as separately installable packages; a parameter-sweep engine (settling backtests are run by editing knobs and bumping the version — `TODO.md`).
 
 ### 4.12 Base-Rate Analyzer (`stockscan.analyzer`)
 
@@ -560,34 +440,25 @@ CI runs the contract tests against every registered strategy. A new strategy tha
 
 **Why auto-disable on fire:** the alternative — re-firing daily as long as the price stays past the target — generates noise and trains the operator to ignore alerts. One firing per crossing event matches retail-watchlist conventions (Robinhood, Fidelity) and is more useful in practice.
 
-### 4.14 Technical Confirmation Score (`stockscan.technical`)
+### 4.14 Market Regime (`stockscan.regime`)
 
-> **⚠ SUPERSEDED (v0.9 / migration 0015).** The `technical` module and
-> `technical_scores` table are retired. Each strategy now owns its score:
-> the composite math lives in a public method on the strategy class (e.g.
-> `ReversalSwing.reversal_score()`), indicator primitives are pure functions
-> in `stockscan.indicators`, and the per-input breakdown persists in
-> `signals.metadata["score_breakdown"]`. See `refactor_plan.md` for the
-> rationale (double-compute, generic-score mismatch, strategy-intent leaking
-> into indicators). The text below is the original design, kept as record.
+Two controls and one breaker, deliberately separate, because the evidence backs each for a different job and with a different sign per strategy family. Full design note with citations: `market_regime_detection.md`.
 
-**Responsibilities:** Per-signal score in `[-1, +1]` answering "do the technicals confirm what this strategy is trying to do?" Backs USER_STORIES Story 12.
+| Control | Rule | Effect |
+|---|---|---|
+| **Trend gate** | SPY close vs SMA(200); flips only after `TREND_DWELL = 3` consecutive closes on the other side | Closed → **no new long entries**. Open positions run their own exits. |
+| **Vol scalar** | 20-day realized vol of SPY log returns, percentile-ranked over 252 days; in the top tercile the scalar is `clip(0.16 / realized, 0.5, 1.0)`, else 1.0 | Multiplies position size for strategies with `sizes_down_in_high_vol = True` (momentum). Never scales up. |
+| **Credit-stress flag** | HY OAS (`BAMLH0A0HYM2`) above the 85th percentile of its trailing 252 observations **and** higher than 5 observations ago | Blocks new longs while it fires. |
 
-- **Plugin pattern, identical to strategies.** `TechnicalIndicator` ABC with auto-registration via `__init_subclass__`. Drop a file in `technical/indicators/`, restart, it's live. Initial indicators: RSI(14) and MACD(12, 26, 9).
-- **Each indicator implements two methods:**
-  - `values(bars, as_of) -> dict | None` — raw computed values (e.g., `{"value": 28.4}` for RSI). Returns None on insufficient history (composite skips abstaining indicators).
-  - `score(values, strategy) -> float` — confirmation score in `[-1, +1]`, branching by `strategy.tags`. `strategy=None` triggers neutral / direction-agnostic mode (used by the Watchlist).
-- **Tag-aware routing:** `mean_reversion` strategies want LOW RSI / negative-rising MACD = +confirming; `trend_following` and `breakout` want HIGH RSI / positive-rising MACD. Adding a strategy with existing tags requires zero indicator code changes; adding a new tag (e.g., `momentum_reversal`) requires one branch per indicator.
-- **Composite** = equal-weight average across indicators that produced a value. Persisted in `technical_scores` (migration 0004) keyed `(symbol, as_of_date, strategy_name)`. Watchlist neutral-mode rows use `strategy_name = '_neutral'`.
-- **Computed by `ScanRunner`** after persisting each signal — both passing AND rejected (rejected ones get a score for diagnostic value).
-- **Backfillable** for past signals via `stockscan technical backfill` — uses local bars only, no API calls. `recompute --since DATE` overwrites for after-the-fact scoring-formula changes.
-- **Display:** new "Tech" column on `/signals` (LEFT JOIN at query time) and `/watchlist` (computed on-render in neutral mode, ~50 ms for typical watchlist size). Colored signed bar: green positive, red negative, grey near-zero.
-
-**Important nuance for new strategies:** strategies whose entry rules already require RSI + MACD bullish (like Largecap Rebound) will get tech scores that frequently agree with the entry decision — the score's marginal information is the *magnitude* of the readings rather than independent confirmation. Adding orthogonal primitives (volume confirmation, distance-from-200-SMA) is the long-term fix; not blocking on it.
+- `rules.py` is pure pandas: `trend_gate`, `realized_vol`, `vol_pct_rank`, `vol_scalar`, `credit_stress_flag`, and `regime_frame(spy_close, hy_oas) -> DataFrame` with every control per bar. Every computation is a trailing window or a forward state machine, so recomputing on a truncated series matches the live value at the truncation point (`tests/test_regime_rules.py` holds the property test).
+- `detect.py` — `detect_regime(as_of, force_recompute=False)` pulls two years of SPY closes and the HY OAS series, evaluates `regime_frame`, persists the last row to `market_regime` (one row per day, `methodology_version = 3`) and returns a `MarketRegime`. No SPY bars → `None`, callers size neutrally. No HY OAS → credit flag off, logged.
+- `store.py` — the row: `trend_gate_open`, `days_on_side`, `spy_close`, `spy_sma200`, `spy_sma200_slope_20d`, `realized_vol_20d`, `realized_vol_pct_rank`, `vol_scalar`, `hy_oas_level`, `hy_oas_pct_rank`, `credit_stress_flag`, and the display label `regime ∈ {risk_on, risk_off, credit_stress}` (credit stress dominates). `MarketRegime.block_new_longs` and `.vol_multiplier` are what the runner reads.
+- **One rule set, two readers.** The live runner reads the last row via `detect_regime`; the backtest engine evaluates the whole frame once per run. A backtest therefore measures the gate, the scalar and the breaker exactly as they trade live.
+- The nightly job recomputes the row (forced) after the bars and macro refresh and before any scan (§4.9). The dashboard card shows each control with its inputs and a per-strategy line saying whether the vol scalar applies.
 
 ### 4.15 Fundamentals Layer (`stockscan.fundamentals`)
 
-**Responsibilities:** Latest-snapshot fundamentals data per symbol, refreshed from EODHD's `/fundamentals/{TICKER}`. Backs USER_STORIES Story 13 and powers the Largecap Rebound strategy's market-cap filter.
+**Responsibilities:** Latest-snapshot fundamentals data per symbol, refreshed from EODHD's `/fundamentals/{TICKER}`. Backs USER_STORIES Story 13 and supplies the sector map behind the sector composites.
 
 - **`fundamentals_snapshot` table** (migration 0005): one row per `symbol UNIQUE`. **38 typed columns** for the fields strategies actually filter on at scan time (`market_cap`, `sector`, `industry`, `shares_outstanding`, `pe_ratio`, `forward_pe`, `eps_ttm`, `dividend_yield`, `beta`, `week_52_high`/`low`, `day_50_ma`/`day_200_ma`, ratios, ...). The full provider response stays in `raw_payload` JSONB for any future field that doesn't yet have an extracted column.
 - **Indexes:** partial DESC index on `market_cap` (used by `market_cap_percentile` queries) and `sector`.
@@ -599,7 +470,7 @@ CI runs the contract tests against every registered strategy. A new strategy tha
 - **`refresh.py`** + CLI command `stockscan refresh fundamentals [SYMBOLS...] [--current-only]`. One API call per symbol; ~500 calls for the full S&P 500. Run weekly (most fields change quarterly with earnings).
 - **DataProvider ABC extended** with `get_fundamentals(symbol)` (default returns None; EODHDProvider overrides).
 
-**Caveat documented in code:** the table holds the *latest* snapshot per symbol, not point-in-time history. For backtests of past dates this means we apply *today's* market-cap percentiles to historical bars — minor look-ahead bias on the universe filter only (prices stay clean). True historical fundamentals (per-quarter snapshots) is a Phase 5 enhancement.
+**Point-in-time companion:** `fundamentals_history` (migration 0023) holds shares outstanding per reporting period, extracted from the stored `raw_payload`, so the cap-weighted composite builder uses `shares(t) × price(t)` rather than today's share count. The snapshot table itself is latest-only; no strategy filters on it at scan time.
 
 ---
 
@@ -630,108 +501,42 @@ References: [EODHD pricing](https://eodhd.com/pricing), [EODHD historical consti
 
 ---
 
-## 6. Strategy Specifications (Proposed for Review)
+## 6. Strategy Specifications
 
-Both strategies are documented in the literature and have decades of out-of-sample evidence. Both are also simple enough that you can read the code and verify it matches the spec.
+The book is two strategies, both with decades of published out-of-sample evidence, both simple enough to read the code and verify it against the spec. Each file's module docstring and `manual` carry the trader-language walkthrough and the sources; this section is the summary.
 
-**Note:** these are **reference implementations** of the `Strategy` contract defined in §4.11. Adding a third strategy later is a single-file drop into `stockscan/strategies/`; no framework code changes.
+### 6.1 `rsi2_meanrev` v2.0.0 — RSI(2) Pullback in Uptrend
 
-### 6.1 Mean Reversion: RSI(2) Pullback in Uptrend (Connors)
+**Source:** Connors & Alvarez (2008); Alvarez (2015–2024); Da, Liu & Schaumburg (2014) on industry-residual reversal; Medhat & Schmeling (2022) on turnover; Kaminski & Lo (2014) on stop-loss rules; Nagel (2012) on reversal and VIX.
 
-**Source:** Larry Connors & Cesar Alvarez, *Short Term Trading Strategies That Work* (2008).
+| | Rule |
+|---|---|
+| Setup | `adj_close > SMA(200)` · sector 1-month return > −5% · 2-day selloff volume < 1.5× the prior 50-day mean |
+| Entry | `RSI(2) < 10` at the close → buy at next open (`require_hook = False` by default) |
+| Rank | idiosyncratic drop = sector 1-month return − stock 1-month return; most stock-specific drop first |
+| Exit | `close > SMA(5)` or `RSI(2) > 50` → sell at next open; time stop after 10 bars |
+| Stop | **none** — a price stop sells the extreme the strategy is built to buy |
+| Sizing | `position_pct = 0.10`; `sizes_down_in_high_vol = False` (reversal pays best in high vol); portfolio caps only |
 
-**Setup filter:** `Close > SMA(200)` — only buy in long-term uptrends.
+Signal metadata: `rsi_2`, `sma_200`, `stock_return_1m`, `sector_return_1m`, `idiosyncratic_drop`, `relative_volume`.
 
-**Entry:** When `RSI(2) < 10` at today's close, enter long at tomorrow's open.
+### 6.2 `momentum_52w_high` v2.0.0 — 52-Week-High Momentum
 
-**Exit (whichever first):**
-- `Close > SMA(5)` (mean has reverted) → sell at next open.
-- Hard stop: `entry_price − 2.5 × ATR(14)` intraday.
-- Time stop: 10 trading days.
+**Source:** George & Hwang (2004); Jeon & Byun (2023); Clenow, *Stocks on the Move* (2015); Gray & Vogel, *Quantitative Momentum*; Han, Zhou & Zhu on the 15% stop; Daniel & Moskowitz (2016) and Barroso & Santa-Clara (2015) on volatility scaling; Blitz, Huij & Martens (2011) on residual momentum.
 
-**Position sizing:** 1% equity risked from entry to hard stop.
+| | Rule |
+|---|---|
+| Eligible | `adj_close > SMA(200)` and `SMA(50) > SMA(200)` · no single-day move beyond ±15% in the last 90 bars · 1-year realized vol ≤ 60% · close ≥ 90% of the 252-day high |
+| Rank | closeness (close ÷ 252-day high) + Clenow slope quality (90-day log-price regression slope × R², squashed to 0–1) + residual tilt (12-month return minus the sector composite's, capped ±25%) |
+| Review | new entries only on Wednesday's close, filled Thursday's open; exits run every day |
+| Exit | close ≤ entry × 0.85 (`stop_loss`) · close < SMA(100) (`below_sma100`) · close < 85% of the 252-day high (`left_near_high_set`) |
+| Sizing | `default_risk_pct = 0.0075` against the 15% stop (≈5% of equity per position); `max_open_positions = 10`; `sizes_down_in_high_vol = True` |
 
-**Filters:**
-- Skip if average dollar volume (20d) < $50M (liquidity floor raised for $1M capital).
-- **Skip if name reports earnings within 5 trading days** (avoids gap risk on small-edge trades).
-- Skip if intended position size > 5% of 20d ADV (per §4.7 liquidity rule).
+Signal metadata: `closeness_52w`, `slope_quality`, `residual_return_12m`, `residual_tilt`, `realized_vol_1y`, `sma_50`, `sma_200`.
 
-**Expected behavior:** Many trades, short holds (avg ~3 days), high win rate (60–70%), small avg win/loss ratio. Edge comes from frequency. Earnings filter expected to drop ~10% of would-be signals.
+### 6.3 Why these two together
 
-### 6.2 Trend Following: Donchian Channel Breakout (Turtle-style)
-
-**Source:** Richard Dennis's Turtle Traders rules + modern equity-trend literature (Greyserman & Kaminski 2014; Hurst 2017 / AQR; Clenow 2015; Larry Williams 1999) + base-breakout literature (Minervini 2013; O'Neil 1988; Weinstein 1988; Bollinger 2001). Implementation version: **v1.2.1** (v1.2.0 → v1.2.1 loosened `vol_contraction_ratio` 0.85 → 0.92 and `base_max_range_pct` 12.0 → 15.0 after the initial 1.2.0 backfill produced too few signals).
-
-**v1.2 framing:** v1.1 caught real breakouts in trending markets but still produced too many signals on stocks that had already soared, were rapidly fluctuating, or were already extended. v1.2 narrows the strategy to the specific setup with the strongest historical edge — a stock that was QUIET (tight pre-breakout range, contracted vol, near its 50-day MA, RSI not elevated) and just broke out on volume. Four new filters plus tightened defaults on `adx_min` (18 → 20) and `volume_mult` (1.5 → 1.75).
-
-**Entry:** Multi-window ensemble. The strategy evaluates each `entry_periods` window (default `[20, 55]`) longest-first and emits ONE signal at the longest qualifying window. The 20-day window is Turtle "System 1" (sensitive); the 55-day window is "System 2" (more confirmed) and serves as the failsafe whenever the 1L filter blocks a 20-day signal. Enter long at tomorrow's open at today's close.
-
-**Setup filters (all must pass):**
-- **ADX(14) ≥ 20** at entry (no trend → no breakout). v1.2 raised from 18.
-- **Volume confirmation**: today's volume ≥ `volume_mult` × trailing 20-day mean volume (default `1.75×` in v1.2; was 1.5× in v1.1). Genuine institutional accumulation produces volume; thin-tape false breakouts don't.
-- **Volatility expansion** (Larry Williams): today's true range ≥ ATR(14). Filters out wick-touch breakouts that closed at the high but had no real intraday range.
-- **Relative strength**: stock's trailing 60-day return > SPY's trailing 60-day return. Adds cross-sectional momentum on top of the absolute breakout signal.
-- **(v1.2) Base consolidation width**: the 20 bars BEFORE the breakout, measured as `(max high − min low) / midpoint`, must be ≤ 15%. Defines a tight pre-breakout base; wider "bases" are usually just chop. The single biggest reason v1.2 generates fewer signals than v1.1.
-- **(v1.2) Volatility contraction**: ATR(20) excluding today / ATR(63) ≤ 0.92. Captures the Bollinger Squeeze pattern — vol must have compressed before the move.
-- **(v1.2) Already-soared cap**: today's close ≤ 1.15 × SMA(50). Skips climax-run stocks with poor risk:reward.
-- **(v1.2) Pre-breakout RSI cap**: yesterday's RSI(14) < 65. Filters stocks that were already overbought going into the move (today's breakout bar naturally pops RSI to 70+; that's expected and not what we filter on).
-- Skip if avg dollar volume (20d) < $100M (portfolio-level filter).
-- Skip if name reports earnings within 5 trading days (portfolio-level filter; avoids gap risk).
-- Skip if intended position size > 5% of 20d ADV (portfolio-level filter).
-
-**Turtle 1L filter (System 1 only):** When the qualifying window is the 20-day one, the strategy walks back through the bar history to the most recent prior 20-day breakout for the same symbol and simulates its outcome under the same exit rules (10-day low confirming exit OR 2× ATR(20) stop, whichever fires first, capped at 60 trading days). If that prior signal would have been a winner, **today's 20-day breakout is rejected** with reason `turtle_1l_skip_after_winner` — visible in the dashboard's "Rejected signals" card. The 55-day window is always taken regardless of recent history (Turtle System 2 acts as the failsafe). Rationale per Faith's *Way of the Turtle*: big sustained trends usually start AFTER a cluster of small false breakouts.
-
-**Initial stop:** `entry_price − 2 × ATR(20)`.
-
-**Trailing exit:** Chandelier stop — `max(close, last 22d high) − 3 × ATR(22)`. Updated daily.
-
-**Exit confirmation:** Close < 10-day low triggers exit at next open (Turtle "S1" exit rule).
-
-**Position sizing:** 0.75% equity risked (wider stops mean more positions; lower risk-per-trade keeps total portfolio risk reasonable). Modulated by the regime composite multiplier (`affinity × (0.5 + 0.5 × composite_score) × stress_mult`) per §4.7.
-
-**Backward compatibility:** All v1.1 and v1.2 filters are individually toggleable. To recover v1.1 behavior set `require_base_consolidation=False, require_vol_contraction=False, max_pct_above_sma50=0.0, max_rsi_pre_breakout=100.0, adx_min=18.0, volume_mult=1.5`. To recover v1.0 behavior additionally disable the v1.1 filters (`volume_mult=1.0, require_vol_expansion=False, enable_turtle_1l=False, enable_relative_strength=False, entry_periods=[20]`). Backtests can ablate any subset to A/B their contributions.
-
-**Persisted intermediate values** (visible on signal-detail page via the metadata humanizer): `breakout_window` (20 or 55), `prior_max_close`, `atr`, `adx`, `volume_mult_actual`, `vol_expansion_ratio`, `rs_60d_diff`, `prior_signal_outcome` (winner/loser/none for the 1L filter), and v1.2's `base_range_pct`, `vol_contraction_ratio_actual`, `pct_above_sma50`, `rsi_pre_breakout`.
-
-**Expected behavior:** v1.2 generates roughly 60–80% fewer signals than v1.1 (which itself was ~50–70% tighter than v1.0). On a typical day in a healthy market: 0–3 candidates; in choppy markets: 0. Each surviving signal is an explicit base-breakout — the setup with the strongest historical edge in the equity trend-following literature. Long holds (avg weeks–months) when the trend is real. Edge still comes from letting winners run via the trailing chandelier stop.
-
-### 6.3 Counter-Trend: Largecap Rebound
-
-**Setup filter (all required):**
-- Symbol's market cap is at or above the 80th percentile of S&P 500 (top quintile by market cap).
-- `Close < SMA(200)` — stock is in a long-term downtrend.
-
-**Entry triggers (all required):**
-- `RSI(14) ≥ rsi_threshold` (default 45) AND `RSI(14) > yesterday's RSI(14)` — momentum is bullish AND rising.
-- MACD(12, 26, 9) `histogram > 0` AND `histogram > yesterday's histogram` — bullish AND accelerating.
-- Buy at next-day open.
-
-**Exits** (whichever first):
-- `Close ≥ SMA(50)` — counter-trend rally hits trend resistance, take profit.
-- `Close ≤ entry − 2.5 × ATR(14)` — hard stop.
-- Time stop at 10 trading days.
-
-**Position sizing:** 1% equity risked from entry to hard stop.
-
-**Filters:** earnings within 5 trading days (consistent with the other strategies); ADV liquidity floor still applies through the shared filter chain.
-
-**Tags:** `("mean_reversion", "long_only", "swing")`.
-
-**Expected behavior:** few trades, quality bias. Most setups will be filtered out by the SMA(200) + market-cap + bullish-momentum combination — by design. When it does fire, the trade is buying *quality* on weakness, not chasing momentum.
-
-**Source:** synthesis of common counter-trend / O'Neil-style "buy quality on weakness" + standard RSI/MACD bullish-confirmation gating.
-
-### 6.4 Why these three together
-
-The three strategies have **different regime dependencies** — running all three diversifies the strategy stack so any single market regime doesn't kill total P&L:
-
-- **RSI(2)** profits in choppy uptrending markets (mean reversion within an uptrend).
-- **Donchian** profits in sustained trending markets (regardless of direction; we're long-only here, so up-trends).
-- **Largecap Rebound** profits when sold-off quality names recover (counter-trend in long-term downtrends).
-
-When markets chop sideways, RSI(2) carries the load. When they trend, Donchian does. When a sector or quality bracket sells off and starts to recover, Largecap Rebound fires. The three rarely all profit at the same time, but they also rarely all lose at the same time.
-
----
+They want opposite markets. RSI(2) earns in choppy uptrends and its profits rise with volatility; momentum earns in sustained trends and crashes in high-vol rebounds. The regime layer encodes that sign difference (vol scalar applies to momentum only) while the shared trend gate keeps both out of new entries when the index is below its 200-day. Neither strategy uses a discretionary indicator beyond moving averages, RSI, realized vol and a regression slope; the retired alternatives failed data-snooping-corrected tests on modern US data (see `market_regime_detection.md` and the 2026-09 canon review).
 
 ## 7. Brokerage Integration: E*TRADE
 
@@ -767,7 +572,7 @@ E*TRADE issues a daily OAuth token that expires at midnight ET and must be re-au
 - Bars live as a **TimescaleDB hypertable** in the same database — no separate Parquet store. Compression policy reduces older chunks to ~10% of original size while keeping them queryable.
 - Continuous aggregates pre-compute weekly and monthly OHLCV rollups from daily bars; the scanner uses these for higher-timeframe filters (e.g., weekly trend) without recomputing each scan.
 - Schema migrations managed via a **custom SQL runner** in `stockscan.db_migrate` (Alembic was removed; runner reads `migrations/NNNN_*.sql` files, splits on top-level semicolons, and runs each statement under AUTOCOMMIT — required because TimescaleDB continuous aggregates can't be created inside a transaction). Tracking lives in `_migrations` (version, name, applied_at, checksum).
-- **5 migrations shipped:** 0001 initial (everything in this snapshot), 0002 backtest tables, 0003 watchlist (`watchlist_items`), 0004 technical_scores (`technical_scores`), 0005 fundamentals (`fundamentals_snapshot`). The DDL below shows the schema as of 0001; later migrations are described in their respective module sections (§4.13–§4.15).
+- **26 migrations shipped** (`ls migrations/` is the full story; `make db-status` shows what is applied). The DDL below shows the schema as of 0001. Later tables are described in their module sections: `watchlist_items` (§4.13), `fundamentals_snapshot` / `fundamentals_history` (§4.15), `macro_series` and `market_regime` (§4.14, v3 columns in `0025_regime_v3.sql`), `paper_trades` (stop optional since 0026), sector composites, news, options proposals and hedge tables.
 
 ```sql
 -- ============================================================
@@ -887,30 +692,11 @@ CREATE TABLE strategy_versions (
     display_name       TEXT NOT NULL,
     description        TEXT,
     tags               TEXT[] NOT NULL DEFAULT '{}',
-    params_json_schema JSONB NOT NULL,        -- from Pydantic .model_json_schema()
+    params_json_schema JSONB NOT NULL,        -- Strategy.knobs() snapshot at first sighting
     code_fingerprint   TEXT NOT NULL,         -- SHA-256 of the strategy module file
     first_seen_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     PRIMARY KEY (strategy_name, strategy_version)
 );
-
--- Active configuration per strategy. Editing params writes a new row.
--- The "active" config is the most recent (active=true) row per strategy_name.
-CREATE TABLE strategy_configs (
-    config_id          BIGSERIAL PRIMARY KEY,
-    strategy_name      TEXT NOT NULL,
-    strategy_version   TEXT NOT NULL,
-    params_json        JSONB NOT NULL,        -- validated against params_json_schema
-    params_hash        TEXT NOT NULL,         -- SHA-256 of canonical params_json
-    risk_pct_override  NUMERIC(5,4),          -- overrides default_risk_pct if set
-    active             BOOLEAN NOT NULL DEFAULT TRUE,
-    created_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    created_by         TEXT,                   -- 'system' or username (future)
-    note               TEXT,                   -- "tightened RSI threshold", etc.
-    FOREIGN KEY (strategy_name, strategy_version)
-        REFERENCES strategy_versions(strategy_name, strategy_version)
-);
-CREATE UNIQUE INDEX idx_active_config_per_strategy
-    ON strategy_configs (strategy_name) WHERE active = TRUE;
 
 -- ============================================================
 -- Strategy runs and signals
@@ -919,7 +705,6 @@ CREATE TABLE strategy_runs (
     run_id            BIGSERIAL PRIMARY KEY,
     strategy_name     TEXT NOT NULL,
     strategy_version  TEXT NOT NULL,
-    config_id         BIGINT NOT NULL REFERENCES strategy_configs(config_id),
     run_at            TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     as_of_date        DATE NOT NULL,
     universe_size     INTEGER NOT NULL,
@@ -934,7 +719,6 @@ CREATE TABLE signals (
     run_id           BIGINT REFERENCES strategy_runs(run_id),
     strategy_name    TEXT NOT NULL,           -- denormalized for fast filtering
     strategy_version TEXT NOT NULL,           -- pinned at signal time; immutable
-    config_id        BIGINT NOT NULL REFERENCES strategy_configs(config_id),
     symbol           TEXT NOT NULL,
     side             TEXT NOT NULL CHECK (side IN ('long','short')),
     score            NUMERIC(10,6),
@@ -1098,54 +882,26 @@ A Mac mini with even a 256 GB SSD comfortably holds decades of full-universe int
 
 ```
 Python 3.12+
-├── Web:         fastapi, uvicorn, jinja2, htmx
-├── Data:        pandas, numpy, pyarrow (export only), httpx
-├── Storage:     psycopg[binary,pool] 3.x, sqlalchemy 2.x, alembic (migrations)
+├── Web:         fastapi, uvicorn, jinja2, htmx (vendored), Tailwind (built, self-hosted)
+├── Data:        pandas, numpy, httpx, tenacity
+├── Storage:     psycopg 3.x, sqlalchemy 2.x, raw-SQL migrations (stockscan.db_migrate)
 ├── DB engine:   PostgreSQL 16 + TimescaleDB 2.x (community edition, Docker)
-├── Charts (BE): matplotlib (for backtest report PDFs)
 ├── Charts (FE): lightweight-charts (TradingView, MIT)
-├── Broker:      pyetrade
-├── Indicators:  pandas-ta
-├── Notify:      smtplib (stdlib) or postmarker, discord-webhook
-├── Scheduler:   launchd plists (Mac mini target)
-├── Config:      pydantic-settings, YAML
-├── Testing:     pytest, pytest-cov, hypothesis, testcontainers (Postgres in CI)
-└── Tooling:     ruff, mypy, pre-commit
+├── Indicators:  hand-rolled in stockscan.indicators (no third-party TA library)
+├── Broker:      pyetrade ([broker] extra, Phase 4)
+├── Notify:      smtplib / Postmark, Discord webhook
+├── Scheduler:   supercronic (Compose) or launchd (Mac mini)
+├── Config:      pydantic-settings (.env)
+├── MCP:         fastmcp ([mcp] extra; stockscan mcp serve)
+├── Testing:     pytest, hypothesis; "integration" marker for tests that need Postgres
+└── Tooling:     ruff, mypy, uv
 ```
 
-**Repo layout:**
-```
-stock-scan/
-├── pyproject.toml
-├── DESIGN.md
-├── stockscan/
-│   ├── __init__.py
-│   ├── cli.py                  # entry point: `stockscan ...`
-│   ├── config.py
-│   ├── data/
-│   ├── universe/
-│   ├── strategies/
-│   ├── scan.py
-│   ├── backtest/
-│   ├── positions/
-│   ├── broker/
-│   ├── risk.py
-│   ├── notify/
-│   ├── scheduler/
-│   └── web/
-├── tests/
-├── infra/
-│   ├── docker-compose.yml      # TimescaleDB service + persistent volume
-│   └── launchd/                # plist templates for Mac mini deployment
-├── alembic/                    # database migrations
-└── data/                       # gitignored; Postgres volume + optional Parquet exports
-```
-
----
+**Repo layout:** see the annotated tree in `README.md` § Project layout.
 
 ## 10. Deployment (Home Server)
 
-- **Target: Apple Silicon Mac mini.** Low power, silent, native launchd, all dependencies have arm64 wheels (verified for `pandas-ta`, `pyarrow`, `pyetrade`, `psycopg`).
+- **Target: Apple Silicon Mac mini.** Low power, silent, native launchd, all dependencies have arm64 wheels.
 
 ### 10.1 Database (Docker Compose)
 
@@ -1176,7 +932,7 @@ secrets:
 
 - Connection string: `postgresql+psycopg://stockscan@127.0.0.1:5432/stockscan` (password from secret).
 - Tunables to set in `postgresql.conf`: `shared_buffers=2GB`, `work_mem=64MB`, `maintenance_work_mem=512MB`, `effective_cache_size=8GB`, plus TimescaleDB's `timescaledb.max_background_workers=8`.
-- One-shot setup script `infra/setup_db.sh` runs `CREATE EXTENSION timescaledb`, then `alembic upgrade head` to apply schema.
+- One-shot setup script `infra/setup_db.sh` runs `CREATE EXTENSION timescaledb`; `stockscan db migrate` applies the schema.
 
 ### 10.2 Application
 
@@ -1211,30 +967,23 @@ A nightly `stockscan export bars` job dumps `bars` to partitioned Parquet under 
 
 | Phase | Status | Scope |
 |---|---|---|
-| **0 — Foundations** | ✅ Done | Repo, Docker Compose for TimescaleDB, **custom SQL migration runner** (replaced Alembic), EODHD client + idempotent bar ingest, historical bulk-backfill job, S&P 500 universe (live + historical), FastAPI skeleton, CLI scaffolding, `SuggestionBroker` + `PaperBroker`. |
-| **1 — Strategies + Backtester** | ✅ Done | Strategy plugin system (ABC, auto-discovery, registry, params Pydantic models, contract tests), RSI(2), Donchian, indicator helpers (RSI, ATR, ADX, SMA/EMA, Donchian channel, Bollinger, **MACD**, ADV), event-driven backtester, metrics module, CLI runners. |
-| **2 — Web UI** | ✅ Done | Dashboard, Signals page (with rejected-signal display), Trades page (lots + journal), Backtests page, Base-rate analyzer page, Trade notes with templated entry/exit prompts and FTS, Strategies page, mobile-first responsive layouts. |
-| **3 — Live Scanner + Notifications** | ✅ Done | Bulk EOD endpoint, launchd plists for nightly-scan / web KeepAlive / db-backup, nightly job orchestration, email (SMTP/Postmark) + Discord webhook channels, channel router. |
-| **Watchlist** | ✅ Done | `watchlist_items` (migration 0003), price-target alerts with auto-disable on fire, "+ Watch" HTMX in-place quick-adds, integrated into nightly job. |
-| **Technical Confirmation Score** | ✅ Done | Plugin system mirroring strategies, RSI(14) + MACD(12,26,9) with tag-aware scoring, `technical_scores` table (migration 0004), persisted by ScanRunner, displayed on Signals + Watchlist, `stockscan technical backfill/recompute`. |
-| **Fundamentals Layer** | ✅ Done | `fundamentals_snapshot` (migration 0005), 38 typed columns + raw JSONB, `market_cap_percentile` helper, `stockscan refresh fundamentals`. |
-| **Largecap Rebound strategy** | ✅ Done | Counter-trend long entries on top-quintile-by-market-cap names below SMA(200) confirmed by RSI + MACD turning bullish (§6.3). |
-| **Market Regime v2 (composite)** | ✅ Done | Continuous vol/trend/breadth/credit composite (40/25/20/15) with HY OAS credit-stress flag. `regime_affinity` mapping on Strategy + soft per-strategy sizing multiplier replaces v1 hard regime gates. FRED provider, `macro_series` table (migration 0010), regime intermediate signals (migration 0011). Dashboard shows full component breakdown with per-component dropdown explanations. |
-| **News integration** | ✅ Done | `news_articles` + symbols/tags/feed_config/alerts (migration 0009), EODHD `/news` for general feed + watchlist, sentiment-aware ranking, sentiment-threshold alerts. Dashboard news card with **on-demand article reader** (each row expands → re-fetches body from provider, never persisted; no content-rights concerns). CLI `refresh news`. |
-| **52-Week-High Momentum strategy** | ✅ Done | George-Hwang style. Score = close / 252-day max, gated to within 5% of 52w high. Clenow regression-slope tiebreak. Time-based 60-day exit matching the original study. Regime affinity favors trending markets, cuts hard in chop. |
-| **Donchian v1.1** | ✅ Done | Multi-window ensemble (entry_periods=[20, 55] — Turtle System 1 + 2 in parallel). Volume confirmation (>=1.5×). Volatility-expansion gate (TR ≥ ATR(14)). Turtle 1L skip-after-winner filter on the 20-day window (tracked as `turtle_1l_skip_after_winner` rejected signal in the runner). Relative-strength filter vs SPY (60d). Each filter individually toggleable for backtest A/B. |
-| **Donchian v1.2** | ✅ Done | Base-breakout narrowing per Minervini/O'Neil/Weinstein/Bollinger lit. Four new filters: base consolidation width (20-bar pre-breakout range ≤ 15% of midpoint), volatility contraction (ATR(20)/ATR(63) ≤ 0.92, Bollinger Squeeze framing), already-soared cap (close ≤ 1.15 × SMA(50)), pre-breakout RSI cap (yesterday's RSI(14) < 65). Plus tightened defaults (`adx_min` 18 → 20, `volume_mult` 1.5 → 1.75). Each new filter individually toggleable. Diagnostics persisted in signal metadata for explainability. |
-| **Meta-labeling layer** | ✅ Done | Optional `[ml]` extra (xgboost + scikit-learn). Per-strategy XGBoost binary classifier trained on triple-barrier labels (Lopez de Prado). 17 engineered features (returns/vol/setup-quality/regime). On-disk pickle store under `./models/<strategy>/`. CLI `ml train` / `ml status`. `signals backfill` populates training data; chronological train/holdout split. **Score-only integration**: scan runner's meta-score pass attaches `meta_label_proba` to `signal.metadata`; never blocks trades. Strategy detail page shows model-status panel; strategy list shows per-card chip. |
-| **Signal-detail full attribution** | ✅ Done | Outcome (entry/stop/qty/risk/notional), Score derivation (humanized strategy metadata with one-line tooltips per indicator), Position sizing math (`base × affinity × composite_mult × stress_mult`), Market regime context (every component + percentile rank + intermediate signal), Technical confirmation breakdown, Meta-label probability with interpretation guide, Strategy params used at scan time, raw JSONB fallback. Curated humanizer dict (`web/deps.py:_METADATA_LABELS`) — adding a new strategy means appending entries there. |
-| **Signals freshness + Fetch Latest** | ✅ Done | `signals_freshness()` helper queries MAX(strategy_runs.run_at), MAX(bars.bar_ts), today's signal count. Header strip on `/signals` shows "Last scan: Xh ago" + "Bars current through: YYYY-MM-DD [fresh/Nd behind]" badge. POST `/signals/refresh` button: `refresh_signals()` orchestrator runs 7-day bulk-EOD bars catch-up (`/eod-bulk-last-day` — one API call per day, not per symbol) + re-runs every registered strategy via HTMX swap. |
+| **0 — Foundations** | ✅ Done | Repo, Docker Compose for TimescaleDB, custom SQL migration runner, EODHD client + idempotent bar ingest, historical bulk backfill, S&P 500 universe (live + historical, Wikipedia fallback), FastAPI skeleton, CLI, `SuggestionBroker` + `PaperBroker`. |
+| **1 — Strategies + Backtester** | ✅ Done | Strategy plugin system (ABC, auto-discovery, registry, class-constant knobs, contract tests), indicator primitives, RSI(2) pullback, 52-week-high momentum, event-driven backtester sharing sizing and regime code with the runner, metrics, CLI (`run` / `list` / `debug` / `export` / `profile`). |
+| **2 — Web UI** | ✅ Done | Dashboard, Signals (passing + rejected, Fetch Latest), Signal detail attribution, Trades (lots + journal), Backtests, Base-rate analyzer, Strategies (manual + knobs), Analysis, mobile-first responsive layouts, docs hub. |
+| **3 — Live Scanner + Notifications** | ✅ Done | Bulk EOD endpoint, nightly job (bars → macro → regime → composites → scans → alerts → summary), supercronic + launchd, email + Discord, DEGRADED summaries. |
+| **Watchlist** | ✅ Done | `watchlist_items`, price-target alerts with auto-disable, "+ Watch" quick-adds, sector-composite chart. |
+| **Fundamentals** | ✅ Done | `fundamentals_snapshot` (38 typed columns + raw JSONB), `fundamentals_history` (point-in-time shares), weekly refresh cron. |
+| **Sector composites** | ✅ Done | Equal-weight sector indices rebuilt nightly; `sector_return` / `sector_relative_return` primitives; both strategies rank against them. |
+| **Market regime** | ✅ Done | Trend gate with dwell, realized-vol scalar with per-strategy opt-in, HY OAS credit-stress breaker; `regime_frame` shared by runner and engine; migration 0025. |
+| **News** | ✅ Done | EODHD `/news` for general feed + watchlist, on-demand article reader, CLI `refresh news`. |
+| **Options + hedging** | ✅ Done | Weekly short-premium proposals, delta-hedge daemon + playground, MCP tools. |
+| **Strategy canon review (2026-09)** | ✅ Done | Book reduced to `rsi2_meanrev` + `momentum_52w_high` (both v2.0.0); knobs as class constants; strategy-owned exits with no engine stop; shared `size_for_strategy`; sector/ADV caps binding in backtests; regime v3. |
+| **Settling backtests** | Pending | Ablations listed in `TODO.md` — point-in-time S&P 500, 5 bp, 2010–2026, walk-forward. |
 | **4 — E*TRADE Integration** | Pending | OAuth handshake UI, `ETradeBroker` against sandbox, integration tests, paper-money rehearsal. |
-| **5 — Hardening** | Pending | Reconciliation loop, drift alerts, error handling, performance reporting, weekly journal export, true historical fundamentals (point-in-time per quarter). |
-| **Strategy optimizer** | Deferred | See `TODO.md §High-impact`. Bayesian search (Optuna) + walk-forward + held-out validation + deflated Sharpe (Lopez de Prado 2014) + per-trial persistence. The single most landmine-laden feature in retail quant; documented anti-overfitting hygiene baked into the report. |
-| **Vol-targeting overlay** | Deferred | See `TODO.md §Medium-impact`. Moreira-Muir (JF 2017) — scale every strategy's position size inversely to its own recent realized vol. Two open design questions: composition with the regime composite multiplier (likely take MIN, not product); per-strategy vs portfolio-level targeting. |
+| **5 — Hardening** | Pending | Reconciliation loop, drift alerts, error handling, performance reporting, weekly journal export. |
+| **Strategy optimizer** | Deferred | See `TODO.md §High-impact`. Bayesian search + walk-forward + held-out validation + deflated Sharpe + per-trial persistence. |
 
-**Critical milestone reached:** at end of "Phase 3 + Watchlist + Tech Score + Fundamentals + Largecap Rebound + Regime v2 + News + Meta-labeling + 52w-high + Donchian v1.1 + Signal-detail attribution", you can run the scanner nightly, get an email/Discord summary of ranked ideas augmented with technical confirmation scores AND meta-label probabilities, alert on price targets for watched names, expand any signal to see its full attribution chain, and execute manually. That's a usable product end-to-end. E*TRADE auto-execution is the next enhancement.
-
----
+**Where the product stands:** the scanner runs nightly, the regime layer gates and sizes the two strategies, the summary reaches email/Discord, any signal expands to its full attribution chain, and execution is manual. E*TRADE auto-execution is the next enhancement; the settling backtests are the next research task.
 
 ## 12. Risks & Mitigations
 
@@ -1264,15 +1013,15 @@ A nightly `stockscan export bars` job dumps `bars` to partitioned Parquet under 
 | Tax-lot accounting | Specific-lot tracking; user picks at exit time, FIFO suggested |
 | Multiple accounts | Single account v1; `account_id` plumbed through schema for future expansion |
 | Notifications | Email (Postmark) + Discord webhook |
-| Starting capital | $1,000,000, integer shares only |
-| Indicator library | `pandas-ta` |
+| Starting capital | `STOCKSCAN_STARTING_EQUITY` (default $100,000) until the broker sync exists; integer shares only |
+| Indicator library | Hand-rolled primitives in `stockscan.indicators` (sma, ema, rsi, atr, true_range, ADV, Yang-Zhang vol, sector returns) — nothing else |
 | Server hardware | Apple Silicon Mac mini, launchd |
 
 ### Defaults I'm choosing unless you object
 
 | Question | Default | Rationale |
 |---|---|---|
-| Initial backtest window | 2010-01-01 → 2026-04-01 (16 years) | Covers 2010s bull, 2020 COVID crash, 2022 bear, 2023–25 recovery, 2026 partial. Reserve last 2 years (2024–2026) as out-of-sample for walk-forward |
+| Backtest window | 2010-01-01 → today (default `--from` is 5 years before `--to`) | Covers 2010s bull, 2020 COVID crash, 2022 bear, 2023–25 recovery. Walk-forward with the last 2 years held out for the settling backtests |
 | Suggestion-mode outputs | UI panel + email digest + CSV export per scan | CSV makes it trivial to journal in Excel or pipe to a Google Sheet later |
 | Source code hosting | GitHub private repo | CI via GitHub Actions; secret management via repo-level encrypted secrets |
 | Backtest commission model | $0 (matches E*TRADE for US equities) | Configurable for sensitivity testing |
@@ -1280,18 +1029,20 @@ A nightly `stockscan export bars` job dumps `bars` to partitioned Parquet under 
 | First strategy to ship | RSI(2) mean-reversion | Faster signal-to-validation loop than TF (more trades per backtest year) |
 | **Strategy hot reload** | **No — restart required to pick up new/edited strategies** | Simpler, safer (no stale-state bugs from `importlib.reload`). Mac mini restart of the FastAPI process is <5 seconds. Reconsider in v1.5 if iteration friction becomes painful. |
 | **Strategy web upload** | **No — files on disk only, edited via your editor of choice** | Web upload would mean executing arbitrary user-uploaded Python on the server. Even single-user, that's an unnecessary attack surface (session hijack → RCE). Strategy code is committed to the repo and deployed via the normal app deploy. |
-| **Parameter sweeps** | **Engine supports them in v1; UI ships in v1.5** | Backtester accepts a parameter grid and runs the cartesian product in parallel. CLI-only access in v1 (`stockscan backtest run rsi2_meanrev --sweep params/sweep.yaml`); web UI for sweep config + heatmap output deferred to v1.5. |
+| **Strategy knobs** | **Class constants; edit and bump the version** | No parameter object, no DB row, no sweep engine. An ablation is a knob edit plus a backtest run; the run record stores `knobs_hash()` so results stay attributable. |
 | **Strategy tags** | `('mean_reversion', 'trend_following', 'breakout', 'momentum', 'long_only', 'short_only', 'pairs')` as the initial vocabulary | Free-form strings are allowed; UI surfaces tags as filter chips on the Strategies page and in scan grouping. |
-
-If any of those defaults look wrong, flag them — otherwise I'll bake them into Phase 0.
 
 ---
 
 ## 14. Appendix: References
 
 - Larry Connors & Cesar Alvarez, *Short Term Trading Strategies That Work* (2008) — RSI(2) origin.
-- Curtis Faith, *Way of the Turtle* (2007) — Donchian breakout / Turtle rules.
+- George & Hwang (2004), "The 52-Week High and Momentum Investing", *Journal of Finance*.
+- Andreas Clenow, *Stocks on the Move* (2015) — regression-slope ranking, SMA(100) exit.
+- Daniel & Moskowitz (2016), "Momentum Crashes"; Barroso & Santa-Clara (2015), "Momentum Has Its Moments".
+- Kaminski & Lo (2014), "When Do Stop-Loss Rules Stop Losses?"
 - Marcos López de Prado, *Advances in Financial Machine Learning* (2018) — bias avoidance, walk-forward design.
+- Regime-layer evidence (Faber 2007; Moreira & Muir 2017; Harvey et al. 2018; Nagel 2012; Gilchrist & Zakrajšek 2012; …): `market_regime_detection.md`.
 - [EODHD documentation](https://eodhd.com/financial-apis/)
 - [E*TRADE Developer](https://developer.etrade.com/home)
 - [pyetrade](https://github.com/jessecooper/pyetrade)

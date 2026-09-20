@@ -18,11 +18,7 @@ from stockscan.strategies._signals import (
     RawSignal,
     Side,
 )
-from stockscan.strategies.base import (
-    STRATEGY_REGISTRY,
-    Strategy,
-    StrategyParams,
-)
+from stockscan.strategies.base import STRATEGY_REGISTRY, Strategy
 from stockscan.strategies.versions import current_version_filter
 
 log = logging.getLogger(__name__)
@@ -34,7 +30,6 @@ __all__ = [
     "RawSignal",
     "Side",
     "Strategy",
-    "StrategyParams",
     "current_version_filter",
     "discover_strategies",
 ]

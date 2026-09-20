@@ -8,24 +8,26 @@ Personal swing-trading scanner, backtester, and position manager.
 
 **Phases 0–3 complete plus a substantial set of feature additions.** What works today:
 
-- **Data layer**: TimescaleDB hypertable for bars, idempotent ingest, EODHD client (per-symbol + bulk EOD + news endpoints), FRED client for macro series, historical S&P 500 universe with survivorship-bias correction
-- **Strategy plugin system**: drop a Python file in `strategies/`, restart, it's live
-- **Four reference strategies**: RSI(2) Mean-Reversion, Donchian Trend (v1.1: multi-window + volume + vol-expansion + Turtle 1L + RS filter), Largecap Rebound (counter-trend with fundamentals filter), 52-Week-High Momentum (George-Hwang)
-- **Market regime classifier (v2 composite)**: continuous vol/trend/breadth/credit composite weighted 40/25/20/15, HY OAS credit-stress circuit breaker, soft per-strategy sizing multiplier (replaces v1 hard regime gates)
-- **Event-driven backtester** sharing strategy code with the live engine; metrics module
-- **Meta-labeling layer (optional `[ml]` extra)**: XGBoost binary classifier per strategy, triple-barrier labels, scoring runs at scan time as advisory metadata (`meta_label_proba`); `stockscan ml train` / `stockscan ml status` CLI; per-strategy model status visible in the web UI
-- **Web UI** (mobile-first responsive): Dashboard with regime breakdown + news card + strategy banner, Signals (with Fetch Latest + freshness chip), Signal detail (full attribution: outcome, score derivation, sizing breakdown, regime context, technical confirmation, meta-label probability, params used, raw metadata), Watchlist, Trades, Backtests, Base-Rate Analyzer, Strategies (with model-status panel)
+- **Data layer**: TimescaleDB hypertable for bars, idempotent ingest, EODHD client (per-symbol + bulk EOD + news endpoints), FRED client for macro series (HY OAS, Treasury yields), historical S&P 500 universe with survivorship-bias correction (Wikipedia fallback on prices-only plans)
+- **Strategy plugin system**: drop a Python file in `strategies/`, restart, it's live. Every knob is a class constant on the strategy (`Strategy.knobs()` lists them); edit the file and bump the version to change one
+- **Two strategies, one book**: `rsi2_meanrev` (RSI(2) pullback in an uptrend, sector-relative ranking, quiet-volume filter, no price stop, fixed 10% of equity per position) and `momentum_52w_high` (Stage-2 eligibility, 52-week-high closeness + Clenow slope quality + sector-residual tilt, weekly review, 15% stop / SMA(100) break / 85%-of-high exits, 0.75% risk, max 10 positions)
+- **Market regime layer**: SPY 200-day trend gate with a 3-close dwell (blocks new entries only), realized-vol position scalar (top tercile of the trailing year, per-strategy opt-in), HY OAS credit-stress breaker. Labels `risk_on` / `risk_off` / `credit_stress`. The backtest engine applies the same rules from the same `regime_frame`
+- **Sizing**: `size_for_strategy` shared by the live runner and the backtest engine — risk % against the strategy's stop, or a fixed fraction for stop-less strategies, times the vol scalar where the strategy opts in. Sector cap, ADV cap and per-strategy position cap all bind in both paths
+- **Event-driven backtester** sharing strategy, sizing and regime code with the live engine; metrics module; `backtest debug` replays `signals()` day by day for one symbol
+- **Web UI** (mobile-first responsive): top nav is Dashboard, Signals, Watchlist, Options, Hedge, Trades, Backtests, with Strategies and Docs in the footer. Dashboard with regime card (trend gate / vol scalar / credit stress + per-strategy sizing lines), latest-scan passing signals + news card, Signals (with Fetch Latest + freshness chip), Signal detail (full attribution: outcome, score derivation, sizing breakdown, regime context, strategy version), Watchlist, Trades, Backtests, Base-Rate Analyzer, Strategies (sizing rule + tuning knobs per strategy), per-symbol Analysis (trend, volatility, earnings, insider activity, options context — reached from any symbol link or the Watchlist's Analyse button)
 - **In-app news reader**: Dashboard news card with per-article expand-on-click, on-demand re-fetch from EODHD (not persisted, no content-rights concerns)
 - **Watchlist** with per-symbol price-target alerts (above/below), auto-disable after firing, "+ Watch" quick-add from Dashboard
-- **Strategy-owned signal scores**: each strategy computes its own composite score with a per-input breakdown persisted in `signals.metadata` (the separate cross-strategy "technical score" layer was retired — see `refactor_plan.md`); the Watchlist's Tech column shows the reversal composite, memoized per (symbol, bars, day)
-- **Fundamentals layer**: 38 typed columns + JSONB raw payload from EODHD, market-cap percentile helper
+- **Strategy-owned signal scores**: each strategy computes its own ranking score and persists the inputs behind it in `signals.metadata`; the signal-detail page renders them with trader-language labels
+- **Fundamentals layer**: 38 typed columns + JSONB raw payload from EODHD, point-in-time shares history for the sector composites, market-cap percentile helper
+- **Sector composites**: equal-weight sector indices rebuilt nightly from bars; both strategies rank against them
 - **Notifications**: email (SMTP / Postmark) + Discord webhook, fired by the nightly job; step failures are carried into the summary (subject gains a DEGRADED tag)
 - **Scheduler**: Docker Compose `scheduler` service (supercronic + `infra/crontab`) on any host, or launchd plist templates on macOS — nightly-scan, daily DB backup, weekly fundamentals refresh
 - **Deployment**: full Docker Compose stack (db + migrate + web + scheduler) — see [DEPLOY.md](./DEPLOY.md); self-hosted UI assets (no CDN dependency)
 - **Logging**: central setup with per-component rotating files under `logs/` (web / cli / nightly), request-timing middleware with slow-request warnings
-- **Migration runner**: 21 SQL migrations, custom runner (replaces Alembic, AUTOCOMMIT-aware)
+- **Migration runner**: 26 SQL migrations, custom runner (replaces Alembic, AUTOCOMMIT-aware)
+- **MCP server** (`stockscan mcp serve`): signals, watchlist, regime, backtests and options tools for AI agents — see [MCP_SERVER.md](./MCP_SERVER.md)
 
-Pending: **Phase 4** (E*TRADE OAuth + broker integration), **Phase 5** (reconciliation drift detection, journaling polish), and the **strategy-optimizer / vol-targeting overlay** items in `TODO.md`.
+Pending: **Phase 4** (E*TRADE OAuth + broker integration), **Phase 5** (reconciliation drift detection, journaling polish), the **settling backtests** and the **strategy-optimizer** item in `TODO.md`.
 
 ---
 
@@ -71,6 +73,18 @@ Then open `.env` and set two things:
 - `EODHD_API_KEY` — your key from eodhd.com.
 - `EODHD_FEATURES` — only if you're **not** on the All-In-One plan. `eod,bulk` for the prices-only plan; see [Data plans](#data-plans-eodhd_features) below.
 
+Optional settings worth knowing (all have defaults in `config.py`):
+
+| Variable | Default | What it does |
+|---|---|---|
+| `FRED_API_KEY` | empty | Enables the FRED macro refresh (HY OAS for the credit-stress breaker, Treasury yields for the options analysis). Without it the credit-stress flag stays off. |
+| `STOCKSCAN_STARTING_EQUITY` | `100000` | Equity the live scanner sizes against until the first `equity_history` row exists (fresh install, paper trading without a broker sync). |
+| `STOCKSCAN_MAX_POSITIONS` | `15` | Portfolio-wide open-position cap (each strategy may also set its own `max_open_positions`). |
+| `STOCKSCAN_MAX_POSITION_PCT` / `STOCKSCAN_MAX_SECTOR_PCT` / `STOCKSCAN_MAX_ADV_PCT` | `0.08` / `0.25` / `0.05` | Notional caps per position, per sector, and versus 20-day dollar volume. |
+| `STOCKSCAN_DRAWDOWN_CIRCUIT_BREAKER` | `0.15` | No new entries once equity is this far below its high-water mark. |
+
+Risk per trade is **not** an environment variable — it lives on each strategy (`default_risk_pct` or `position_pct`).
+
 **4. Install Python dependencies**
 
 ```bash
@@ -89,8 +103,8 @@ make db-init         # creates timescaledb extension + applies all SQL migration
 **6. Verify the install**
 
 ```bash
-make test            # 600+ tests should pass
-make db-status       # should show migrations 0001..0021 applied, no pending
+make test            # 700+ tests should pass
+make db-status       # should show migrations 0001..0026 applied, no pending
 ```
 
 ---
@@ -151,22 +165,23 @@ Available pages:
 
 | URL | What it shows |
 |---|---|
-| `/` | Dashboard — equity, latest signals (with "+ Watch" quick-add), open positions, **Market Regime** card with full v2 composite breakdown + dropdown explanations per component, **strategy banner** with regime affinity + soft-sizing multipliers, **news card** with per-article expand-on-click reader |
-| `/signals` | Today's passing + rejected signals, filterable by strategy. **Header strip**: "Last scan: Xh ago · N today" + "Bars current through: YYYY-MM-DD [fresh/Nd behind]" + ⟳ Fetch Latest button (HTMX-swapped: backfills 7 days of bars + re-runs every strategy). **Strategy score** column (per-strategy composite with breakdown on the detail page) |
-| `/signals/{id}` | Full signal attribution: Outcome (entry/stop/qty/risk-per-share/notional), Score derivation (humanized strategy metadata with one-line tooltips per indicator), Position sizing (`base × affinity × composite_mult × stress_mult` math), Market regime context (full v2 components + intermediate signals + percentile ranks), Technical confirmation breakdown, Meta-label probability with interpretation guide, Strategy parameters used at scan time, Run context, raw JSONB fallback |
+| `/` | Dashboard — equity, the latest scan's passing signals (with "+ Watch" quick-add), open positions, **Market Regime** card showing the trend gate (with days on side), the vol scalar (realized vol + percentile rank) and the credit-stress flag, each with a dropdown explanation, plus a per-strategy line saying its sizing rule and whether the vol scalar applies, **news card** with per-article expand-on-click reader |
+| `/signals` | Today's passing + rejected signals, filterable by strategy. **Header strip**: "Last scan: Xh ago · N today" + "Bars current through: YYYY-MM-DD [fresh/Nd behind]" + ⟳ Fetch Latest button (HTMX-swapped: backfills 7 days of bars + re-runs every strategy). **Score** column (the strategy's own ranking metric — idiosyncratic drop for RSI(2), closeness + slope quality + residual tilt for momentum — with the inputs on the detail page) |
+| `/signals/{id}` | Full signal attribution: Outcome (entry/stop/qty/risk-per-share/notional — or "no stop" for stop-less strategies), Score derivation (humanized strategy metadata with one-line tooltips per input), Position sizing (the strategy's rule × the vol scalar where it applies, plus the trend gate and credit-stress state), Market regime context (gate, SPY vs SMA(200), realized vol + rank, HY OAS + rank), Strategy version at scan time |
 | `/signals/{id}/base-rates` | Historical-setup outcome stats for that strategy on that symbol |
 | `/news/{article_id}/content` | HTMX fragment endpoint — re-fetches the article body from EODHD on demand (not persisted) |
-| `/watchlist` | Watched symbols with last close, % change, volume, **reversal-composite score**, price target editor, alert toggle |
+| `/watchlist` | Watched symbols with last close, % change, volume, price target editor, alert toggle, and the sector-composite chart |
 | `/trades` | Open + closed trades; round-trip stats |
 | `/trades/{id}` | Single-trade detail with notes thread (markdown + FTS) |
-| `/backtests` | Saved backtest runs |
+| `/backtests` | Saved backtest runs (with CAGR + Sharpe). **Run a backtest** form at the top — same inputs and defaults as `stockscan backtest run`; the run starts in the background, the page polls until it lands, and the result appears in the list |
 | `/backtests/{id}` | Run detail with equity curve + trade log |
-| `/strategies` | Registered strategies with descriptions, beginner-friendly manuals, and a **meta-label model status chip** per card (trained/untrained, last fit, holdout AUC) |
-| `/strategies/{name}` | Strategy detail with rendered manual + Pydantic param schema + full **meta-label model panel** (training rows, base rate, holdout AUC, threshold metrics, fit timestamp, re-train CLI snippet) |
+| `/strategies` | Registered strategies with descriptions and each card's sizing rule (risk % against the stop, or a fixed fraction per position, and whether it is vol-scaled) |
+| `/strategies/{name}` | Strategy detail with the sizing summary (rule, max open positions, vol scalar applies or not), the rendered manual, the **tuning knobs** table read off the class, and the freshness of any non-bar inputs (e.g. latest sector-composite bar) |
+| `/analysis` · `/analysis/{symbol}` | Per-symbol analysis: trend bucket (MA stack + returns), realized-volatility state, options context (Black-Scholes strike framing), insider activity |
 | `/health` | JSON status (DB, TimescaleDB extension, registered strategies) |
-| `/docs` | **Documentation hub** — index of all repo markdown docs (README, DESIGN, USER_STORIES, TODO, MIGRATION, regime-research) plus the auto-generated CLI reference. Renders markdown with TOC + anchor links; CLI reference walks the live Typer command tree |
+| `/docs` | **Documentation hub** — index of all repo markdown docs (README, DESIGN, USER_STORIES, TODO, DEPLOY, MIGRATION, regime-research) plus the auto-generated CLI reference. Renders markdown with TOC + anchor links; CLI reference walks the live Typer command tree |
 | `/docs/cli` | Auto-generated CLI reference. Captures `--help` for every `stockscan` command/group/leaf via `typer.testing.CliRunner` — single source of truth, never drifts |
-| `/docs/{slug}` | Renders one of the registered markdown files (slugs: `readme`, `design`, `user-stories`, `todo`, `migration`, `regime-research`) |
+| `/docs/{slug}` | Renders one of the registered markdown files (slugs: `readme`, `design`, `user-stories`, `todo`, `deploy`, `migration`, `regime-research`) |
 | `/api-docs` | FastAPI's auto-generated Swagger UI (relocated from `/docs`) |
 | `/api-redoc` | FastAPI's ReDoc alternative |
 | `/api-openapi.json` | OpenAPI JSON spec |
@@ -198,7 +213,7 @@ Valid names: `eod`, `bulk`, `universe`, `fundamentals`, `news`, `calendar`,
 
 - `stockscan refresh fundamentals` / `refresh news` print a one-line notice and exit 0 (so the Sunday fundamentals cron and any scripts keep working), and the watchlist / analysis / MCP refresh paths skip that leg — **no request is made**, nothing counts against quota, no `DEGRADED` nightly summaries.
 - Stored rows are still shown everywhere (the news card, insider tables, fundamentals). Refresh buttons become a muted "not available on current data plan" note.
-- `largecap_rebound` keeps trading on the frozen `fundamentals_snapshot`; its strategy page shows the snapshot's as-of date.
+- The sector composites both strategies rank against keep building from bars, but their sector map comes from the frozen `fundamentals_snapshot`; each strategy page shows the latest composite bar date.
 - `stockscan refresh universe` switches to a **Wikipedia fallback** (see below) so newly added index members still get scanned.
 - `stockscan health` lists the enabled families; startup logs a warning naming the excluded ones.
 
@@ -310,7 +325,7 @@ uv run stockscan refresh bars                    # full universe (~6M bars, 2007
 uv run stockscan refresh bars --current-only     # current 500 only (~2M bars)
 uv run stockscan refresh daily --days 5          # bulk-refresh recent N days
 uv run stockscan refresh fundamentals --current-only  # ~500 EODHD fundamentals calls
-uv run stockscan refresh macro                   # FRED HY OAS (default series for regime composite)
+uv run stockscan refresh macro                   # FRED HY OAS + 1M/3M Treasury yields (regime breaker, options context)
 uv run stockscan refresh macro BAMLH0A0HYM2 BAMLC0A0CMEY  # multiple FRED series
 uv run stockscan refresh news                    # EODHD news for general feed + watchlist
 
@@ -327,24 +342,16 @@ uv run stockscan scan run rsi2_meanrev --as-of 2024-03-15   # backdated
 
 # Signals backfill (replay scans — version-aware skip-query, so a version bump
 # automatically re-scans older-version dates without --force)
-uv run stockscan signals backfill donchian_trend                     # 1yr daily, resumable
+uv run stockscan signals backfill momentum_52w_high                 # 1yr daily, resumable
 uv run stockscan signals backfill all --start 2024-01-01             # all strategies, custom range
 uv run stockscan signals backfill rsi2_meanrev --every 5             # weekly only
-uv run stockscan signals backfill donchian_trend --force             # ignore skip set entirely
+uv run stockscan signals backfill momentum_52w_high --force          # ignore skip set entirely
 
 # Signals admin (delete prior-version data after a strategy upgrade)
-uv run stockscan signals delete -s donchian_trend -v 1.0.0           # confirm interactively
-uv run stockscan signals delete -s donchian_trend -v 1.0.0 --yes     # script-friendly
+uv run stockscan signals delete -s momentum_52w_high -v 1.0.0        # confirm interactively
+uv run stockscan signals delete -s momentum_52w_high -v 1.0.0 --yes  # script-friendly
 uv run stockscan signals delete -s rsi2_meanrev -v 1.0.0 \
     --start 2020-01-01 --end 2023-12-31                              # bounded date range
-
-# Meta-labeling (requires `uv sync --extra ml`)
-# Defaults filter to the CURRENT registered strategy version; pass
-# --strategy-version to re-train on historical-version signals.
-uv run stockscan ml train donchian_trend                             # fit + pickle to ./models/
-uv run stockscan ml train rsi2_meanrev --min-rows 50                 # lower the floor for small-N
-uv run stockscan ml train donchian_trend --strategy-version 1.0.0    # train on legacy v1.0 signals
-uv run stockscan ml status                                           # list trained models w/ holdout AUC
 
 # Watchlist
 uv run stockscan watchlist list
@@ -352,17 +359,24 @@ uv run stockscan watchlist add AAPL --target 200 --direction above
 uv run stockscan watchlist remove 3
 uv run stockscan watchlist check-alerts          # fire any pending now
 
-# Backtesting
-uv run stockscan backtest run rsi2_meanrev --from 2020-01-01 --capital 1000000
-uv run stockscan backtest run donchian_trend --from 2020-01-01
-uv run stockscan backtest list
+# Backtesting (point-in-time S&P 500 by default; 5 bp slippage; $100k)
+uv run stockscan backtest run rsi2_meanrev --from 2010-01-01
+uv run stockscan backtest run momentum_52w_high --from 2010-01-01 -s AAPL -s MSFT
+uv run stockscan backtest list --strategy rsi2_meanrev
+uv run stockscan backtest debug rsi2_meanrev AAPL --from 2024-01-01  # per-day signals() replay
+uv run stockscan backtest export 12 --out bt12.json                 # trades + equity + regime overlay
+uv run stockscan backtest profile momentum_52w_high                 # cProfile hotspots (see DESIGN §4.4.1)
 
-# Scheduled jobs (run by launchd in production)
-uv run stockscan jobs nightly-scan               # refresh + scan + watchlist alerts + notify
+# Sector composites (rebuilt nightly; strategies rank against them)
+uv run stockscan composites build                                    # full rebuild from 2007
+uv run stockscan composites symbol AAPL                              # which composite a symbol maps to
+
+# Scheduled jobs (run by supercronic / launchd in production)
+uv run stockscan jobs nightly-scan               # bars → macro → regime → composites → scans → alerts → summary
 
 # Web + tests
 make run-web                                     # FastAPI dev server on :8000
-make test                                        # unit tests (600+)
+make test                                        # unit tests (700+)
 make check                                       # lint + typecheck + test
 ```
 
@@ -374,19 +388,20 @@ make check                                       # lint + typecheck + test
 stock-scan/
 ├── DESIGN.md                # System design (authoritative)
 ├── USER_STORIES.md          # Functional spec
+├── market_regime_detection.md  # Regime layer design note (evidence + rules)
+├── TODO.md                  # Backlog + settling backtests
 ├── README.md
 ├── pyproject.toml
 ├── Makefile
 ├── Dockerfile               # App image (web + scheduler) — see DEPLOY.md
 ├── docker-compose.yml       # Full stack: db + migrate + web + scheduler
 ├── tailwind.config.js       # Theme for the built stylesheet (`make css`)
-├── migrations/              # Plain SQL (custom runner; no Alembic) — 21 files
+├── migrations/              # Plain SQL (custom runner; no Alembic) — 26 files
 │   ├── 0001_initial_schema.sql        # bars, accounts, signals, trades, lots, notes ...
 │   ├── 0002_backtest_tables.sql       # backtest_runs / trades / equity_curve
-│   ├── ...                            # watchlist, fundamentals, regime v2, news, ML, ...
-│   ├── 0015_drop_technical_scores.sql # retired: scores live on the signal now
-│   ├── 0016_drop_strategy_configs.sql # retired: knobs live in the strategy file
-│   └── 0021_refresh_log.sql           # latest — `ls migrations/` for the full story
+│   ├── ...                            # watchlist, fundamentals, news, sectors, options, hedge ...
+│   ├── 0025_regime_v3.sql             # trend gate + vol scalar + credit breaker columns
+│   └── 0026_paper_trades_optional_stop.sql  # latest — `ls migrations/` for the full story
 ├── infra/
 │   ├── docker-compose.yml             # TimescaleDB
 │   ├── setup_db.sh
@@ -399,35 +414,40 @@ stock-scan/
 │       └── mobile-setup.md
 ├── src/stockscan/
 │   ├── cli.py                         # `stockscan ...` (db / refresh / scan / backtest /
-│   │                                    watchlist / jobs / strategies / ml /
-│   │                                    signals)
+│   │                                    watchlist / jobs / strategies / signals / analysis /
+│   │                                    composites / options / hedge / mcp)
 │   ├── config.py                      # Pydantic settings
 │   ├── db.py                          # SQLAlchemy engine + healthcheck
 │   ├── db_migrate.py                  # SQL migration runner (Alembic replacement)
 │   ├── tables.py                      # SQLAlchemy Core table definitions
 │   ├── metrics.py                     # CAGR, Sharpe, Sortino, max DD, profit factor
-│   ├── data/                          # Provider clients (EODHD + FRED + stub), store, backfill, macro_store
-│   ├── universe/                      # S&P 500 membership management
+│   ├── data/                          # Provider clients (EODHD + FRED + stub), store, backfill,
+│   │                                    macro_store + macro_refresh (FRED series)
+│   ├── universe/                      # S&P 500 membership (EODHD sp500.py, wikipedia.py fallback)
 │   ├── fundamentals/                  # Snapshot store + EODHD refresh + market_cap_percentile
-│   ├── indicators/                    # RSI, ATR, Donchian, ADX, Bollinger, MACD, ADV
-│   ├── strategies/                    # Plugin system + RSI(2) + Donchian (v1.1) + Largecap Rebound + 52w-high
-│   ├── regime/                        # v2 composite classifier (vol/trend/breadth/credit) + store + detect
+│   ├── sectors/                       # Equal-weight sector composites
+│   ├── indicators/                    # ta.py (sma/ema/rsi/atr/true_range/ADV/Yang-Zhang vol),
+│   │                                    relative_strength.py (sector_return, sector_relative_return)
+│   ├── strategies/                    # base.py (ABC + registry + knobs) + rsi2_meanrev + momentum_52w
+│   ├── regime/                        # rules.py (pure math, regime_frame) + detect.py + store.py
 │   ├── analyzer/                      # Per-signal historical base-rate analysis
+│   ├── analysis/                      # Per-symbol trend / volatility / options context
 │   ├── scan/                          # ScanRunner + signals_freshness + refresh_signals (Fetch Latest)
-│   ├── risk/                          # Sizer + filter chain (earnings, sector, ADV, drawdown)
+│   ├── risk/                          # sizer.py (size_for_strategy) + filters.py (filter chain)
 │   ├── broker/                        # Broker ABC + Suggestion + Paper (E*TRADE in Phase 4)
-│   ├── backtest/                      # Event-driven engine + slippage + persistence
-│   ├── positions/                     # Trade lifecycle helpers
+│   ├── backtest/                      # Event-driven engine + slippage + persistence + profile
+│   ├── positions/, paper_store/       # Trade lifecycle helpers, paper trades
 │   ├── notes/                         # Trade notes CRUD + FTS search
-│   ├── news/                          # EODHD news refresh + on-demand article reader + store
-│   ├── ml/                            # Meta-labeling: features + labels + train + predict + on-disk store
+│   ├── news/, earnings/, insider/,    # EODHD extras: news reader, earnings calendar,
+│   │   econ_events/                     insider transactions, economic events
+│   ├── proposals/, hedge/, cycles/    # Options proposals, delta hedging, cycle tools
 │   ├── watchlist/                     # Store + alerts + nightly hook
 │   ├── notify/                        # Email (SMTP) + Discord webhook + router
-│   ├── jobs/                          # Nightly orchestration: refresh → scan → notify
+│   ├── jobs/                          # Nightly orchestration
+│   ├── mcp/                           # MCP server (see MCP_SERVER.md)
 │   └── web/                           # FastAPI app, routes, Jinja templates (mobile-first),
 │                                        self-hosted static assets (Tailwind build + htmx)
-├── models/                            # Pickled XGBoost meta-label artifacts (per strategy)
-└── tests/                             # 600+ tests
+└── tests/                             # 700+ tests
 ```
 
 ---
@@ -461,22 +481,19 @@ stock-scan/
 | Phase | Status | What's in it |
 |---|---|---|
 | 0 — Foundations | ✅ Done | Repo, schema, data layer, plugin system, broker ABC, FastAPI skeleton, CLI |
-| 1 — Strategies + backtester | ✅ Done | Indicators, RSI(2), Donchian, event-driven backtester, metrics, CLI |
+| 1 — Strategies + backtester | ✅ Done | Indicator primitives, RSI(2) pullback, 52-week-high momentum, event-driven backtester, metrics, CLI |
 | 2 — Web UI | ✅ Done | Dashboard, Signals, Trades, Backtests, Base-rates, Strategies — mobile-first responsive |
-| 3 — Live scanner + notifications | ✅ Done | Bulk EOD endpoint, scheduler (launchd), nightly job, email + Discord, db-backup |
+| 3 — Live scanner + notifications | ✅ Done | Bulk EOD endpoint, scheduler (launchd / supercronic), nightly job, email + Discord, db-backup |
 | Watchlist | ✅ Done | Per-symbol price-target alerts, auto-disable on fire, "+ Watch" quick-add, Discord/email alerts via nightly hook |
-| Technical confirmation score | ✅ Done | Plugin system (RSI/MACD), per-strategy tag-aware scoring, signed [-1, +1], displayed on Signals + Watchlist |
-| Fundamentals layer | ✅ Done | EODHD refresh, 38 typed columns + JSONB raw, market_cap_percentile helper |
-| Largecap Rebound strategy | ✅ Done | Counter-trend long entries on top-quintile-by-market-cap S&P 500 names below SMA(200) |
-| Market Regime v2 (composite) | ✅ Done | Vol (VIX) / Trend (SMA-200 slope) / Breadth (RSP-SPY) / Credit (HY OAS) composite (40/25/20/15). Soft per-strategy sizing multiplier replaces v1 hard gates. FRED provider, macro_series store, regime_affinity contract on Strategy. Dashboard component breakdown w/ per-component dropdown explanations |
+| Fundamentals layer | ✅ Done | EODHD refresh, 38 typed columns + JSONB raw, point-in-time shares history, market_cap_percentile helper |
+| Sector composites | ✅ Done | Equal-weight sector indices from bars + sector map; rebuilt nightly; `sector_return` / `sector_relative_return` primitives |
+| Market regime | ✅ Done | SPY 200-day trend gate with dwell, realized-vol scalar with per-strategy opt-in, HY OAS credit-stress breaker. FRED provider + `macro_series`. Same `regime_frame` in live and backtest. Dashboard card with per-control explanations |
 | News integration | ✅ Done | EODHD `/news` for general feed + watchlist symbols, sentiment-aware ranking, dashboard card with **on-demand article reader** (per-row expand → re-fetch from provider, never persisted), CLI `refresh news` |
-| 52-Week-High Momentum strategy | ✅ Done | George-Hwang style. Score = close / 252-day max, gated to within 5% of 52w high. Clenow regression-slope tiebreak. Time-based 60-day exit |
-| Donchian v1.1 | ✅ Done | Multi-window ensemble (20+55), volume confirmation (1.5×), volatility-expansion (TR ≥ ATR(14)), Turtle 1L skip-after-winner filter (tracked as a rejected signal), relative-strength filter vs SPY (60d). Each filter individually toggleable for backtest A/B |
-| Meta-labeling layer | ✅ Done | Optional `[ml]` extra. XGBoost binary classifier per strategy, triple-barrier labels (Lopez de Prado), 17 engineered features. CLI `ml train` / `ml status`, `signals backfill` populates training data, on-disk pickle store. Score-only integration: scan runner attaches `meta_label_proba` to signal metadata; never blocks trades |
-| Signal-detail full attribution | ✅ Done | Outcome, Score derivation (humanized strategy metadata + tooltips), Position sizing math, Market regime context (every component + percentile rank + intermediate signal), Technical confirmation, Meta-label probability, Strategy params used at scan time, raw JSONB fallback |
+| Strategy canon review (2026-09) | ✅ Done | Book reduced to RSI(2) pullback + 52-week-high momentum, both v2.0.0; knobs as class constants; exits (stops included) strategy-owned; sizing shared by runner and engine. Settling backtests listed in `TODO.md` |
+| Signal-detail full attribution | ✅ Done | Outcome, Score derivation (humanized strategy metadata + tooltips), Position sizing (strategy rule × vol scalar, gate + credit-stress state), Market regime context (gate, realized vol + rank, HY OAS + rank), Strategy version at scan time, raw JSONB fallback |
 | Signals freshness + Fetch Latest | ✅ Done | Header strip on `/signals` showing last scan + bars-current-through with [fresh/Nd behind] badge. POST `/signals/refresh` button: 7-day bulk-EOD bars catch-up + re-runs every registered strategy via HTMX |
-| Strategy model status UI | ✅ Done | Strategies list shows per-card chip (no model / trained N days ago / AUC X.XX); detail page shows full meta-label panel with re-train CLI snippet |
+| Options + hedging | ✅ Done | Weekly short-premium proposals (`stockscan options propose`), delta-hedge daemon and playground (`/hedge`), MCP tools for both |
 | 4 — E*TRADE integration | Pending | OAuth flow, broker impl, fill reconciliation |
 | 5 — Hardening | Pending | Reconciliation drift alerts, error handling, journal export |
+| Settling backtests | Pending | Ablations for both strategies and the regime controls — see [TODO.md](TODO.md) |
 | Strategy optimizer (Bayesian) | Pending | See [TODO.md §High-impact](TODO.md). Walk-forward + held-out validation + deflated Sharpe + per-trial persistence |
-| Vol-targeting overlay (Moreira-Muir) | Pending | See [TODO.md §Medium-impact](TODO.md). Per-strategy realized-vol scaling for sizing |

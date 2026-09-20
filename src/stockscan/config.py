@@ -44,6 +44,10 @@ class Settings(BaseSettings):
     # ---- Logging (see stockscan.logging_setup) ----
     # Empty log_dir → <repo_root>/logs (resolved_log_dir property below).
     log_dir: str = Field("", alias="STOCKSCAN_LOG_DIR")
+    # Empty → <repo_root>/migrations. The Docker image installs the package
+    # into site-packages, where no repo root exists, so it sets this to the
+    # copied /app/migrations explicitly.
+    migrations_dir: str = Field("", alias="STOCKSCAN_MIGRATIONS_DIR")
     log_to_file: bool = Field(True, alias="STOCKSCAN_LOG_TO_FILE")
     # Requests slower than this log at WARNING in the web timing middleware.
     slow_request_ms: int = Field(750, alias="STOCKSCAN_SLOW_REQUEST_MS")
@@ -86,7 +90,9 @@ class Settings(BaseSettings):
     discord_webhook_url: SecretStr = Field(SecretStr(""), alias="DISCORD_WEBHOOK_URL")
 
     # ---- Risk caps (DESIGN §4.7) ----
-    default_risk_pct: Decimal = Field(Decimal("0.01"), alias="STOCKSCAN_DEFAULT_RISK_PCT")
+    # Equity the live scanner sizes against until the first equity_history
+    # row exists (a fresh install, or paper trading without a broker sync).
+    starting_equity: Decimal = Field(Decimal("100000"), alias="STOCKSCAN_STARTING_EQUITY")
     max_positions: int = Field(15, alias="STOCKSCAN_MAX_POSITIONS")
     max_sector_pct: Decimal = Field(Decimal("0.25"), alias="STOCKSCAN_MAX_SECTOR_PCT")
     max_position_pct: Decimal = Field(Decimal("0.08"), alias="STOCKSCAN_MAX_POSITION_PCT")
@@ -128,6 +134,11 @@ class Settings(BaseSettings):
 
             return ALL_FEATURES
         return frozenset(f.strip() for f in raw.split(",") if f.strip())
+
+    @property
+    def resolved_migrations_dir(self) -> Path:
+        """Migrations directory as a Path — explicit setting or <repo_root>/migrations."""
+        return Path(self.migrations_dir) if self.migrations_dir else PROJECT_ROOT / "migrations"
 
     @property
     def resolved_log_dir(self) -> Path:
@@ -189,8 +200,8 @@ def config_warnings() -> list[str]:
         out.append("DATABASE_URL still contains the placeholder password")
     if not settings.fred_api_key.get_secret_value():
         out.append(
-            "FRED_API_KEY not set — regime composite runs without the "
-            "credit-stress component (weights renormalize)"
+            "FRED_API_KEY not set — the regime layer's credit-stress flag "
+            "stays off (HY OAS is never refreshed)"
         )
     has_email = bool(settings.notify_email_to and settings.notify_email_from)
     has_discord = bool(settings.discord_webhook_url.get_secret_value())

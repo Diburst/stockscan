@@ -4,11 +4,38 @@ Backlog of deferred features and improvements, with enough context that future-T
 
 ---
 
+## Settling backtests (2026-09 canon review)
+
+The canon review reduced the book to `rsi2_meanrev` and `momentum_52w_high` and
+settled the regime layer as a trend gate, a vol scalar and a credit
+breaker. Each of the calls below was made on the literature; these runs confirm
+them on our own data. Common setup for every run: point-in-time S&P 500
+universe, 5 bp slippage, 2010-01-01 → today, walk-forward with the last two
+years held out. Each ablation is a knob edit + version bump on a branch and a
+`stockscan backtest run`; record the `knobs_hash` with the run note.
+
+**RSI(2) pullback**
+- [ ] With and without the sector-relative ranking (`sector_min_return` off, rank by raw RSI instead of `idiosyncratic_drop`). Expect: sector conditioning improves expectancy per trade and drawdown in 2015–16 and 2022.
+- [ ] With and without a 3×ATR(14) price stop added to `exit_rules`. Expect: the stop lowers returns more than it lowers drawdown (Kaminski & Lo). If it does not, the no-stop decision is reopened.
+
+**52-week-high momentum**
+- [ ] Rank-based entry (top of the eligible list per weekly review) versus a plain `min_closeness = 0.95` threshold with no ranking. Expect: ranking wins on turnover and on drawdown; similar CAGR.
+- [ ] 15% stop versus SMA(100)-break only. Expect: the stop roughly doubles Sharpe by cutting crash months (Han, Zhou & Zhu); if it merely adds turnover, drop it.
+
+**Regime controls**
+- [ ] Trend gate with the 3-close dwell, without it, and no gate. Expect: similar CAGR, materially shallower max drawdown with the gate; the dwell cuts flips without changing the drawdown result.
+- [ ] Vol scalar on/off for momentum — report max drawdown and the worst-month distribution, not just CAGR. Also run the scalar forced on for RSI(2) to confirm it hurts there.
+
+Results go into the strategy `manual` (one paragraph each) and, where a call is
+reversed, into a version bump with the reason in the module docstring.
+
+---
+
 ## High-impact
 
 ### Strategy optimizer (Bayesian search + walk-forward + held-out validation)
 
-**Idea:** A search engine that varies a strategy's parameters across thousands of trials, runs a backtest at each point, and reports the parameter set that maximizes a chosen objective — *with anti-overfitting hygiene baked in by default*. Lets you ask "what's the best `rsi_period` × `atr_stop_mult` × `adx_min` combination for Largecap Rebound on AAPL over 2015–2024?" and get a defensible answer rather than an overfit one.
+**Idea:** A search engine that varies a strategy's parameters across thousands of trials, runs a backtest at each point, and reports the parameter set that maximizes a chosen objective — *with anti-overfitting hygiene baked in by default*. Lets you ask "what's the best `rsi_entry` × `max_holding_bars` × `sector_min_return` combination for RSI(2) over 2015–2024?" and get a defensible answer rather than an overfit one. Knobs are class constants, so a trial is an instance with overridden attributes, not a parameter object.
 
 **The risk to call out loudly in the docs:** this is the single most landmine-laden feature in retail quant trading. With enough degrees of freedom and a single sample, an optimizer will *always* find parameters that beat the benchmark on that sample — even on pure random walks. That's a statistical certainty, not a bug. The optimizer's job isn't to "find the best parameters"; it's to **find robust parameters and honestly report how robust they are**.
 
@@ -42,7 +69,7 @@ The objective module is small (~50 lines) — each function takes the `BacktestR
 - **Cross-symbol robustness (optional):** optimize on a basket (AAPL, MSFT, GOOG, JPM, JNJ), validate on names not in the basket. Strongest robustness signal but compute-heavy.
 - **Single-window mode** — possible but flagged in CLI and UI as "exploratory only — DO NOT use these parameters live without walk-forward validation."
 
-**4. What's optimized.** MVP optimizes parameter VALUES only (RSI period, MACD periods, ATR multiplier, ADX threshold, etc.) — bounded space, easier, less overfit-prone. Optimizing strategy STRUCTURE (which conditions to AND/OR, which indicators to include) is genetic programming territory — much more powerful but much more overfit-prone. Defer to v2.
+**4. What's optimized.** MVP optimizes knob VALUES only (RSI entry level, holding period, closeness threshold, stop percentage, etc.) — bounded space, easier, less overfit-prone. Optimizing strategy STRUCTURE (which conditions to AND/OR, which indicators to include) is genetic programming territory — much more powerful but much more overfit-prone. Defer to v2.
 
 **5. Persistence + reproducibility.** Every run is an artifact:
 
@@ -120,268 +147,25 @@ Estimated effort: ~1 week including all of the anti-overfitting hygiene. Without
 
 #### Why this is high-impact (and dangerous)
 
-Done well, it answers questions you currently can't: "is `rsi_period=14` actually the best for Largecap Rebound, or is 11 better? How sensitive is performance to `atr_stop_mult`? Is the strategy edge structural or did I luck into one set of parameters?"
+Done well, it answers questions you currently can't: "is `rsi_entry = 10` actually the best for RSI(2), or is 5 better? How sensitive is momentum to `stop_pct`? Is the strategy edge structural or did I luck into one set of knobs?"
 
 Done badly — without walk-forward, without OOS hold-out, without deflated Sharpe — it produces an extremely confident-looking report that says "this strategy makes 200% with 80% win rate" and you blow up your account live-trading parameters that fit one historical sample. Hence why "do not optimize without validation hygiene" should be the first line of the docstring on the runner.
 
 ---
 
-### Financial news integration (EODHD /news)
-
-**Idea:** Pull financial news from EODHD's news API and surface it in two places — general market news on the Dashboard, and per-symbol news for everything on the Watchlist. Lets the operator see macro context + news that might explain a watchlisted name's price action without leaving the app.
-
-**Why this matters for swing trading specifically:** earnings beats, FDA approvals, M&A announcements, and macro events (Fed meetings, CPI prints) drive overnight gaps that can blow through ATR-based stops. Already we filter signals near earnings dates; news visibility lets the operator notice *unscheduled* catalysts (lawsuit, executive departure, sector rotation news) on watchlisted names before they hit a position.
-
-#### API surface
-
-EODHD endpoint: `GET /api/news`
-
-Documented query params (verify against current EODHD docs):
-- `s` — symbol filter (e.g., `s=AAPL.US`). Optional; when omitted returns broad financial news.
-- `t` — topic tag filter (e.g., `t=mergers and acquisitions`, `monetary-policy`, `earnings`). Optional.
-- `from` / `to` — ISO date range.
-- `limit` — max articles per call (provider-specific cap, typically 1000).
-- `offset` — pagination.
-
-Response shape per article: `{date, title, content, link, symbols: [...], tags: [...], sentiment: {polarity, neg, neu, pos}}`. The sentiment field is a per-article score from EODHD's NLP — useful but treat as advisory only.
-
-#### Storage
-
-Cache articles locally so re-renders don't hit the API and so we have history for analysis later.
-
-```sql
-CREATE TABLE news_articles (
-    article_id      TEXT PRIMARY KEY,           -- hash of (link) or EODHD's id
-    published_at    TIMESTAMPTZ NOT NULL,
-    title           TEXT NOT NULL,
-    snippet         TEXT,                        -- first ~500 chars of content
-    link            TEXT NOT NULL,
-    source          TEXT,                        -- 'reuters', 'bloomberg', etc.
-    sentiment_polarity NUMERIC(5,4),             -- -1..+1
-    sentiment_pos    NUMERIC(5,4),
-    sentiment_neg    NUMERIC(5,4),
-    sentiment_neu    NUMERIC(5,4),
-    tags            TEXT[] NOT NULL DEFAULT '{}',
-    fetched_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-CREATE INDEX idx_news_published ON news_articles (published_at DESC);
-CREATE INDEX idx_news_tags ON news_articles USING GIN (tags);
-
--- Many-to-many because articles can mention multiple symbols
-CREATE TABLE news_article_symbols (
-    article_id  TEXT NOT NULL REFERENCES news_articles(article_id) ON DELETE CASCADE,
-    symbol      TEXT NOT NULL,
-    PRIMARY KEY (article_id, symbol)
-);
-CREATE INDEX idx_news_symbols_lookup ON news_article_symbols (symbol, article_id);
-```
-
-We **don't store full article content** — keeping a 500-char snippet is plenty for the UI; clicking the link opens the original. Saves storage and avoids any content-rights concerns.
-
-#### Refresh strategy
-
-- **Per-symbol**: refresh news for every watchlisted symbol once a day after market close. ~50 watched names × 1 call = trivial cost.
-- **General market**: refresh once a day on the same schedule, using the configured symbol + tag set (see Decisions §1).
-- **On-demand**: a "Refresh news" button on the Dashboard / news page for manual pulls.
-
-Schedule via launchd as a daily job that runs after the nightly scan completes (~20:30 ET): `com.stockscan.news-refresh.plist`. Could also fold into the existing nightly-scan job since both run at similar times.
-
-#### UI surfaces
-
-**Dashboard:** new card showing the last 5–10 general-market headlines with publish time, source, and a small sentiment-color dot (green/red/grey). Each item links out to the source.
-
-```
-┌──────────────────────────────────────────────────────────────────────┐
-│ Market news                                            [Refresh]      │
-├──────────────────────────────────────────────────────────────────────┤
-│ ● Fed signals two more rate cuts this year       Reuters · 14m ago   │
-│ ○ Tech sector leads as semiconductors rebound    Bloomberg · 1h ago  │
-│ ● JPMorgan beats Q1 estimates, raises guidance   WSJ · 2h ago        │
-│ ...                                                                   │
-└──────────────────────────────────────────────────────────────────────┘
-```
-(● = strong sentiment polarity ±0.5, ○ = mild)
-
-**Watchlist:** add a "news" toggle/button per row that expands to show last 3 headlines for that symbol. Or a compact "news" badge that shows count + most-negative sentiment indicator (red dot if recent negative news).
-
-**Dedicated `/news` page:** chronological feed with filters by symbol, tag, sentiment range, date range. FTS search via Postgres if we extend the `tsvector` pattern from `trade_notes`.
-
-**Per-trade or per-signal news context (stretch):** when looking at a backtest trade or live signal, optionally show news from the few days around the entry. Could explain "why did this trade win/lose" — e.g., a positive earnings surprise on day 3 of a Largecap Rebound entry.
-
-#### Decisions (resolved)
-
-**1. General-market feed scope.** Default-curated mix of (a) major-index symbols, (b) tech/semis/AI bias, (c) macro-event topics. User can edit the curation in Settings.
-
-Default symbol filter (initial seed):
-- **Indices/broad ETFs:** `SPY`, `QQQ`, `DIA`, `IWM`
-- **Sector ETFs (tech/semis bias):** `XLK`, `SOXX`, `SMH`
-- **Mega-cap tech anchors:** `AAPL`, `MSFT`, `NVDA`, `GOOGL`, `META`, `AMZN`, `AMD`, `TSM`, `ASML`
-
-Default topic-tag filter (verify exact strings against EODHD's tag taxonomy at implementation time):
-- `monetary-policy` (FOMC, rate decisions)
-- `economic-indicators` (CPI, unemployment, GDP, NFP)
-- `earnings` (broad earnings season news)
-- `artificial-intelligence` (AI-related macro news)
-
-Curation UI: a Settings panel with two text-area fields (one for symbols, one for tags), each populated with the defaults above. User edits → saves to a `news_feed_config` table. The general-market query becomes the union: articles where `symbol IN config.symbols OR tags && config.tags`.
-
-**2. Sentiment treatment.** Surface as advisory metadata only — a small color-coded dot (●/○) next to each headline based on polarity magnitude, no sorting/filtering by sentiment in the MVP. Avoids over-reliance on a noisy NLP score while still making the signal visible at a glance. Tooltip on hover shows the raw polarity number for users who want detail.
-
-**3. Refresh cadence.** Daily, scheduled to run right after the nightly scan completes (~20:30 ET). Manual on-demand refresh button on the Dashboard for ad-hoc pulls. No intraday refreshing in MVP.
-
-**4. Push notifications for high-impact watchlisted-symbol news.** Yes, opt-in. Settings toggle: "Notify on watchlisted-symbol news with |sentiment| > X" (default threshold 0.7, configurable). Uses the existing notify router (email + Discord). Fires once per article — articles already alerted are tracked via a `news_alerted` flag or a join table.
-
-**5. Article retention.** Keep forever. Storage cost is trivial (~1000 articles/day = a few MB/year of metadata). Useful for historical analysis later — could correlate news catalysts with trade outcomes in a Phase 5+ feature.
-
-**6. Source filtering.** Out of scope for MVP. All EODHD-provided sources kept as-is. Revisit if noise becomes a real problem.
-
-#### MVP definition (when this gets built)
-
-- **EODHD provider method** `get_news(symbols=None, tags=None, from_date, to_date, limit=1000)`
-- **Migration** (next free number):
-  - `news_articles` + `news_article_symbols` (per §Storage)
-  - `news_feed_config` — single-row table holding the user-curated `symbols TEXT[]` and `tags TEXT[]` for the general-market feed; seeded with defaults from §Decisions §1
-  - `news_alerts_sent` — small (article_id, channel) tracking table so push notifications fire once per article
-- **Module** `stockscan/news/` with:
-  - `store.py` — CRUD
-  - `refresh.py` — bulk pulls (per-watchlist-symbol + general-feed)
-  - `alerts.py` — high-sentiment push notifications opt-in
-  - `helpers.py` — recent-for-symbol, recent-general, full-text search
-- **CLI**:
-  - `stockscan refresh news` — pulls watchlist + general feed; idempotent
-  - `stockscan news list [--symbol AAPL] [--tag earnings] [--days 7]`
-  - `stockscan news search "query"` — Postgres FTS across titles + snippets
-- **Web UI**:
-  - Dashboard card: last 5–10 general-market headlines with sentiment-color dot, sourced from the union of `news_feed_config.symbols` + `news_feed_config.tags`
-  - Watchlist row: expandable per-symbol news (HTMX expand/collapse, last 3 headlines)
-  - `/news` dedicated page with chronological feed + filters (symbol, tag, date range, FTS)
-  - Settings page section: edit the general-feed `symbols` and `tags` lists; toggle high-sentiment push notifications + threshold
-- **Notifications**: opt-in push (email + Discord) for watchlisted-symbol articles with `|sentiment_polarity| ≥ threshold` (default 0.7), fired via the existing notify router, deduplicated by `news_alerts_sent`
-- **launchd**: `com.stockscan.news-refresh.plist` running daily at 20:30 ET on weekdays — folded into the existing nightly-scan job is also fine
-
-Estimated effort: ~3–4 days. UI is the bulk of the work (per-symbol expandable sections, the `/news` page, the Settings curation panel); the API integration + storage is straightforward.
-
----
-
-### Market-regime detector + meta-strategy switching
-
-**Idea:** Detect the broader-market regime (trending vs choppy) and route strategies accordingly. Largecap Rebound and Donchian Trend whip in chop; RSI(2) thrives there. A regime detector would let the scanner *choose which strategies to run* based on current conditions instead of always running everything.
-
-**Concrete shape:**
-
-- New module `stockscan/regime/` with a `detect_regime(as_of)` function that looks at SPY (or some configurable benchmark) and classifies the market as one of:
-  - `trending_up` — SPY's ADX(14) > 25 AND close > SMA(200)
-  - `trending_down` — ADX > 25 AND close < SMA(200)
-  - `choppy` — ADX < 18 (range-bound)
-  - `transitioning` — ADX 18–25 (ambiguous)
-- Persisted in a `market_regime` table keyed by `(as_of_date)` so backtests + dashboard can query it cheaply.
-- `Strategy` ABC gets an optional `applicable_regimes: ClassVar[set[str]]` attribute. Strategies declare which regimes they're active in:
-  - `RSI2MeanReversion`: `{"choppy", "trending_up", "transitioning"}` — works in most environments except sustained downtrends
-  - `DonchianBreakout`: `{"trending_up", "trending_down"}` — needs a real trend
-  - `LargeCapRebound`: `{"trending_up", "transitioning"}` — needs some directional move plus quality-stock recoveries; excluded in pure chop and bear markets
-- The `ScanRunner` queries today's regime and skips strategies whose `applicable_regimes` don't include it.
-- The dashboard shows the current regime as a badge + a small "Strategies active today" panel.
-- The nightly summary email includes the regime in its header.
-
-**Why this is the right answer for the chop problem:** the ADX entry filter on Largecap Rebound is a workaround for a per-strategy chop weakness; the regime detector solves the underlying issue at the portfolio level — *don't run counter-trend strategies in a regime where they don't work*.
-
-**Why deferred:** changes the operational model from "run everything" to "run regime-appropriate." Needs a design discussion about how to handle strategies that already have open positions when the regime flips (close them? hold them? rotate?). Half a day of code + thinking.
-
 ---
 
 ## Medium-impact
 
-### Volatility-managed sizing overlay (Moreira-Muir 2017)
-
-**Idea:** Scale every strategy's position size *inversely* to its own recent realized volatility instead of holding constant notional. A position taken when realized vol is double the long-run average gets sized at half. Empirically increases Sharpe across virtually every strategy class — value, momentum, profitability, investment, FX carry — in the original Moreira & Muir (Journal of Finance, 2017) paper, with replications across SSRN since.
-
-**The intuition:** during high-vol regimes, drawdowns are violent and Sharpe is bad even when expected returns are positive; during low-vol regimes, drawdowns are mild and Sharpe is good. So if you lever up in calm and de-lever in storms — without any explicit market-timing signal — you mechanically harvest the inverse correlation between vol and Sharpe. It's free Sharpe lift from a sizing rule alone.
-
-**The skeptical 2020 follow-up (Cederburg, O'Doherty, Wang).** Across 103 anomalies, vol-managed portfolios DON'T systematically beat their unmanaged versions on average — though they DO produce significant spanning-regression alpha. Read: vol management is alpha-additive (the residual after subtracting the original) but not a free lunch when measured against absolute return. For our use case the alpha-additive interpretation is the relevant one — we're not replacing Donchian, we're scaling it.
-
-**Concrete shape:**
-
-- Add a `VolTargetSizer` step to the runner that runs AFTER the base sizer but BEFORE the FilterChain. Computes:
-    ```
-    realized_vol_21d = std(daily log returns, 21d) * sqrt(252)
-    multiplier        = clip(target_vol / realized_vol_21d, 0.25, 2.0)
-    qty_after_vol    = round(qty_before_vol * multiplier)
-    ```
-    where `target_vol` is a global setting (default ~15% annualised — close to long-run S&P realized) and the clip keeps it from going to zero (no signal) or unbounded (leverage blowup).
-
-- Persists the multiplier and the realized vol into `signals.metadata` so the dashboard can show it ("sized at 0.6× — vol elevated") and so backtests can ablate the overlay later.
-
-- Per-strategy override: each `Strategy` subclass gets an optional `vol_target: ClassVar[float | None] = None`. None = use the global default; a float = override (e.g., RSI2 might run hotter at 18%, Donchian cooler at 12%). Strategies opt INTO the overlay rather than out — keeps the existing strategy bodies untouched at first.
-
-- A new column on `signals.metadata`: `realized_vol_21d` and `vol_target_multiplier`, indexed for the dashboard backfill.
-
-**Two open questions Thomas wants to think about before implementing:**
-
-1. **Does vol-targeting compose with the regime composite multiplier?** We already scale by `affinity × (0.5 + 0.5 × composite_score) × stress_mult`. Vol-targeting is multiplicatively independent in theory, but stacked with the regime multiplier could over-adjust during high-vol stress (when both shrink the position). Probably want to use the MIN of the two scalars rather than the product, or apply vol-target AFTER all other sizing rules so it has the final word.
-
-2. **Per-strategy vs portfolio-level vol targeting.** Two distinct things:
-    - *Per-strategy:* every signal sized to deliver target vol on its own. The original Moreira-Muir paper's framing.
-    - *Portfolio-level:* compute realized portfolio vol from the actual P&L track record and scale ALL new positions accordingly. Closer to what real CTAs do (de Prado's vol-scaling).
-    The portfolio version captures correlation effects (a basket of correlated trend trades has more vol than the per-position math implies); the per-strategy version is simpler to implement and easier to backtest without a full portfolio model. MVP should be per-strategy; portfolio version is a follow-up.
-
-**References:**
-- Moreira, A. & Muir, T. (2017). "Volatility-Managed Portfolios." *Journal of Finance* 72(4): 1611–1644.
-- Cederburg, S., O'Doherty, M. S., Wang, F. (2020). "On the performance of volatility-managed portfolios." *Journal of Financial Economics* 138(1): 95–117. (The skeptical replication.)
-- Harvey, C. R. et al. (2018). "The Impact of Volatility Targeting." *Journal of Portfolio Management* 45(1): 14–33. (Industry-practitioner perspective.)
-
-**Effort estimate:** half a day for the per-strategy MVP. Most of the work is the metadata round-trip and a fair backtest framework that can A/B with-and-without the overlay on the existing strategies.
-
----
-
-### Meta-label features: consume strategy-emitted metadata
-
-**Idea:** Extend `stockscan.ml.features.FEATURE_COLUMNS` so the meta-label classifier can see the per-strategy intermediate values that already get persisted to `signals.metadata`. Right now the feature builder reads only one strategy-specific key (`closeness_52w` for the 52w-high strategy); every other field — `volume_mult_actual`, `vol_expansion_ratio`, `rs_60d_diff`, `breakout_window`, `prior_signal_outcome` for Donchian v1.1; `slope_quality` for momentum_52w_high; `adx` for both — gets discarded. That's leaving signal on the table because those are exactly the kind of values XGBoost would split on most readily.
-
-**Why it matters:** the v1.0 holdout AUC of 0.523 on Donchian was likely held back by missing volume features (we recommended adding volume in the strategy review). With Donchian v1.1 emitting `volume_mult_actual` directly into metadata, surfacing it as a model input is now a one-line change rather than a re-derivation.
-
-**Concrete shape:**
-
-- Append to `FEATURE_COLUMNS` (in canonical order, at the end so existing pickled models continue to load with a clear schema-mismatch warning rather than silent column reordering):
-  - `signal_volume_ratio` — pulled from `signal_metadata.get("volume_mult_actual")`. Default fill: 1.0 (neutral).
-  - `signal_vol_expansion` — from `signal_metadata.get("vol_expansion_ratio")`. Default fill: 1.0.
-  - `signal_rs_60d_diff` — from `signal_metadata.get("rs_60d_diff")`. Default fill: 0.0.
-  - `signal_slope_quality` — from `signal_metadata.get("slope_quality")` (momentum_52w_high). Default fill: 0.5.
-  - `signal_strategy_adx` — from `signal_metadata.get("adx")`. Default fill: 20.0.
-  - `signal_breakout_window` — from `signal_metadata.get("breakout_window")`. Default fill: 0 (means "not a Donchian breakout signal"). Encoded as integer; XGBoost handles it natively without one-hot.
-
-- These are STRATEGY-OPTIONAL. A signal from a strategy that doesn't emit `volume_mult_actual` (e.g., RSI(2)) gets the neutral fill (1.0) — which means the feature contributes nothing to that strategy's model splits, exactly the desired behavior. **No per-strategy feature pipeline needed.**
-
-- Bump `_DEFAULT_HYPERPARAMS["max_depth"]` from 4 to 5 — slightly deeper trees to use the additional features. Keep the remaining hyperparameters conservative.
-
-- Bump `train_model`'s default `model_version` from `"1.0.0"` to `"2.0.0"`. The feature schema check in `predict.py` (`tuple(artifact.feature_columns) != tuple(FEATURE_COLUMNS)`) will then refuse to load v1.0.0 artifacts against the new schema, forcing a clean re-train rather than silent misalignment.
-
-- Re-train every strategy after the change (`stockscan ml train donchian_trend`, etc.) and verify the holdout AUC moves. Donchian should benefit most.
-
-**Effort estimate:** an hour to write + re-train. The change is mostly mechanical — six new keys in `_NEUTRAL_FILLS`, six new columns in `FEATURE_COLUMNS`, six lookups in `build_features`. Add a tiny unit test that feeds a synthetic Donchian-v1.1 metadata dict through `build_features` and asserts the new features round-trip.
-
-**Why it's medium-impact, not high:** the existing 17 features cover the broad surface (regime, returns, vol, RSI, closeness-to-high). The additions are incremental signal-strength on top. They could easily move holdout AUC from 0.52 → 0.58, but it's a refinement, not a fundamental capability.
-
----
-
 ### True historical fundamentals (point-in-time per quarter)
 
-**Current state:** `fundamentals_snapshot` holds the *latest* snapshot per symbol. Backtests apply today's market-cap percentiles to historical bars.
+**Current state:** `fundamentals_snapshot` holds the *latest* snapshot per symbol; `fundamentals_history` (migration 0023) holds point-in-time shares outstanding for the cap-weighted composites, but not the other fields.
 
-**Problem:** small look-ahead bias on the universe filter. A backtest of 2015 sees today's market cap rankings — names that have grown into the top quintile since 2015 will pass the filter even though they wouldn't have qualified back then. Direction of bias: probably overstates the strategy's apparent performance slightly.
+**Problem:** the sector map behind the composites is the frozen latest snapshot, so a symbol that changed sector is composited under its current sector for its whole history. No strategy filters on market cap at scan time any more, so the universe-filter look-ahead that motivated this item is gone; what remains is the sector-map drift.
 
-**Fix:** replace `fundamentals_snapshot` with `fundamentals_history (symbol, as_of_date, ...)` — one row per symbol per quarterly earnings reporting. Refresh from EODHD's historical fundamentals endpoint. Strategies use `market_cap_percentile(symbol, as_of)` with a real `as_of` parameter that picks the most-recent snapshot at-or-before that date.
+**Fix:** extend `fundamentals_history` with sector/industry per period (EODHD's historical fundamentals payload carries them) and have the composite builder use the sector as of each date.
 
-**Why deferred:** a few hundred extra API calls and ~10× the storage for fundamentals (mostly negligible). The current bias is small for 1–3 year windows; gets worse for longer historical backtests. Phase 5 cleanup.
-
-### Signal-detail technical breakdown view
-
-**Current state:** technical scores persist a `breakdown` JSONB with each indicator's raw values + sub-score, but the UI only shows the composite.
-
-**What's missing:** a per-signal page section that renders the breakdown — e.g., "RSI: 28.4 → +0.72; MACD histogram: +0.45 (rising) → +0.55. Composite: +0.64." Useful for understanding *why* a signal got the score it did.
-
-**Where it goes:** signals/detail.html, between the existing "Signal" card and the action buttons. Data is already there in `signals.metadata` joined to `technical_scores.breakdown`.
-
-**Why deferred:** known nice-to-have, called out in v0.7 changelog. ~half day of UI work.
+**Why deferred:** sector reclassifications are rare in the S&P 500; the effect on a sector-relative rank is second-order. Phase 5 cleanup.
 
 ### Cross-symbol "find similar setup" historical search
 
@@ -391,25 +175,17 @@ Estimated effort: ~3–4 days. UI is the bulk of the work (per-symbol expandable
 
 **Why deferred:** valuable but additive. The per-symbol view answers "should I take this trade on this name today" which is the most common operator question. Cross-symbol view is a research tool. Phase 5.
 
-### ~~Parameter-sweep UI~~ → subsumed by the strategy optimizer (see "High-impact")
-
-The standalone parameter-sweep idea is replaced by the optimizer entry above. The optimizer's web UI at `/optimizations/{id}` includes the parameter-scatter visualization that was the core of this idea, plus the validation hygiene that a naive sweep would lack.
-
 ---
 
 ## Smaller items
 
-### Watchlist remove → Dashboard pill auto-flip
+### On-device verification of the Compose build and background Fetch Latest
 
-When you remove a symbol from `/watchlist`, the Dashboard pill stays "✓ watching" until you reload `/`. Fix: make the Dashboard pill itself an HTMX delete-form so clicking it toggles back to "+ Watch" without a navigate. ~30 minutes.
+Left over from the 2026-06 hardening pass, which ran in a sandbox without a Docker daemon: run `docker compose build` on the Mac mini and click through the background-refresh UX (POST `/signals/refresh` → status polling → swap) on a phone.
 
 ### Filter-table-by-selected-symbol on Backtest detail
 
 The backtest detail page chart picker focuses ONE symbol's chart, but the trade log below shows ALL symbols. For multi-symbol runs it'd be cleaner to filter the table when a symbol is selected. Add `?show=selected` flag.
-
-### Strategy parameter-edit UI
-
-Pydantic schemas already render in the strategies/detail.html as raw JSON. Wiring up an HTML form generated from the schema would let operators tweak strategy params without editing Python. ~1 day.
 
 ### Mobile UI polish on the new backtest chart
 
@@ -422,12 +198,6 @@ Currently the entry/exit prompts are hardcoded ("Thesis", "What invalidates this
 ### Notification quiet hours
 
 Discord alerts at 2am for a midnight reconciliation pass would be annoying. Add a quiet-hours config that suppresses non-critical alerts outside trading hours. Minor.
-
-### Bulk-refresh fundamentals on a schedule
-
-`stockscan refresh fundamentals` is manual. Adding `infra/launchd/com.stockscan.fundamentals-refresh.plist` to run weekly (Sunday 03:00 ET) would keep the data fresh without manual intervention. Trivial — clone an existing plist.
-
----
 
 ## Phase 4 + 5 (not deferred — just upcoming)
 
@@ -443,13 +213,16 @@ These are the planned next phases per DESIGN.md §11 and aren't really TODOs in 
 These items started as "nice to have someday" and have shipped:
 
 - ~~Watchlist with price-target alerts~~ ✓ shipped
-- ~~Technical confirmation score (per-strategy, signed)~~ ✓ shipped
 - ~~Fundamentals snapshot layer + market_cap_percentile~~ ✓ shipped
-- ~~Largecap Rebound strategy (counter-trend on quality)~~ ✓ shipped
 - ~~Bulk EOD endpoint for fast daily refresh~~ ✓ shipped
 - ~~Per-symbol price chart with entry/exit markers in backtest detail~~ ✓ shipped
 - ~~R-multiple ("return on risk") on backtest trades~~ ✓ shipped
 - ~~Mobile-first responsive UI~~ ✓ shipped
 - ~~Strategy plugin system with auto-discovery~~ ✓ shipped
-- ~~Beginner-friendly strategy manuals~~ ✓ shipped (RSI(2), Donchian; Largecap Rebound's manual is still the placeholder)
+- ~~Beginner-friendly strategy manuals~~ ✓ shipped (both strategies)
 - ~~Custom SQL migration runner (replaced Alembic)~~ ✓ shipped
+- ~~Financial news integration (EODHD /news)~~ ✓ shipped (feed + on-demand reader; the `/news` page and sentiment push alerts were not built)
+- ~~Market-regime layer~~ ✓ shipped as trend gate + vol scalar + credit breaker (see `market_regime_detection.md`) — the "run only regime-appropriate strategies" idea was replaced by gating new entries and per-strategy vol scaling
+- ~~Volatility-managed sizing overlay (Moreira-Muir)~~ ✓ shipped as the regime vol scalar, applied per strategy via `sizes_down_in_high_vol`
+- ~~Weekly fundamentals refresh on a schedule~~ ✓ shipped (`infra/crontab`, Sun 03:00 ET)
+- ~~Point-in-time shares outstanding~~ ✓ shipped (`fundamentals_history`, migration 0023)

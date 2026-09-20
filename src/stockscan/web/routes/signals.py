@@ -380,28 +380,24 @@ def signal_detail(
 
     Pulls together (1) the signal row + JSONB strategy metadata (which
     carries the strategy-owned score breakdown), (2) the regime row at
-    the same as_of_date for component-level context, (3) the
-    strategy_configs row for the exact params used at scan time, and
-    (4) the strategy class itself so we can show the regime-affinity
-    table and the human-readable manual.
+    the same as_of_date for the trend gate / vol scalar / credit-stress
+    context, and (3) the strategy class itself for its sizing rule and
+    the human-readable manual.
 
     Each lookup soft-fails to ``None`` so a missing row in any one
     table never blanks out the whole page.
     """
     discover_strategies()
 
-    # ---- 1. The signal itself, joined with its run metadata.
+    # ---- 1. The signal itself.
     sig_sql = text(
         """
-        SELECT s.signal_id, s.run_id, s.strategy_name,
+        SELECT s.signal_id, s.strategy_name,
                s.strategy_version, s.symbol, s.side, s.score, s.status,
                s.as_of_date, s.suggested_entry, s.suggested_stop,
                s.suggested_target, s.suggested_qty, s.rejected_reason,
-               s.metadata,
-               r.universe_size, r.signals_emitted, r.rejected_count,
-               r.run_at
+               s.metadata
         FROM signals s
-        LEFT JOIN strategy_runs    r ON r.run_id    = s.run_id
         WHERE s.signal_id = :sid
         """
     )
@@ -421,7 +417,7 @@ def signal_detail(
         label=f"signal_detail[{signal_id}].get_regime",
     )
 
-    # ---- 3. The strategy class — used for affinity lookups, the
+    # ---- 3. The strategy class — its sizing rule, the
     #         description-and-manual block, and parameter-schema.
     strategy_cls: type[Strategy] | None
     try:
@@ -431,7 +427,7 @@ def signal_detail(
         strategy_cls = None
 
     # ---- 4. Derived sizing breakdown — only meaningful when we have
-    #         both a strategy class (for affinity) and a regime row.
+    #         both a strategy class (for its sizing rule) and a regime row.
     sizing_breakdown: dict[str, object] | None = _sizing_breakdown(
         signal, strategy_cls, regime
     )
@@ -451,33 +447,31 @@ def _sizing_breakdown(
     strategy_cls: type[Strategy] | None,
     regime: MarketRegime | None,
 ) -> dict[str, object] | None:
-    """Re-derive the regime-multiplier components that produced this signal's qty.
+    """Re-derive how the regime layer touched this signal's size.
 
-    The runner computes ``qty = base_qty x affinity x composite_mult x
-    stress_mult`` — but only the final qty is persisted. We can reconstruct
-    the multiplier components from the strategy's affinity table and the
-    regime row, which is what makes "why did I get THIS many shares?"
-    answerable on the detail page.
+    The runner sizes each signal by the strategy's own rule (risk against
+    the stop, or a fixed fraction of equity) and then, for strategies that
+    opt in, multiplies by the day's vol scalar; new longs are refused
+    outright while the trend gate is closed or credit stress fires. Only
+    the final qty is persisted, so the components are rebuilt here from
+    the strategy class and the regime row.
 
     Returns ``None`` when either input is missing — the template renders
     a "regime data unavailable" note in that case rather than zeros.
     """
     if strategy_cls is None or regime is None:
         return None
-
-    label = regime.regime
-    affinity = float(strategy_cls.affinity_for(label))
-    composite_dec = regime.composite_score
-    composite = float(composite_dec) if composite_dec is not None else None
-    composite_mult = 0.5 + 0.5 * composite if composite is not None else 1.0
-    stress_mult = 0.5 if regime.credit_stress_flag else 1.0
-    multiplier = affinity * composite_mult * stress_mult
+    applies = strategy_cls.sizes_down_in_high_vol
     return {
-        "regime_label": label,
-        "affinity": affinity,
-        "composite": composite,
-        "composite_mult": composite_mult,
-        "stress_mult": stress_mult,
-        "multiplier": multiplier,
-        "block_new_longs": bool(regime.credit_stress_flag) and signal.side == "long",
+        "regime_label": regime.regime,
+        "sizing_rule": (
+            f"fixed {strategy_cls.position_pct:.0%} of equity"
+            if strategy_cls.position_pct is not None
+            else f"risk {strategy_cls.default_risk_pct:.2%} of equity against the stop"
+        ),
+        "trend_gate_open": regime.trend_gate_open,
+        "vol_scalar": regime.vol_multiplier if applies else 1.0,
+        "vol_scalar_applies": applies,
+        "credit_stress": regime.credit_stress_flag,
+        "block_new_longs": regime.block_new_longs and signal.side == "long",
     }

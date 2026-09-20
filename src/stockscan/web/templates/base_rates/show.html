@@ -5,7 +5,7 @@
 
 {% block content %}
 {% if not signal %}
-  {{ empty("Signal not found.", "❓") }}
+  {{ empty("Signal not found.") }}
   <div class="mt-4">{{ back_link("/signals", "Back to signals") }}</div>
 {% else %}
 <div class="space-y-6">
@@ -88,7 +88,7 @@
       {% endcall %}
     {% endif %}
   {% else %}
-    {{ empty("Strategy never fired on this symbol in the historical window.", "🤷") }}
+    {{ empty("Strategy never fired on this symbol in the historical window.") }}
   {% endif %}
 
   <a href="/signals/{{ signal.signal_id }}" class="inline-flex items-center px-4 py-2 rounded border border-ink-300 text-sm">

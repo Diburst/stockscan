@@ -37,12 +37,7 @@ class OptionProposal:
     # Context that drove the proposal.
     day_move_pct: float | None
     days_to_earnings: int | None
-    confluence_count: int
-    pct_to_threat: float | None  # distance to the threatened level (R for call, S for put)
+    confluence_count: int  # key EMAs within 0.5×ATR of the strike
     trend_bucket: str
     rationale: str
-    # Context flag (NOT scored): current price is itself sitting at the level
-    # it's selling against — support for a put, resistance for a call. The
-    # "price at confirmed level" timing signal, surfaced as a callout.
-    price_at_level: bool = False
     score_breakdown: dict[str, Any] = field(default_factory=dict)

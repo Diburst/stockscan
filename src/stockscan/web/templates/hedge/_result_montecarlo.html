@@ -1,4 +1,4 @@
-{% macro money(v) %}<span class="{{ 'text-ok-600' if v >= 0 else 'text-bad-600' }}">{{ "{:+,.0f}".format(v) }}</span>{% endmacro %}
+{% from "_macros.html" import money %}
 {% set m = result.mc %}{% set h = result.hist %}
 <h2 class="text-sm font-semibold text-ink-700 mb-2">Result — Monte Carlo · {{ m.n_paths }} paths · {{ result.spec.option }}</h2>
 
@@ -6,7 +6,7 @@
   <div class="bg-white rounded-xl shadow-sm border border-ink-300/40 p-3">
     <div class="text-xs text-ink-500">Net P&L mean / median</div>
     <div class="text-lg tabular-nums font-semibold">{{ money(m.net_pnl.mean) }} / {{ money(m.net_pnl.median) }}</div>
-    <div class="text-xs text-ink-400">std ${{ "{:,.0f}".format(m.net_pnl.std) }}</div>
+    <div class="text-xs text-ink-400">std ${{ money(m.net_pnl.std, signed=False) }}</div>
   </div>
   <div class="bg-white rounded-xl shadow-sm border border-ink-300/40 p-3">
     <div class="text-xs text-ink-500">5th – 95th pct</div>
@@ -20,7 +20,7 @@
   </div>
   <div class="bg-white rounded-xl shadow-sm border border-ink-300/40 p-3">
     <div class="text-xs text-ink-500">Avg trades / cost</div>
-    <div class="text-lg tabular-nums">{{ m.avg_trades }} · <span class="text-ink-500">${{ "{:,.0f}".format(m.avg_cost) }}</span></div>
+    <div class="text-lg tabular-nums">{{ m.avg_trades }} · <span class="text-ink-500">${{ money(m.avg_cost, signed=False) }}</span></div>
     <div class="text-xs text-ink-400">opt {{ money(m.avg_option_pnl) }} · hdg {{ money(m.avg_hedge_pnl) }}</div>
   </div>
 </div>

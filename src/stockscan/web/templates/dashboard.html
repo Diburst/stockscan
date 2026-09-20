@@ -1,5 +1,5 @@
 {% extends "base.html" %}
-{% from "_macros.html" import card, badge, empty, stat %}
+{% from "_macros.html" import card, badge, empty, stat, table_open, table_close, mobile_list_open, mobile_list_close, signal_row %}
 
 {% block title %}Dashboard{% endblock %}
 
@@ -38,10 +38,23 @@
   {% endif %}
 {% endmacro %}
 
+{# One Calendar & Cycles cell: label, headline, up to two detail lines. #}
+{% macro cycle_cell(label, headline, line1="", line2="", ring=False) %}
+  <div class="bg-ink-100/40 border border-ink-300/40 rounded-lg p-3 {% if ring %}ring-2 ring-ok-600/30{% endif %}">
+    <div class="text-xs uppercase tracking-wide text-ink-500">{{ label }}</div>
+    <div class="text-lg font-semibold mt-1">{{ headline }}</div>
+    {% if line1 %}<div class="text-sm mt-0.5">{{ line1 }}</div>{% endif %}
+    {% if line2 %}<div class="text-xs text-ink-500 mt-1">{{ line2 }}</div>{% endif %}
+  </div>
+{% endmacro %}
+
 {% block content %}
+{%- set features = data_features() -%}
+{%- set feeds_off = ['universe', 'fundamentals', 'news', 'calendar', 'insider', 'econ_events'] | reject('in', features) | list -%}
+{%- set health_degraded = (not health.ok) or (not health.timescaledb) or health.timescaledb == "(missing)" -%}
 <div class="space-y-6">
 
-  <!-- Headline numbers -->
+  {# Headline numbers #}
   <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
     <div class="bg-white rounded-xl shadow-sm border border-ink-300/40 p-4">
       {{ stat("Equity",
@@ -49,373 +62,182 @@
         sub=("as of " ~ equity.as_of_date) if equity else "no NAV history yet") }}
     </div>
     <div class="bg-white rounded-xl shadow-sm border border-ink-300/40 p-4">
-      {{ stat("Cash",
-        "${:,.0f}".format(equity.cash|float) if equity else "—") }}
-    </div>
-    <div class="bg-white rounded-xl shadow-sm border border-ink-300/40 p-4">
       {{ stat("Open positions", open_trades|length) }}
     </div>
     <div class="bg-white rounded-xl shadow-sm border border-ink-300/40 p-4">
-      {% set strategy_names = strategies|map(attribute='name')|join(', ') %}
-      {{ stat("Strategies", strategies|length,
-              sub=strategy_names if strategies else "none registered") }}
+      {{ stat("Passing signals", passing_count,
+              sub=("as of " ~ passing_as_of) if passing_as_of else "no scans yet",
+              kind="ok" if passing_count else "neutral") }}
+    </div>
+    <div class="bg-white rounded-xl shadow-sm border border-ink-300/40 p-4">
+      {% if regime %}
+        {{ stat("Regime", regime.regime | replace("_", " "),
+                sub="no new longs" if regime.block_new_longs else "new entries allowed",
+                kind={'risk_on': 'ok', 'risk_off': 'warn', 'credit_stress': 'bad'}.get(regime.regime, 'neutral')) }}
+      {% else %}
+        {{ stat("Regime", "—", sub="not computed yet") }}
+      {% endif %}
     </div>
   </div>
 
-  <!-- ============================================================
-       Market Regime card — DESIGN §regime
-       Extracted to _regime_card.html so the refresh route can render
-       the same surface via POST /regime/refresh.
-       ============================================================ -->
   {% include "_regime_card.html" %}
 
-  <!-- ============================================================
-       Calendar & Cycles card — broad seasonal / cyclical context
-       on top of the regime composite. All indicators are descriptive,
-       not prescriptive — each is bench-marked against historical
-       averages so the user can see whether today's calendar moment
-       is favorable or unfavorable in the long-run distribution.
-       ============================================================ -->
+  {# Latest scan — passing signals from the most recent current-version scan date #}
+  {% call card(
+       title="Latest scan" ~ (" · " ~ passing_as_of if passing_as_of else ""),
+       subtitle=(passing_count ~ " passing" if passing_as_of else "No scans yet")
+  ) %}
+    {% if signals %}
+      {{ table_open([
+          {"label": "Symbol"}, {"label": "Side"}, {"label": "Strategy"},
+          {"label": "Score", "align": "right"}, {"label": "Entry", "align": "right"},
+          {"label": "Stop", "align": "right"}, {"label": "Qty", "align": "right"},
+          {"label": "Date"}, {"label": "", "align": "right"},
+      ]) }}
+        {% for sig in signals %}
+          {{ signal_row(sig, actions=watch_button(sig.symbol, watching=watching)) }}
+        {% endfor %}
+      {{ table_close() }}
+      {{ mobile_list_open() }}
+        {% for sig in signals %}
+          {{ signal_row(sig, mobile=True, actions=watch_button(sig.symbol, watching=watching)) }}
+        {% endfor %}
+      {{ mobile_list_close() }}
+    {% else %}
+      {{ empty("No passing signals — click ⟳ Refresh on the Signals page or run `stockscan scan run rsi2_meanrev`.") }}
+    {% endif %}
+    <div class="mt-3 text-right">
+      <a href="/signals" class="text-xs text-ink-500 hover:text-ink-900 underline">All signals →</a>
+    </div>
+  {% endcall %}
+
+  {# Open positions #}
+  {% call card(title="Open positions") %}
+    {% if open_trades %}
+      <ul class="divide-y divide-ink-300/40 -mx-4">
+        {% for t in open_trades %}
+          <li class="px-4 py-2.5 flex items-center justify-between">
+            <div>
+              <a href="/analysis/{{ t.symbol }}" class="font-mono font-semibold hover:underline"
+                 title="Open analysis for {{ t.symbol }}">{{ t.symbol }}</a>
+              <div class="text-xs text-ink-500">{{ t.strategy }} · opened {{ t.opened_at.date() }}</div>
+            </div>
+            <div class="flex items-center gap-3 flex-shrink-0">
+              {{ watch_button(t.symbol, watching=watching) }}
+              <a href="/trades/{{ t.trade_id }}" class="text-xs text-ink-700 underline" title="Open trade detail">Open</a>
+            </div>
+          </li>
+        {% endfor %}
+      </ul>
+    {% else %}
+      <p class="text-sm text-ink-500">No open positions.</p>
+    {% endif %}
+  {% endcall %}
+
+  {# Calendar & Cycles — descriptive seasonal context. Tier 1 as cells,
+     Tier 2 as one line. #}
   {% if calendar_state %}
   {% set cs = calendar_state %}
   {% call card(
        title="Calendar & Cycles",
-       subtitle="Seasonal + cyclical context. Descriptive (not predictive) — read alongside Market Regime above.",
+       subtitle="Descriptive, not predictive — read alongside Market Regime. Local SPY bars; Presidential and decennial averages are Almanac reference values.",
   ) %}
-    {# ----- Tier 1 row: the four strongest signals ----- #}
-    <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
-
-      {# 1. Monthly seasonality #}
+    <div class="grid grid-cols-2 lg:grid-cols-4 gap-3">
       {%- set ms = cs.monthly_seasonality -%}
-      <div class="bg-ink-100/40 border border-ink-300/40 rounded-lg p-3">
-        <div class="text-xs uppercase tracking-wide text-ink-500">Monthly seasonality</div>
-        <div class="text-lg font-semibold mt-1">{{ ms.month_name }}</div>
-        {% if ms.available %}
-          {%- set rate = ms.positive_rate -%}
-          {%- set rate_color = 'ok-600' if rate >= 0.65 else ('bad-600' if rate <= 0.35 else 'ink-700') -%}
-          <div class="text-sm text-{{ rate_color }} mt-0.5">
-            <span class="font-mono">{{ ms.n_positive }} / {{ ms.n_observations }}</span>
-            green · {{ "%.0f%%"|format(100 * rate) }}
-          </div>
-          {%- set avg_color = 'ok-600' if ms.avg_return_pct > 0 else 'bad-600' -%}
-          <div class="text-xs text-ink-500 mt-1">
-            avg <span class="font-mono text-{{ avg_color }}">{{ "%+.2f%%"|format(ms.avg_return_pct) }}</span>
-            · since {{ ms.earliest_year }}
-          </div>
-        {% else %}
-          <div class="text-xs text-ink-400 italic mt-1">insufficient SPY history</div>
-        {% endif %}
-      </div>
+      {% if ms.available %}
+        {%- set rate_color = 'text-ok-600' if ms.positive_rate >= 0.65 else ('text-bad-600' if ms.positive_rate <= 0.35 else 'text-ink-700') -%}
+        {{ cycle_cell("Monthly seasonality", ms.month_name,
+            ('<span class="%s"><span class="font-mono">%d / %d</span> green · %.0f%%</span>'|format(rate_color, ms.n_positive, ms.n_observations, 100 * ms.positive_rate))|safe,
+            ('avg <span class="font-mono %s">%+.2f%%</span> · since %s'|format('text-ok-600' if ms.avg_return_pct > 0 else 'text-bad-600', ms.avg_return_pct, ms.earliest_year))|safe) }}
+      {% else %}
+        {{ cycle_cell("Monthly seasonality", ms.month_name, line2="insufficient SPY history") }}
+      {% endif %}
 
-      {# 2. Halloween window #}
       {%- set hs = cs.halloween -%}
-      <div class="bg-ink-100/40 border border-ink-300/40 rounded-lg p-3">
-        <div class="text-xs uppercase tracking-wide text-ink-500">Halloween window</div>
-        <div class="text-lg font-semibold mt-1">
-          {%- if hs.in_winter_window -%}
-            <span class="text-ok-600">Nov–Apr</span> <span class="text-xs text-ink-500 font-normal">(strong)</span>
-          {%- else -%}
-            <span class="text-warn-600">May–Oct</span> <span class="text-xs text-ink-500 font-normal">(weak)</span>
-          {%- endif -%}
-        </div>
-        {% if hs.available %}
-          {%- set hs_color = 'ok-600' if hs.historical_avg_pct > 0 else 'bad-600' -%}
-          <div class="text-sm mt-0.5">
-            avg <span class="font-mono text-{{ hs_color }}">{{ "%+.2f%%"|format(hs.historical_avg_pct) }}</span>
-          </div>
-          <div class="text-xs text-ink-500 mt-1">
-            <span class="font-mono">{{ "%.0f%%"|format(100 * hs.historical_positive_rate) }}</span>
-            positive · {{ hs.n_observations }} obs since {{ hs.earliest_year }}
-          </div>
-        {% else %}
-          <div class="text-xs text-ink-400 italic mt-1">insufficient history</div>
-        {% endif %}
-      </div>
+      {%- set hs_head = ('<span class="text-ok-600">Nov–Apr</span> <span class="text-xs text-ink-500 font-normal">(strong)</span>' if hs.in_winter_window else '<span class="text-warn-600">May–Oct</span> <span class="text-xs text-ink-500 font-normal">(weak)</span>')|safe -%}
+      {% if hs.available %}
+        {{ cycle_cell("Halloween window", hs_head,
+            ('avg <span class="font-mono %s">%+.2f%%</span>'|format('text-ok-600' if hs.historical_avg_pct > 0 else 'text-bad-600', hs.historical_avg_pct))|safe,
+            ('<span class="font-mono">%.0f%%</span> positive · %d obs since %s'|format(100 * hs.historical_positive_rate, hs.n_observations, hs.earliest_year))|safe) }}
+      {% else %}
+        {{ cycle_cell("Halloween window", hs_head, line2="insufficient history") }}
+      {% endif %}
 
-      {# 3. Presidential cycle #}
       {%- set ps = cs.presidential -%}
-      <div class="bg-ink-100/40 border border-ink-300/40 rounded-lg p-3
-                  {% if ps.is_strongest_year %}ring-2 ring-ok-600/30{% endif %}">
-        <div class="text-xs uppercase tracking-wide text-ink-500">Presidential cycle</div>
-        <div class="text-lg font-semibold mt-1">
-          Year {{ ps.year_of_cycle }}
-          <span class="text-xs text-ink-500 font-normal">({{ ps.label }})</span>
-        </div>
-        {% if ps.available %}
-          {%- set ps_color = 'ok-600' if ps.historical_avg_pct > 0 else 'bad-600' -%}
-          <div class="text-sm mt-0.5">
-            avg <span class="font-mono text-{{ ps_color }}">{{ "%+.1f%%"|format(ps.historical_avg_pct) }}</span>
-            · {{ "%.0f%%"|format(100 * ps.historical_positive_rate) }} pos
-          </div>
-          <div class="text-xs text-ink-500 mt-1">
-            since 1928 · {% if ps.is_strongest_year %}<span class="text-ok-600 font-semibold">historically strongest</span>{% else %}reference avg{% endif %}
-          </div>
-        {% endif %}
-      </div>
+      {{ cycle_cell("Presidential cycle",
+          ('Year %d <span class="text-xs text-ink-500 font-normal">(%s)</span>'|format(ps.year_of_cycle, ps.label))|safe,
+          ('avg <span class="font-mono %s">%+.1f%%</span> · %.0f%% pos'|format('text-ok-600' if ps.historical_avg_pct > 0 else 'text-bad-600', ps.historical_avg_pct, 100 * ps.historical_positive_rate))|safe if ps.available else "",
+          ("since 1928 · " ~ ('<span class="text-ok-600 font-semibold">historically strongest</span>' if ps.is_strongest_year else 'reference avg'))|safe if ps.available else "",
+          ring=ps.is_strongest_year) }}
 
-      {# 4. Drawdown / corrections #}
       {%- set dd = cs.drawdown -%}
-      <div class="bg-ink-100/40 border border-ink-300/40 rounded-lg p-3">
-        <div class="text-xs uppercase tracking-wide text-ink-500">SPY drawdown</div>
-        {% if dd.available and dd.drawdown_pct is not none %}
-          {%- set dd_color = 'ok-600' if dd.drawdown_pct >= -2 else ('warn-600' if dd.drawdown_pct >= -10 else 'bad-600') -%}
-          <div class="text-lg font-semibold mt-1 text-{{ dd_color }} font-mono">
-            {{ "%.2f%%"|format(dd.drawdown_pct) }}
-          </div>
-          <div class="text-xs text-ink-500 mt-0.5">
-            ATH {{ dd.ath_date }} ({{ dd.days_since_ath }}d ago)
-          </div>
-          <div class="text-xs text-ink-500 mt-1 leading-snug">
-            since 10% pullback:
-            {% if dd.correction_10pct.days_since is not none %}
-              {%- set c10 = dd.correction_10pct -%}
-              <span class="font-mono">{{ c10.days_since }}d</span>
-              {% if c10.gap_percentile is not none %}
-                · {{ c10.gap_percentile|round|int }}th pct
-                {% if c10.gap_percentile >= 80 %}<span class="text-warn-600">overdue</span>{% endif %}
-                <span class="block text-ink-400">vs {{ c10.n_historical_gaps }} prior gaps · median {{ c10.median_gap_days }}d</span>
-              {% endif %}
-            {% else %}<span class="text-ok-600">none on file</span>{% endif %}
-          </div>
+      {% if dd.available and dd.drawdown_pct is not none %}
+        {%- set dd_color = 'text-ok-600' if dd.drawdown_pct >= -2 else ('text-warn-600' if dd.drawdown_pct >= -10 else 'text-bad-600') -%}
+        {%- set c10 = dd.correction_10pct -%}
+        {% if c10.days_since is not none %}
+          {%- set c10_line = ('since 10%% pullback: <span class="font-mono">%dd</span>'|format(c10.days_since)) -%}
+          {% if c10.gap_percentile is not none %}
+            {%- set c10_line = c10_line ~ (' · pct rank %d vs %d prior (median %dd)'|format(c10.gap_percentile|round|int, c10.n_historical_gaps, c10.median_gap_days)) -%}
+            {% if c10.gap_percentile >= 80 %}{%- set c10_line = c10_line ~ ' <span class="text-warn-600">overdue</span>' -%}{% endif %}
+          {% endif %}
         {% else %}
-          <div class="text-xs text-ink-400 italic mt-1">insufficient SPY history</div>
+          {%- set c10_line = 'since 10% pullback: <span class="text-ok-600">none on file</span>' -%}
         {% endif %}
-      </div>
+        {{ cycle_cell("SPY drawdown",
+            ('<span class="font-mono %s">%.2f%%</span>'|format(dd_color, dd.drawdown_pct))|safe,
+            ('<span class="text-xs text-ink-500">ATH %s (%dd ago)</span>'|format(dd.ath_date, dd.days_since_ath))|safe,
+            c10_line|safe) }}
+      {% else %}
+        {{ cycle_cell("SPY drawdown", "—", line2="insufficient SPY history") }}
+      {% endif %}
     </div>
 
-    {# ----- Tier 2 row: smaller state indicators ----- #}
-    <div class="mt-4 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-3">
-      {# Breadth — pulled to the front of Tier 2 because it's the only
-         live-state read on this row. #}
-      {%- set b = cs.breadth -%}
-      <div class="bg-ink-100/40 border border-ink-300/40 rounded-lg p-3">
-        <div class="text-xs uppercase tracking-wide text-ink-500">Breadth (above SMA200)</div>
-        {% if b.available %}
-          {%- set b_color = 'ok-600' if b.kind == 'ok' else ('warn-600' if b.kind == 'warn' else 'bad-600') -%}
-          <div class="text-lg font-semibold mt-1 text-{{ b_color }} font-mono">
-            {{ "%.0f%%"|format(b.pct_above_sma200) }}
-          </div>
-          <div class="text-xs text-ink-500 mt-0.5">
-            {{ b.n_above_sma200 }} of {{ b.n_total }} · {{ b.label }}
-          </div>
-        {% else %}
-          <div class="text-xs text-ink-400 italic mt-1">insufficient bars history</div>
-        {% endif %}
-      </div>
-
-      {# Turn of month #}
-      {%- set tom = cs.turn_of_month -%}
-      <div class="bg-ink-100/40 border border-ink-300/40 rounded-lg p-3"
-           title="{{ tom.explanation }}">
-        <div class="text-xs uppercase tracking-wide text-ink-500">Turn of month</div>
-        {% if tom.in_window %}
-          <div class="text-lg font-semibold mt-1 text-ok-600">in window</div>
-          <div class="text-xs text-ink-500 mt-0.5">day {{ tom.days_into_window + 1 }} / 5</div>
-        {% else %}
-          <div class="text-lg font-semibold mt-1 text-ink-500">out</div>
-          {% if tom.next_window_start %}
-            <div class="text-xs text-ink-500 mt-0.5">opens {{ tom.next_window_start }}</div>
-          {% endif %}
-        {% endif %}
-      </div>
-
-      {# Santa Claus #}
-      {%- set sc = cs.santa_claus -%}
-      <div class="bg-ink-100/40 border border-ink-300/40 rounded-lg p-3"
-           title="{{ sc.explanation }}">
-        <div class="text-xs uppercase tracking-wide text-ink-500">Santa Claus</div>
-        {% if sc.in_window %}
-          <div class="text-lg font-semibold mt-1 text-ok-600">in window</div>
-          <div class="text-xs text-ink-500 mt-0.5">day {{ sc.days_into_window + 1 }} / 7</div>
-        {% else %}
-          <div class="text-lg font-semibold mt-1 text-ink-500">out</div>
-          {% if sc.next_window_start %}
-            <div class="text-xs text-ink-500 mt-0.5">opens {{ sc.next_window_start }}</div>
-          {% endif %}
-        {% endif %}
-      </div>
-
-      {# January Barometer #}
-      {%- set jb = cs.january_barometer -%}
-      <div class="bg-ink-100/40 border border-ink-300/40 rounded-lg p-3"
-           title="{% if jb.sign_match_rate %}Sign of January's return matched the full year's sign in {{ '%.0f%%'|format(100 * jb.sign_match_rate) }} of the {{ jb.n_observations }} observations on file.{% endif %}">
-        <div class="text-xs uppercase tracking-wide text-ink-500">January Barometer</div>
+    {# Tier 2: one line of smaller state indicators. #}
+    {%- set tom = cs.turn_of_month -%}
+    {%- set sc = cs.santa_claus -%}
+    {%- set jb = cs.january_barometer -%}
+    {%- set dx = cs.decennial -%}
+    <div class="mt-3 text-xs text-ink-500 flex flex-wrap gap-x-4 gap-y-1">
+      <span title="{{ tom.explanation }}">Turn of month:
+        {% if tom.in_window %}<span class="text-ok-600 font-semibold">in window</span> (day {{ tom.days_into_window + 1 }}/5)
+        {% else %}out{% if tom.next_window_start %} · opens {{ tom.next_window_start }}{% endif %}{% endif %}
+      </span>
+      <span title="{{ sc.explanation }}">Santa Claus:
+        {% if sc.in_window %}<span class="text-ok-600 font-semibold">in window</span> (day {{ sc.days_into_window + 1 }}/7)
+        {% else %}out{% if sc.next_window_start %} · opens {{ sc.next_window_start }}{% endif %}{% endif %}
+      </span>
+      <span title="{% if jb.sign_match_rate %}Sign of January's return matched the full year's sign in {{ '%.0f%%'|format(100 * jb.sign_match_rate) }} of the {{ jb.n_observations }} observations on file.{% endif %}">January Barometer:
         {% if jb.january_complete and jb.january_return_pct is not none %}
-          {%- set jb_color = 'ok-600' if jb.january_was_positive else 'bad-600' -%}
-          <div class="text-lg font-semibold mt-1 text-{{ jb_color }} font-mono">
-            {{ "%+.2f%%"|format(jb.january_return_pct) }}
-          </div>
-          <div class="text-xs text-ink-500 mt-0.5">
-            Jan {{ jb.current_year }}{% if jb.sign_match_rate %} · {{ "%.0f%%"|format(100 * jb.sign_match_rate) }} hit rate{% endif %}
-          </div>
-        {% else %}
-          <div class="text-lg font-semibold mt-1 text-ink-500">pending</div>
-          <div class="text-xs text-ink-500 mt-0.5">January not yet complete</div>
-        {% endif %}
-      </div>
-
-      {# Decennial #}
-      {%- set dx = cs.decennial -%}
-      <div class="bg-ink-100/40 border border-ink-300/40 rounded-lg p-3
-                  {% if dx.is_strongest_digit %}ring-2 ring-ok-600/30{% endif %}"
-           title="Stock Trader's Almanac decennial pattern (since 1881). Years ending in 5 historically dominate; years ending in 0 underperform. Sample size is one observation per decade so this is trivia, not edge.">
-        <div class="text-xs uppercase tracking-wide text-ink-500">Decennial (year-end {{ dx.year_ending_digit }})</div>
+          <span class="font-mono {{ 'text-ok-600' if jb.january_was_positive else 'text-bad-600' }}">{{ "%+.2f%%"|format(jb.january_return_pct) }}</span>{% if jb.sign_match_rate %} · {{ "%.0f%%"|format(100 * jb.sign_match_rate) }} hit rate{% endif %}
+        {% else %}pending{% endif %}
+      </span>
+      <span title="Stock Trader's Almanac decennial pattern (since 1881). One observation per decade — trivia, not edge.">Decennial (year-end {{ dx.year_ending_digit }}):
         {% if dx.available %}
-          {%- set dx_color = 'ok-600' if dx.historical_avg_pct > 0 else 'bad-600' -%}
-          <div class="text-lg font-semibold mt-1 text-{{ dx_color }} font-mono">
-            {{ "%+.1f%%"|format(dx.historical_avg_pct) }}
-          </div>
-          <div class="text-xs text-ink-500 mt-0.5">
-            {% if dx.is_strongest_digit %}<span class="text-ok-600 font-semibold">historically strongest digit</span>{% else %}long-run avg since 1881{% endif %}
-          </div>
-        {% endif %}
-      </div>
+          <span class="font-mono {{ 'text-ok-600' if dx.historical_avg_pct > 0 else 'text-bad-600' }}">{{ "%+.1f%%"|format(dx.historical_avg_pct) }}</span>{% if dx.is_strongest_digit %} · <span class="text-ok-600 font-semibold">strongest digit</span>{% endif %}
+        {% else %}—{% endif %}
+      </span>
     </div>
 
-    {# Failure footer — only renders when an indicator hard-failed. #}
     {% if cs.failures %}
       <div class="mt-3 text-xs text-ink-400 italic">
-        Indicators with errors: {{ cs.failures | join(', ') }}
-        (these defaulted to 'unavailable'; check the FastAPI logs).
-      </div>
-    {% endif %}
-
-    <div class="mt-3 text-xs text-ink-500 leading-relaxed">
-      All data-driven stats are computed from local SPY bars and current
-      S&P 500 constituents — coverage depends on
-      <code class="bg-ink-100 px-1 rounded">stockscan refresh bars</code>
-      history. The Presidential cycle and decennial averages are hardcoded
-      reference values from <em>Stock Trader's Almanac</em> (since 1928 and
-      1881 respectively).
-    </div>
-  {% endcall %}
-  {% endif %}
-
-  <!-- ============================================================
-       Index Structure card — SPY-level technical indicators with
-       interpretation. Three readings (ADX, Bollinger %B, BB width
-       percentile) chosen because each has either academic support
-       OR is a direct measure of state (rather than predictive
-       pattern-recognition). Each card shows the value, a bucketed
-       label, and a curated flavor-text paragraph explaining what
-       THIS reading means for trend vs. mean-reversion strategies.
-       ============================================================ -->
-  {% if structure_state %}
-  {% set ss = structure_state %}
-  {% call card(
-       title="Index Structure",
-       subtitle="SPY technical state with interpretation. Read alongside Market Regime above.",
-  ) %}
-    <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
-
-      {# ----- 1. ADX(14) ----- #}
-      {%- set a = ss.adx -%}
-      <div class="bg-ink-100/40 border border-ink-300/40 rounded-lg p-4">
-        <div class="flex items-baseline justify-between gap-2 mb-1">
-          <div class="text-xs uppercase tracking-wide text-ink-500">{{ ss.spy_symbol }} ADX(14)</div>
-          {%- if a.kind == 'ok' -%}{{ badge(a.label, "ok") }}
-          {%- elif a.kind == 'warn' -%}{{ badge(a.label, "warn") }}
-          {%- elif a.kind == 'bad' -%}{{ badge(a.label, "bad") }}
-          {%- else -%}{{ badge(a.label, "neutral") }}{%- endif -%}
-        </div>
-        {% if a.available %}
-          {%- set a_color = 'ok-600' if a.kind == 'ok' else ('warn-600' if a.kind == 'warn' else ('bad-600' if a.kind == 'bad' else 'ink-700')) -%}
-          <div class="text-3xl font-mono font-semibold text-{{ a_color }} mt-1">
-            {{ "%.1f"|format(a.value) }}
-          </div>
-        {% else %}
-          <div class="text-3xl font-mono text-ink-400 mt-1">—</div>
-        {% endif %}
-        <p class="text-xs text-ink-700 mt-3 leading-snug">{{ a.explanation }}</p>
-      </div>
-
-      {# ----- 2. Bollinger %B ----- #}
-      {%- set b = ss.bollinger -%}
-      <div class="bg-ink-100/40 border border-ink-300/40 rounded-lg p-4">
-        <div class="flex items-baseline justify-between gap-2 mb-1">
-          <div class="text-xs uppercase tracking-wide text-ink-500">{{ ss.spy_symbol }} Bollinger %B</div>
-          {%- if b.pct_b_kind == 'ok' -%}{{ badge(b.pct_b_label, "ok") }}
-          {%- elif b.pct_b_kind == 'warn' -%}{{ badge(b.pct_b_label, "warn") }}
-          {%- elif b.pct_b_kind == 'bad' -%}{{ badge(b.pct_b_label, "bad") }}
-          {%- else -%}{{ badge(b.pct_b_label, "neutral") }}{%- endif -%}
-        </div>
-        {% if b.available and b.pct_b_value is not none %}
-          {%- set pb_color = 'ok-600' if b.pct_b_kind == 'ok' else ('warn-600' if b.pct_b_kind == 'warn' else ('bad-600' if b.pct_b_kind == 'bad' else 'ink-700')) -%}
-          <div class="text-3xl font-mono font-semibold text-{{ pb_color }} mt-1">
-            {{ "%.2f"|format(b.pct_b_value) }}
-          </div>
-          {# Mini horizontal gauge showing where %B sits in [0, 1].
-             Below 0 clamps to 0; above 1 clamps to the right edge with
-             an indicator. Markers at 0.5 (middle band) and at the band
-             edges. #}
-          {%- set clamped = (b.pct_b_value if b.pct_b_value <= 1.0 else 1.0) if b.pct_b_value >= 0 else 0 -%}
-          <div class="relative h-2 mt-2 rounded-full bg-ink-300/40 overflow-hidden">
-            {# Background bands: lower 20% green-tinted, upper 20% red-tinted #}
-            <div class="absolute inset-y-0 left-0 w-[20%] bg-ok-600/15"></div>
-            <div class="absolute inset-y-0 right-0 w-[20%] bg-bad-600/15"></div>
-            {# Middle marker at 50% #}
-            <div class="absolute inset-y-0 left-1/2 w-px bg-ink-500/50"></div>
-            {# Position indicator #}
-            <div class="absolute top-[-2px] bottom-[-2px] w-1 rounded bg-{{ pb_color }}"
-                 style="left: calc({{ (clamped * 100)|round(1) }}% - 2px);"></div>
-          </div>
-          <div class="flex justify-between text-[10px] text-ink-500 mt-1 font-mono">
-            <span>0.0 (lower)</span>
-            <span>0.5 (mid)</span>
-            <span>1.0 (upper)</span>
-          </div>
-        {% else %}
-          <div class="text-3xl font-mono text-ink-400 mt-1">—</div>
-        {% endif %}
-        <p class="text-xs text-ink-700 mt-3 leading-snug">{{ b.pct_b_explanation }}</p>
-      </div>
-
-      {# ----- 3. BB width percentile ----- #}
-      <div class="bg-ink-100/40 border border-ink-300/40 rounded-lg p-4">
-        <div class="flex items-baseline justify-between gap-2 mb-1">
-          <div class="text-xs uppercase tracking-wide text-ink-500">{{ ss.spy_symbol }} BB width</div>
-          {%- if b.width_kind == 'ok' -%}{{ badge(b.width_label, "ok") }}
-          {%- elif b.width_kind == 'warn' -%}{{ badge(b.width_label, "warn") }}
-          {%- elif b.width_kind == 'bad' -%}{{ badge(b.width_label, "bad") }}
-          {%- else -%}{{ badge(b.width_label, "neutral") }}{%- endif -%}
-        </div>
-        {% if b.available and b.width_percentile is not none %}
-          {%- set w_color = 'ok-600' if b.width_kind == 'ok' else ('warn-600' if b.width_kind == 'warn' else ('bad-600' if b.width_kind == 'bad' else 'ink-700')) -%}
-          <div class="text-3xl font-mono font-semibold text-{{ w_color }} mt-1">
-            {{ "%.0f"|format(b.width_percentile) }}<span class="text-base text-ink-500">%</span>
-          </div>
-          <div class="text-xs text-ink-500 mt-0.5">
-            6-month percentile · raw width <span class="font-mono">{{ "%.4f"|format(b.width_value) }}</span>
-          </div>
-        {% else %}
-          <div class="text-3xl font-mono text-ink-400 mt-1">—</div>
-        {% endif %}
-        <p class="text-xs text-ink-700 mt-3 leading-snug">{{ b.width_explanation }}</p>
-      </div>
-
-    </div>
-
-    {% if ss.failures %}
-      <div class="mt-3 text-xs text-ink-400 italic">
-        Indicators with errors: {{ ss.failures | join(', ') }}
+        Indicators with errors: {{ cs.failures | join(', ') }} (defaulted to unavailable; check the FastAPI logs).
       </div>
     {% endif %}
   {% endcall %}
   {% endif %}
 
-  <!-- Macro this week — economic events calendar (high + medium importance,
-       US-only, next 7 days). Refreshed on the watchlist's "Refresh bars"
-       button so users always see the current week's catalysts. -->
+  {# Macro — US economic releases, next 7 days. #}
+  {% if 'econ_events' in features or macro_events %}
   {% call card(
       title="Macro this week",
-      subtitle="High / medium-importance US economic releases — next 7 days. Refreshes when you click Refresh bars on the Watchlist."
+      subtitle="High / medium-importance US economic releases, next 7 days. Refreshes with Refresh bars on the Watchlist."
   ) %}
     {% if not macro_events %}
-      {{ empty("No upcoming events in the next 7 days, or data not yet refreshed.", "📅") }}
+      <p class="text-sm text-ink-500">No high/medium-importance US releases in the next 7 days, or not yet refreshed.</p>
     {% else %}
       <ul class="divide-y divide-ink-300/40 -mx-4">
         {% for ev in macro_events %}
-          <li class="px-4 py-2.5 flex items-center justify-between gap-3">
+          <li class="px-4 py-2 flex items-center justify-between gap-3">
             <div class="min-w-0 flex-1">
               <div class="flex items-center gap-2 flex-wrap">
                 {%- if ev.importance == 'high' -%}
@@ -454,16 +276,20 @@
       </ul>
     {% endif %}
   {% endcall %}
+  {% endif %}
 
-  <!-- Earnings this week — watchlist symbols reporting in the next 7 days. -->
-  {% if watch_earnings %}
-    {% call card(
-        title="Earnings this week",
-        subtitle="Watched symbols reporting in the next 7 days. BMO = before market open, AMC = after market close."
-    ) %}
+  {# Watched symbols reporting in the next 7 days. #}
+  {% if 'calendar' in features or watch_earnings %}
+  {% call card(
+      title="Earnings this week",
+      subtitle="Watched symbols reporting in the next 7 days. BMO = before market open, AMC = after market close."
+  ) %}
+    {% if not watch_earnings %}
+      <p class="text-sm text-ink-500">No watched symbols report in the next 7 days.</p>
+    {% else %}
       <ul class="divide-y divide-ink-300/40 -mx-4">
         {% for e in watch_earnings %}
-          <li class="px-4 py-2.5 flex items-center justify-between gap-3">
+          <li class="px-4 py-2 flex items-center justify-between gap-3">
             <div class="flex items-center gap-3">
               <a href="/analysis/{{ e.symbol }}"
                  class="font-mono font-semibold hover:underline">{{ e.symbol }}</a>
@@ -489,96 +315,52 @@
           </li>
         {% endfor %}
       </ul>
-    {% endcall %}
+    {% endif %}
+  {% endcall %}
   {% endif %}
 
-  <!-- Market News card (rendered as a partial so the same template is used
-       both on initial page load and as the HTMX target of POST /news/refresh) -->
-  {% include "_news_card.html" %}
+  {% if 'news' in features %}
+    {% include "_news_card.html" %}
+  {% endif %}
 
-  <!-- Latest signals -->
-  {% call card(title="Latest signals", subtitle="Most recent 25 across all strategies") %}
-    {% if signals %}
-      <ul class="divide-y divide-ink-300/40 -mx-4">
-        {% for sig in signals %}
-          <li class="px-4 py-3 flex items-center justify-between gap-4">
-            <div class="min-w-0">
-              <div class="flex items-center gap-2">
-                <span class="font-mono font-semibold">{{ sig.symbol }}</span>
-                {% if sig.status == 'new' %}
-                  {{ badge("passing", "ok") }}
-                {% elif sig.status == 'rejected' %}
-                  {{ badge("rejected", "warn") }}
-                {% elif sig.status == 'ordered' %}
-                  {{ badge("ordered", "neutral") }}
-                {% endif %}
-              </div>
-              <div class="text-xs text-ink-500 truncate">
-                {{ sig.strategy_name }} · {{ sig.as_of_date }}
-                {% if sig.rejected_reason %} · {{ sig.rejected_reason }}{% endif %}
-              </div>
-            </div>
-            <div class="flex items-center gap-3 flex-shrink-0">
-              {{ watch_button(sig.symbol, watching=watching) }}
-              <a href="/signals/{{ sig.signal_id }}" class="text-xs text-ink-700 hover:text-ink-900 underline" title="Open signal detail">Open</a>
-            </div>
-          </li>
-        {% endfor %}
-      </ul>
-    {% else %}
-      {{ empty("No signals yet — run `stockscan scan run rsi2_meanrev`.", "🔍") }}
-    {% endif %}
-  {% endcall %}
-
-  <!-- Open positions -->
-  {% call card(title="Open positions") %}
-    {% if open_trades %}
-      <ul class="divide-y divide-ink-300/40 -mx-4">
-        {% for t in open_trades %}
-          <li class="px-4 py-3 flex items-center justify-between">
-            <div>
-              <div class="font-mono font-semibold">{{ t.symbol }}</div>
-              <div class="text-xs text-ink-500">{{ t.strategy }} · opened {{ t.opened_at.date() }}</div>
-            </div>
-            <div class="flex items-center gap-3 flex-shrink-0">
-              {{ watch_button(t.symbol, watching=watching) }}
-              <a href="/trades/{{ t.trade_id }}" class="text-xs text-ink-700 underline" title="Open trade detail">Open</a>
-            </div>
-          </li>
-        {% endfor %}
-      </ul>
-    {% else %}
-      {{ empty("No open positions.", "💼") }}
-    {% endif %}
-  {% endcall %}
-
-  <!-- System health -->
-  {% call card(title="System health") %}
-    <dl class="grid grid-cols-1 sm:grid-cols-2 gap-x-6 gap-y-2 text-sm">
-      <div class="flex justify-between">
-        <dt class="text-ink-500">Database</dt>
-        <dd>
-          {% if health.ok %}{{ badge("ok", "ok") }}{% else %}{{ badge("down", "bad") }}{% endif %}
-        </dd>
-      </div>
-      <div class="flex justify-between">
-        <dt class="text-ink-500">TimescaleDB</dt>
-        <dd>
-          {% if health.timescaledb and health.timescaledb != "(missing)" %}
-            {{ badge("v" ~ health.timescaledb, "ok") }}
-          {% else %}{{ badge("missing", "bad") }}{% endif %}
-        </dd>
-      </div>
-      <div class="flex justify-between">
-        <dt class="text-ink-500">Postgres</dt>
-        <dd class="text-xs text-ink-700 truncate max-w-[60%]">{{ health.postgres or "—" }}</dd>
-      </div>
-      <div class="flex justify-between">
-        <dt class="text-ink-500">Strategies registered</dt>
-        <dd>{{ strategies|length }}</dd>
-      </div>
-    </dl>
-  {% endcall %}
+  {# System health: one line unless something is degraded. #}
+  {% if health_degraded %}
+    {% call card(title="System health") %}
+      <dl class="grid grid-cols-1 sm:grid-cols-2 gap-x-6 gap-y-2 text-sm">
+        <div class="flex justify-between">
+          <dt class="text-ink-500">Database</dt>
+          <dd>{% if health.ok %}{{ badge("ok", "ok") }}{% else %}{{ badge("down", "bad") }}{% endif %}</dd>
+        </div>
+        <div class="flex justify-between">
+          <dt class="text-ink-500">TimescaleDB</dt>
+          <dd>
+            {% if health.timescaledb and health.timescaledb != "(missing)" %}
+              {{ badge("v" ~ health.timescaledb, "ok") }}
+            {% else %}{{ badge("missing", "bad") }}{% endif %}
+          </dd>
+        </div>
+        <div class="flex justify-between">
+          <dt class="text-ink-500">Postgres</dt>
+          <dd class="text-xs text-ink-700 truncate max-w-[60%]">{{ health.postgres or "—" }}</dd>
+        </div>
+        <div class="flex justify-between">
+          <dt class="text-ink-500">Strategies registered</dt>
+          <dd>{{ strategies|length }}{% if strategies %} <span class="text-xs text-ink-500">({{ strategies|map(attribute='name')|join(', ') }})</span>{% endif %}</dd>
+        </div>
+      </dl>
+      {% if feeds_off %}
+        <p class="mt-3 text-xs text-ink-500">Not on current data plan: {{ feeds_off | join(', ') }}</p>
+      {% endif %}
+    {% endcall %}
+  {% else %}
+    <div class="text-xs text-ink-500 px-1 flex flex-wrap gap-x-4 gap-y-1" id="system-health">
+      <span>System: {{ badge("db ok", "ok") }} TimescaleDB v{{ health.timescaledb }}</span>
+      <span title="{{ health.postgres or '' }}">{{ strategies|length }} strateg{{ "y" if strategies|length == 1 else "ies" }}: {{ strategies|map(attribute='name')|join(', ') if strategies else "none registered" }}</span>
+      {% if feeds_off %}
+        <span title="Set EODHD_FEATURES to enable these feeds after upgrading the data plan">Not on current data plan: {{ feeds_off | join(', ') }}</span>
+      {% endif %}
+    </div>
+  {% endif %}
 
 </div>
 {% endblock %}
