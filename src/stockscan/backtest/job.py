@@ -6,7 +6,7 @@ POST starts the work on a daemon thread and returns immediately; the page
 polls ``GET /backtests/run/status`` every 2 s until the run lands, then
 shows a link to the saved report.
 
-Same constraints as :mod:`stockscan.scan.refresh_job`: in-process,
+Same constraints as :mod:`stockscan.jobs.background`: in-process,
 single-flight (one backtest at a time, guarded by a lock — a second POST
 while one runs is told so rather than starting another), state in module
 globals (single uvicorn worker), and the thread opens its own DB session

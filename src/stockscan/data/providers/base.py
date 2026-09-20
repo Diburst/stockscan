@@ -106,6 +106,15 @@ class DataProvider(ABC):
 
     name: str  # 'eodhd', 'polygon', 'stub', etc.
 
+    def close(self) -> None:
+        """Release any network resources; a no-op for providers without them."""
+
+    def __enter__(self) -> DataProvider:
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        self.close()
+
     def supports(self, feature: str) -> bool:
         """Whether this provider may call the given feature family.
 

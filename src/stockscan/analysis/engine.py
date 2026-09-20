@@ -9,6 +9,7 @@ broken indicator doesn't blank out the whole report.
 from __future__ import annotations
 
 import logging
+import math
 from datetime import date as _date
 from datetime import timedelta as _td
 from typing import TYPE_CHECKING
@@ -24,6 +25,7 @@ from stockscan.analysis.trend import compute_trend
 from stockscan.analysis.volatility import compute_volatility
 from stockscan.data.store import get_bars
 from stockscan.db import session_scope
+from stockscan.indicators import avg_dollar_volume, sector_relative_return
 
 if TYPE_CHECKING:
     import pandas as pd
@@ -108,12 +110,17 @@ def _analyze(
         return SymbolAnalysis.unavailable(symbol, as_of, "no_bars_at_as_of")
 
     last_close = float(bars["close"].iloc[-1]) if "close" in bars.columns else None
+    last_ts = bars.index[-1]
+    last_bar_date = last_ts.date() if hasattr(last_ts, "date") else last_ts
     last_volume: float | None = None
     if "volume" in bars.columns and "close" in bars.columns:
         try:
             last_volume = float(bars["volume"].iloc[-1]) * float(bars["close"].iloc[-1])
         except (TypeError, ValueError):
             last_volume = None
+    adv_20d = _adv_20d(bars)
+    day_move_pct = _day_move_pct(bars)
+    day_move_residual_pct = _day_move_residual_pct(symbol, bars, as_of, day_move_pct)
 
     # ---- Sub-module dispatches with per-component soft-fail. ----
     trend = _safe_call(failures, "trend", lambda: compute_trend(bars))
@@ -122,6 +129,7 @@ def _analyze(
         trend = TrendState.unavailable()
     if volatility is None:
         volatility = VolatilityState.unavailable()
+    daily_sigma_pct = _daily_sigma_pct(volatility)
 
     options_ctx = _safe_call(
         failures, "options_context",
@@ -170,16 +178,64 @@ def _analyze(
         as_of=as_of,
         available=True,
         last_close=last_close,
+        last_bar_date=last_bar_date,
         last_volume=last_volume,
         bars_count=len(bars),
         trend=trend,
         volatility=volatility,
         options_context=options_ctx,
+        adv_20d=adv_20d,
+        day_move_pct=day_move_pct,
+        day_move_residual_pct=day_move_residual_pct,
+        daily_sigma_pct=daily_sigma_pct,
         closes_history=closes_history,
         volumes_history=volumes_history,
         ohlc_history=ohlc_history,
         failures=failures,
     )
+
+
+def _adv_20d(bars: pd.DataFrame) -> float | None:
+    """Mean close × volume over the last 20 bars; None with fewer bars."""
+    if "close" not in bars.columns or "volume" not in bars.columns:
+        return None
+    adv = float(avg_dollar_volume(bars["close"], bars["volume"], period=20).iloc[-1])
+    return None if math.isnan(adv) else adv
+
+
+def _day_move_pct(bars: pd.DataFrame) -> float | None:
+    """1-day % change of adj_close; None with fewer than two bars."""
+    if "adj_close" not in bars.columns or len(bars) < 2:
+        return None
+    prev, last = float(bars["adj_close"].iloc[-2]), float(bars["adj_close"].iloc[-1])
+    if not prev or math.isnan(prev) or math.isnan(last):
+        return None
+    return (last - prev) / prev * 100.0
+
+
+def _day_move_residual_pct(
+    symbol: str, bars: pd.DataFrame, as_of: _date, day_move_pct: float | None
+) -> float | None:
+    """``day_move_pct`` net of the sector composite's 1-day return.
+
+    None when the symbol has no sector composite or the composites are not
+    built; a missing composite must never break the analysis page.
+    """
+    if day_move_pct is None:
+        return None
+    bars.attrs["symbol"] = symbol
+    try:
+        residual = sector_relative_return(bars, as_of, lookback=1)
+    except Exception as exc:
+        log.debug("analysis: sector residual failed for %s: %s", symbol, exc)
+        return None
+    return None if residual is None else residual * 100.0
+
+
+def _daily_sigma_pct(volatility: VolatilityState) -> float | None:
+    """One trading day of vol in %, from the annualised EWMA (else 21d) vol."""
+    annual = volatility.ewma_vol_pct or volatility.realized_vol_21d_pct
+    return None if annual is None else annual / math.sqrt(252)
 
 
 def _safe_call(failures: list[str], name: str, fn):

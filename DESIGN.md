@@ -294,17 +294,23 @@ The same FastAPI + HTMX + Tailwind stack delivers both desktop and mobile from a
 
 **Verification:** before Phase 2 sign-off, every primary workflow (scan → ticket → submit → view trade → add note → exit review → check base rates) is manually verified on a real iPhone (Safari) and a real Android (Chrome) via the WireGuard tunnel.
 
-### 4.9 Scheduler and nightly job (`stockscan.jobs`)
+### 4.9 The refresh pipeline (`stockscan.jobs`)
 
-`stockscan jobs nightly-scan` (20:00 ET, Mon–Fri) is the one scheduled entry point — supercronic via `infra/crontab` in the Compose stack, launchd plists on a bare Mac. Steps, in order, each individually fault-tolerant (a failure is logged, recorded in `step_failures`, and the run continues):
+`jobs.pipeline.run_pipeline` is the one fetch-and-analyze path in the app. It has two callers and no others: `stockscan jobs nightly-scan` (20:00 ET, Mon–Fri — supercronic via `infra/crontab` in the Compose stack, launchd plists on a bare Mac) runs it and sends the summary notification; the Dashboard's single **Refresh** button runs it on a background thread (`jobs.background`, single-flight: a click while a run is in flight joins that run, so double-clicks, second tabs and the MCP `refresh_data` tool all watch the same run) and shows each step as it completes in the strip at the top of the page, then reloads the Dashboard cards. There are no other refresh, fetch or rebuild buttons anywhere in the UI.
 
-1. **Bars** — bulk-EOD refresh of recent days for every known symbol.
-2. **Macro** — FRED series (`BAMLH0A0HYM2` HY OAS for the credit-stress flag; `DGS1MO`/`DGS3MO` for the options analysis). Skipped with a warning when `FRED_API_KEY` is unset.
-3. **Regime** — `detect_regime(as_of, force_recompute=True)` from the fresh bars and macro, so a row cached earlier in the day is replaced before anything sizes against it.
-4. **Sector composites** — rebuild the equal-weight composites the strategies rank against (local, no API calls).
-5. **Scans** — `ScanRunner.run()` for every registered strategy.
-6. **Watchlist alerts** — price-target checks against the fresh bars.
-7. **Summary** — email + Discord; the subject gains `DEGRADED` when any step failed.
+Steps, in order, each individually fault-tolerant (a failure is logged, recorded in `step_failures`, and the run continues):
+
+1. **bars** — bulk-EOD for the sessions the store lacks up to the latest *completed* session (`data.backfill.missing_bulk_dates`, so a 2 pm click never fetches today's bar before it prints), filtered to the tracked set (`data.tracked.tracked_symbols`: S&P 500 ever-members + the watchlist), then `catch_up_lagging_symbols` fetches, per symbol, any watched name whose own latest bar is behind the freshest market-wide bar. The bulk pass judges freshness by the market, so without the catch-up a watched name that fell behind on its own would stay stale.
+2. **macro** — FRED series (`BAMLH0A0HYM2` HY OAS for the credit-stress flag; `DGS1MO`/`DGS3MO` for the options analysis). Skipped with a warning when `FRED_API_KEY` is unset.
+3. **regime** — `detect_regime(as_of, force_recompute=True)` from the fresh bars and macro, so a row cached earlier in the day is replaced before anything sizes against it.
+4. **composites** — the equal-weight sector composites the strategies rank against, then every watchlist composite (local, no API calls).
+5. **scans** — `ScanRunner.run()` for every registered strategy, **skipped** when no bar arrived and every strategy at its current version already has a run reaching the latest stored bar (`scan.store.has_run_covering`). A version bump or a new bar always rescans.
+6. **trades** — paper trades marked to market and their exits applied.
+7. **options** — tonight's short-premium book for all watched symbols (`proposals.store.save_run(replace=True)`: one saved run per date, an earlier run for the same day is replaced so the base rates never double-count a day), then `proposals.settle.settle_expired(as_of)` fills the outcome columns (`touched`, `breached`, `breach_date`, `close_at_expiry`, `max_adverse_pct`) of every proposal whose expiry has passed, from bars alone.
+8. **feeds** — news, macro calendar, earnings and insider transactions, each only when the data plan includes it (`EODHD_FEATURES`) and its once-a-day cooldown (`refresh_log`, 20 h; insider's own 23 h gate) has passed.
+9. **alerts** — watchlist price-target checks against the fresh bars.
+
+The nightly run then sends the summary (email + Discord; the subject gains `DEGRADED` when any step failed). The pipeline is idempotent end to end: a second run with nothing new makes no bulk call, no catch-up call, no feed call, skips the scans and replaces today's regime row and options run with identical ones.
 
 Daily DB backup (02:00 ET) and the weekly fundamentals refresh (Sun 03:00 ET) are separate cron lines. Broker order placement and reconciliation jobs arrive with Phase 4.
 
@@ -472,6 +478,10 @@ Two controls and one breaker, deliberately separate, because the evidence backs 
 
 **Point-in-time companion:** `fundamentals_history` (migration 0023) holds shares outstanding per reporting period, extracted from the stored `raw_payload`, so the cap-weighted composite builder uses `shares(t) × price(t)` rather than today's share count. The snapshot table itself is latest-only; no strategy filters on it at scan time.
 
+
+### 4.16 Options proposals (`stockscan.proposals`)
+
+A cross-sectional layer, not a `Strategy`: it reads every watched name's `SymbolAnalysis` and builds a short-premium book in the same shape as the signal canon — hard filters, then one rank key, no weighted blend. `engine.py` is the checklist: the trigger is today's move in units of the name's own daily vol (`DAY_TRIGGER_SIGMA = 1.0`), sector-residual for put-sales (only residual reversal survives in large caps — the `rsi2_meanrev` canon) and raw for call-sales (a green day into the strike is a level bet); the trend bucket and the regime layer qualify the side (red day in `strong_down` and green day in `strong_up` are skipped; a closed gate forces put-sales to counter-trend alignment; credit stress skips put-sales outright); then the filters — earnings inside the expiry when the date is known (`earnings_known` is carried as a flag otherwise), HV percentile ≥ 25, 20-day ADV ≥ $25M, price ≥ $10. `rank_key = |move_sigma| × trend_align`, ties by HV percentile; EMA confluences are shown as a fact and never ranked. `portfolio.py` sets the book multiplier (vol scalar × 0.5 under stress, so the halving lands on call-sales), sizes each row in contracts as `floor(equity × 0.005 × book_mult / (strike × 100 × 2 × σ_tenor))`, and caps two per sector (the runner's sector map) and two per hand-maintained cluster. `service.generate_book` is the one entry point for the page, the MCP tool, the CLI and the nightly job; it also lists the high-importance US macro events inside the expiry for the header (shown, never a multiplier). Nightly, the run is saved (`option_proposal_runs` / `option_proposals`, migration 0027) and `settle.py` fills `breached / touched / breach_date / close_at_expiry / max_adverse_pct / settled_at` for expired rows from bars alone; `store.trigger_base_rates` aggregates the settled rows per side × trend bucket × gate state, which is what the "Why this trade" card shows once a class has 30 settled proposals. Every threshold is a starting value — the base rates are what set them.
 ---
 
 ## 5. Data Provider Selection
@@ -969,8 +979,8 @@ A nightly `stockscan export bars` job dumps `bars` to partitioned Parquet under 
 |---|---|---|
 | **0 — Foundations** | ✅ Done | Repo, Docker Compose for TimescaleDB, custom SQL migration runner, EODHD client + idempotent bar ingest, historical bulk backfill, S&P 500 universe (live + historical, Wikipedia fallback), FastAPI skeleton, CLI, `SuggestionBroker` + `PaperBroker`. |
 | **1 — Strategies + Backtester** | ✅ Done | Strategy plugin system (ABC, auto-discovery, registry, class-constant knobs, contract tests), indicator primitives, RSI(2) pullback, 52-week-high momentum, event-driven backtester sharing sizing and regime code with the runner, metrics, CLI (`run` / `list` / `debug` / `export` / `profile`). |
-| **2 — Web UI** | ✅ Done | Dashboard, Signals (passing + rejected, Fetch Latest), Signal detail attribution, Trades (lots + journal), Backtests, Base-rate analyzer, Strategies (manual + knobs), Analysis, mobile-first responsive layouts, docs hub. |
-| **3 — Live Scanner + Notifications** | ✅ Done | Bulk EOD endpoint, nightly job (bars → macro → regime → composites → scans → alerts → summary), supercronic + launchd, email + Discord, DEGRADED summaries. |
+| **2 — Web UI** | ✅ Done | Dashboard (with the one Refresh button), Signals (passing + rejected), Signal detail attribution, Trades (lots + journal), Backtests, Base-rate analyzer, Strategies (manual + knobs), Analysis, mobile-first responsive layouts, docs hub. |
+| **3 — Live Scanner + Notifications** | ✅ Done | Bulk EOD endpoint, nightly job (bars → macro → regime → composites → scans → options book → alerts → summary), supercronic + launchd, email + Discord, DEGRADED summaries. |
 | **Watchlist** | ✅ Done | `watchlist_items`, price-target alerts with auto-disable, "+ Watch" quick-adds, sector-composite chart. |
 | **Fundamentals** | ✅ Done | `fundamentals_snapshot` (38 typed columns + raw JSONB), `fundamentals_history` (point-in-time shares), weekly refresh cron. |
 | **Sector composites** | ✅ Done | Equal-weight sector indices rebuilt nightly; `sector_return` / `sector_relative_return` primitives; both strategies rank against them. |

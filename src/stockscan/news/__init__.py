@@ -7,8 +7,8 @@ Module surface, in dependency order:
   * ``refresh``  — orchestrate provider pulls into the store. Idempotent:
                    re-running on the same day is safe.
 
-The CLI command ``stockscan refresh news`` and the web ``POST /news/refresh``
-endpoint both call :func:`refresh.refresh_news`.
+The CLI command ``stockscan refresh news`` and the refresh pipeline both
+call :func:`refresh.refresh_news`.
 """
 
 from __future__ import annotations

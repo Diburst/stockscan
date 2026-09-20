@@ -13,14 +13,8 @@ from sqlalchemy.orm import Session
 from datetime import date as _date, timedelta as _timedelta
 
 from stockscan.config import settings
-from stockscan.data.backfill import backfill_symbol
-from stockscan.data.providers.eodhd import EODHDError, EODHDProvider
-from stockscan.data.store import latest_bar_date, latest_daily_bar_date
-from stockscan.earnings import refresh_earnings
-from stockscan.econ_events import refresh_economic_events
-from stockscan.insider import refresh_insider_for_watchlist
-from stockscan.refresh_log import mark_refreshed, refresh_due
-from stockscan.scan import refresh_signals
+from stockscan.data.backfill import CATCH_UP_CALENDAR_DAYS, backfill_symbol
+from stockscan.data.providers.eodhd import EODHDProvider
 from stockscan.watchlist.composite import (
     composite_payload,
     member_series,
@@ -42,23 +36,20 @@ from stockscan.watchlist.store import (
     resolve_selection,
     set_target,
     toggle_alert,
-    watchlist_symbols,
 )
 from stockscan.web.deps import (
     flash_redirect,
     get_session,
     hx_toast_response,
-    rate_limit_check,
     render,
     safe,
 )
 
 log = logging.getLogger(__name__)
 
-# ~1140 calendar days ≈ 3 years of trading bars. EOD history is a single
-# provider call regardless of range, so we pull the full window the charts can
-# display (the Analysis 3y button + 756-bar chart cap) up front.
-_BACKFILL_CALENDAR_DAYS = 1140
+# EOD history is a single provider call regardless of range, so a new name
+# gets the full window the charts can display up front.
+_BACKFILL_CALENDAR_DAYS = CATCH_UP_CALENDAR_DAYS
 
 
 def _backfill_history(symbol: str) -> str:
@@ -136,248 +127,6 @@ def watchlist_list(
         bars_as_of=_bars_as_of(items),
         err=err,
     )
-
-
-# How many calendar days to backfill in the per-symbol watchlist pass.
-# Matches the bulk refresh window (days_back=7) so the two passes cover the
-# same range. The per-symbol path is idempotent (it checks ``latest_bar_date``
-# and only fetches gaps) so a few extra days of overlap cost nothing.
-_WATCHLIST_REFRESH_DAYS = 7
-
-# Daily-ish cooldown for the slow-moving auxiliary fetches (economic-events
-# calendar, earnings calendar/trends). 20h ≈ "once a day" while still allowing
-# a same-day re-pull the next morning. Insider has its own 23h gate.
-_AUX_COOLDOWN_HOURS = 20
-
-
-@router.post("/refresh-bars")
-def watchlist_refresh_bars(
-    request: Request,
-    s: Session = Depends(get_session),
-):
-    """Pull fresh EOD bars for the S&P 500 universe + watchlist, re-run all
-    strategies, then redirect to /analysis so the freshly-derived indicators
-    are visible immediately.
-
-    Two-phase fetch scope:
-
-      1. **Bulk-EOD** over the S&P 500 universe ∪ watchlist (via
-         ``refresh_signals``), pulled one trading day at a time on the US
-         exchange. This covers the vast majority of names cheaply (one API
-         call per day, not per symbol).
-
-      2. **Per-symbol backfill** for the names phase 1 missed. The bulk
-         endpoint is exchange-scoped (``US``), so non-US names and freshly
-         added watchlist symbols without prior history aren't covered by
-         phase 1. Phase 2 only fetches symbols whose latest stored bar is
-         behind the freshest market-wide day (``latest_daily_bar_date``);
-         names the bulk pass already brought current are skipped with no API
-         call. (Previously this re-fetched every watched name every refresh,
-         because ``backfill_symbol`` re-pulls its overlap window even when
-         current.)
-
-    Equivalent to ``stockscan refresh daily`` from the CLI plus the
-    explicit watchlist coverage guarantee. Per the "indicators must follow
-    bars" requirement, lazily-computed indicators on /watchlist and
-    /analysis will pick up the new bars on the next page load — that's the
-    redirect target.
-    """
-    cooldown_remaining = rate_limit_check("watchlist.refresh", cooldown_seconds=15)
-    if cooldown_remaining is not None:
-        return flash_redirect(
-            "/analysis",
-            "warn",
-            f"Just refreshed — try again in {int(cooldown_remaining) + 1}s",
-        )
-
-    api_key = settings.eodhd_api_key.get_secret_value()
-    if not api_key:
-        return flash_redirect(
-            "/watchlist",
-            "error",
-            "EODHD_API_KEY is not set. Add it to your .env to refresh bars.",
-        )
-
-    watchlist_backfilled = 0
-    per_symbol_failures: list[str] = []
-    econ_upserted = 0
-    econ_skipped_cooldown = False
-    earnings_calendar_upserted = 0
-    earnings_trends_upserted = 0
-    earnings_skipped_cooldown = False
-    insider_skipped_cooldown_h: float | None = None
-    insider_symbols_refreshed = 0
-    insider_transactions_upserted = 0
-    # Auxiliary phases the data plan excludes (EODHD_FEATURES). Skipped
-    # before any cooldown bookkeeping so nothing is marked "refreshed".
-    plan_skipped: list[str] = []
-    try:
-        with EODHDProvider(api_key=api_key) as provider:
-            # ---- Phase 1: bulk S&P 500 + watchlist via the universe filter ----
-            result = refresh_signals(
-                provider, days_back=_WATCHLIST_REFRESH_DAYS, session=s
-            )
-
-            # ---- Phase 2: per-symbol catch-up for names the bulk pass missed ----
-            # The bulk endpoint is US-exchange-scoped, so non-US names and
-            # freshly-added symbols without prior history aren't covered by
-            # phase 1. Rather than re-fetch EVERY watched name (backfill_symbol
-            # re-pulls its overlap window even when current — one API call per
-            # symbol), we only backfill names whose latest stored bar is behind
-            # the freshest day the bulk pass just produced. Current US names are
-            # skipped entirely (zero API calls). Soft-fail per symbol.
-            watched = watchlist_symbols(session=s)
-            cutoff = latest_daily_bar_date(session=s)  # freshest market-wide bar
-            start = _date.today() - _timedelta(days=_WATCHLIST_REFRESH_DAYS)
-            for sym in sorted(watched):
-                lb = latest_bar_date(sym, session=s)
-                if cutoff is not None and lb is not None and lb >= cutoff:
-                    continue  # already current via the bulk pass — no fetch
-                try:
-                    watchlist_backfilled += backfill_symbol(provider, sym, start=start)
-                except Exception as exc:
-                    log.warning(
-                        "watchlist refresh: per-symbol backfill failed for %s: %s",
-                        sym, exc,
-                    )
-                    per_symbol_failures.append(sym)
-
-            # ---- Phase 3: economic events (1 API call, US-only) ----
-            # Daily cooldown: the macro calendar barely moves intraday, so
-            # repeat refreshes within the window make no call.
-            if not provider.supports("econ_events"):
-                plan_skipped.append("macro calendar")
-            elif refresh_due("econ_events", cooldown_hours=_AUX_COOLDOWN_HOURS, session=s):
-                try:
-                    econ_result = refresh_economic_events(provider, session=s)
-                    econ_upserted = econ_result.upserted
-                    if econ_result.error:
-                        log.warning("watchlist refresh: econ_events: %s", econ_result.error)
-                    else:
-                        mark_refreshed("econ_events", session=s)
-                except Exception as exc:  # safety
-                    log.warning("watchlist refresh: econ_events fan-out: %s", exc)
-            else:
-                econ_skipped_cooldown = True
-
-            # ---- Phase 4: earnings calendar + trends for watchlist names ----
-            # Daily cooldown as well — estimate revisions update at most daily.
-            watched_sorted = sorted(watched)
-            if not provider.supports("calendar"):
-                plan_skipped.append("earnings")
-            elif watched_sorted and refresh_due(
-                "earnings", cooldown_hours=_AUX_COOLDOWN_HOURS, session=s
-            ):
-                try:
-                    earn_result = refresh_earnings(
-                        provider, watched_sorted, session=s,
-                    )
-                    earnings_calendar_upserted = earn_result.calendar_upserted
-                    earnings_trends_upserted = earn_result.trends_upserted
-                    if earn_result.error:
-                        log.warning(
-                            "watchlist refresh: earnings: %s", earn_result.error,
-                        )
-                    else:
-                        mark_refreshed("earnings", session=s)
-                except Exception as exc:
-                    log.warning("watchlist refresh: earnings fan-out: %s", exc)
-            elif watched_sorted:
-                earnings_skipped_cooldown = True
-
-            # ---- Phase 5: insider transactions (10 API calls per symbol!) ----
-            # Gated by 23h cooldown via insider_refresh_log so this only
-            # actually pulls once per day regardless of refresh frequency.
-            try:
-                ins_result = refresh_insider_for_watchlist(
-                    provider, watched_sorted, session=s,
-                )
-                if ins_result.skipped_reason:
-                    plan_skipped.append("insider")
-                elif ins_result.skipped:
-                    insider_skipped_cooldown_h = (
-                        (ins_result.cooldown_remaining_secs or 0) / 3600.0
-                    )
-                else:
-                    insider_symbols_refreshed = ins_result.symbols_refreshed
-                    insider_transactions_upserted = ins_result.transactions_upserted
-                    if ins_result.error:
-                        log.warning("watchlist refresh: insider: %s", ins_result.error)
-            except Exception as exc:
-                log.warning("watchlist refresh: insider fan-out: %s", exc)
-    except EODHDError as exc:
-        log.warning("watchlist refresh: provider error: %s", exc)
-        try:
-            s.rollback()
-        except Exception as roll_exc:
-            log.warning("watchlist refresh: rollback failed: %s", roll_exc)
-        return flash_redirect("/watchlist", "error", f"Provider error: {exc}")
-    except Exception as exc:
-        log.exception("watchlist refresh: unexpected error")
-        try:
-            s.rollback()
-        except Exception as roll_exc:
-            log.warning("watchlist refresh: rollback failed: %s", roll_exc)
-        return flash_redirect("/watchlist", "error", f"Refresh failed: {exc}")
-
-    # Did any phase actually hit the provider? If the bars were already current
-    # AND every auxiliary phase was cooldown-gated, the whole refresh was a
-    # zero-API-cost no-op — say so plainly instead of "0 bars; 0 signals…".
-    fetched_anything = any([
-        result.bars_upserted, watchlist_backfilled, econ_upserted,
-        earnings_calendar_upserted, earnings_trends_upserted,
-        insider_symbols_refreshed,
-    ])
-    if not fetched_anything and result.up_to_date and not per_symbol_failures:
-        notes: list[str] = []
-        if econ_skipped_cooldown or earnings_skipped_cooldown:
-            notes.append("macro/earnings on daily cooldown")
-        if insider_skipped_cooldown_h is not None:
-            notes.append(f"insider cooldown {insider_skipped_cooldown_h:.1f}h")
-        if plan_skipped:
-            notes.append(", ".join(plan_skipped) + " not on current data plan")
-        suffix = (" (" + "; ".join(notes) + ")") if notes else ""
-        return flash_redirect(
-            "/analysis", "info", f"Already up to date — no API calls used{suffix}"
-        )
-
-    if result.up_to_date:
-        msg_parts = ["bars already current"]
-    else:
-        msg_parts = [
-            f"{result.bars_upserted} bulk bar(s) across "
-            f"{result.bars_days_covered} day(s)",
-            f"{result.signals_emitted} signal(s) across "
-            f"{result.strategies_run} strategy(ies)",
-        ]
-    if watchlist_backfilled:
-        msg_parts.append(f"{watchlist_backfilled} extra watchlist bar(s)")
-    if econ_upserted:
-        msg_parts.append(f"{econ_upserted} econ event(s)")
-    if earnings_calendar_upserted or earnings_trends_upserted:
-        msg_parts.append(
-            f"{earnings_calendar_upserted} earnings + "
-            f"{earnings_trends_upserted} trend point(s)"
-        )
-    if insider_symbols_refreshed:
-        msg_parts.append(
-            f"insider: {insider_transactions_upserted} txn(s) across "
-            f"{insider_symbols_refreshed} sym"
-        )
-    elif insider_skipped_cooldown_h is not None:
-        msg_parts.append(
-            f"insider: skipped (cooldown {insider_skipped_cooldown_h:.1f}h remaining)"
-        )
-    if plan_skipped:
-        msg_parts.append(", ".join(plan_skipped) + " not on current data plan")
-    if per_symbol_failures:
-        msg_parts.append(
-            f"{len(per_symbol_failures)} watchlist fetch(es) failed "
-            f"({', '.join(per_symbol_failures[:3])}{'…' if len(per_symbol_failures) > 3 else ''})"
-        )
-    msg = "Refresh complete — " + "; ".join(msg_parts)
-    kind = "warn" if (result.failures or per_symbol_failures) else "success"
-    return flash_redirect("/analysis", kind, msg)
 
 
 # Inline replacement returned to HTMX requests after a successful add — the
@@ -688,34 +437,6 @@ def watchlist_member_series(
         label="watchlist.member_series",
     )
     return {"series": out or {}}
-
-
-@router.post("/composite/rebuild")
-def watchlist_composite_rebuild(
-    request: Request,
-    list_id: str = Form(...),
-    s: Session = Depends(get_session),
-):
-    """Manual rebuild button. Recomputes both composites from current membership
-    + newest stored data (no API calls) and redirects back to the list."""
-    try:
-        lid = int(list_id)
-    except ValueError:
-        return flash_redirect("/watchlist", "error", "Invalid list")
-    result = safe(
-        lambda: refresh_watchlist_composites(lid, session=s),
-        label=f"watchlist.composite_rebuild[{lid}]",
-    )
-    if result is None:
-        return flash_redirect(f"/watchlist?list={lid}", "error", "Composite rebuild failed")
-    if result.members == 0:
-        msg = "Composite cleared — list is empty"
-    elif result.eq_rows == 0:
-        msg = "No price history yet for these symbols — rebuild after a Refresh"
-    else:
-        cw = f"{result.cw_rows} cap-weight pts" if result.cw_rows else "cap-weight skipped (no share history)"
-        msg = f"Composite rebuilt — {result.eq_rows} equal-weight pts, {cw} (as of {result.as_of})"
-    return flash_redirect(f"/watchlist?list={lid}", "success", msg)
 
 
 @router.post("/lists/create")

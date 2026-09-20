@@ -1,26 +1,63 @@
 {% extends "base.html" %}
+{% from "_macros.html" import badge, table_open, table_close %}
 {% block title %}Options{% endblock %}
 
 {% block content %}
 <div class="max-w-5xl mx-auto px-4 py-6">
-  <div class="flex items-baseline justify-between mb-4">
+  <div class="flex items-baseline justify-between mb-3">
     <h1 class="text-xl font-semibold">Options — proposed book</h1>
-    <span class="text-sm text-ink-400">
-      {{ as_of }} ·
-      {% if regime %}regime: {{ regime.regime }} · vol scalar {{ '%.2f'|format(regime.vol_multiplier) }}
-      {% else %}regime: n/a{% endif %}
-      · {{ book|length }} of {{ candidates }} candidates
-    </span>
+    <span class="text-sm text-ink-400">{{ as_of }} · {{ book|length }} of {{ candidates }} candidates</span>
+  </div>
+
+  <!-- Regime controls + book size: the same three controls as the dashboard card -->
+  <div class="border border-ink-800 rounded-lg px-4 py-2 mb-3">
+    {% if regime %}
+      {{ table_open([{"label": "Control"}, {"label": "State"}, {"label": "Effect on the book"}],
+                    mobile="scroll", table_classes="min-w-[480px]") }}
+        <tr>
+          <td class="px-4 py-1.5 font-medium whitespace-nowrap">Trend gate</td>
+          <td class="px-4 py-1.5 whitespace-nowrap">
+            {% if regime.trend_gate_open %}{{ badge("open", "ok") }}{% else %}{{ badge("closed", "bad") }}{% endif %}
+            <span class="text-xs text-ink-500 ml-1">{{ regime.days_on_side }} close{{ "s" if regime.days_on_side != 1 else "" }} on side</span>
+          </td>
+          <td class="px-4 py-1.5 text-xs text-ink-500">{% if regime.trend_gate_open %}with-trend put-sales rank first{% else %}put-sales demoted to counter-trend; call-sales unchanged{% endif %}</td>
+        </tr>
+        <tr>
+          <td class="px-4 py-1.5 font-medium whitespace-nowrap">Vol scalar</td>
+          <td class="px-4 py-1.5 whitespace-nowrap">
+            {% if regime.vol_multiplier < 1.0 %}{{ badge("×" ~ "%.2f"|format(regime.vol_multiplier), "warn") }}{% else %}{{ badge("×1.00", "ok") }}{% endif %}
+          </td>
+          <td class="px-4 py-1.5 text-xs text-ink-500">multiplies every row's size</td>
+        </tr>
+        <tr>
+          <td class="px-4 py-1.5 font-medium whitespace-nowrap">Credit stress</td>
+          <td class="px-4 py-1.5 whitespace-nowrap">
+            {% if regime.credit_stress_flag %}{{ badge("firing", "bad") }}{% else %}{{ badge("clear", "ok") }}{% endif %}
+          </td>
+          <td class="px-4 py-1.5 text-xs text-ink-500">{% if regime.credit_stress_flag %}put-sales skipped; call-sales halved{% else %}no effect{% endif %}</td>
+        </tr>
+        <tr>
+          <td class="px-4 py-1.5 font-medium whitespace-nowrap">Book size</td>
+          <td class="px-4 py-1.5 whitespace-nowrap font-mono">×{{ "%.2f"|format(book_mult) }}</td>
+          <td class="px-4 py-1.5 text-xs text-ink-500">contracts sized against ${{ "{:,.0f}".format(equity) }} equity</td>
+        </tr>
+      {{ table_close() }}
+    {% else %}
+      <div class="text-sm text-ink-400 py-1">Regime n/a — book size ×{{ "%.2f"|format(book_mult) }}, contracts sized against ${{ "{:,.0f}".format(equity) }} equity</div>
+    {% endif %}
+    <div class="text-xs py-1.5 {% if macro_events %}text-warn-600{% else %}text-ink-500{% endif %}">
+      {% if macro_events %}{{ macro_events|join(" · ") }} inside expiry{% else %}No high-importance US macro events inside expiry{% endif %}
+    </div>
   </div>
 
   <p class="text-xs text-ink-400 mb-4">
-    Short-premium proposals, ranked. IV is a realized-vol proxy (not live implied
-    vol) — treat scores as relative and verify strikes on a live chain. Not advice.
+    Short-premium proposals, ranked by |day move in σ| × trend alignment after hard
+    filters. HV is realized vol (not a live chain) — verify strikes on a live chain. Not advice.
   </p>
 
   {% if not book %}
     <div class="text-ink-400 text-sm border border-ink-800 rounded p-6 text-center">
-      No qualifying proposals right now — no day-color triggers cleared the filters.
+      No qualifying proposals right now — no 1σ day cleared the filters.
     </div>
   {% else %}
     <div class="space-y-2">
@@ -28,10 +65,7 @@
       <div class="border border-ink-800 rounded-lg">
         <!-- Summary row -->
         <div class="p-3 flex items-center gap-4">
-          <div class="w-10 text-center">
-            <div class="text-xs text-ink-500">#{{ loop.index }}</div>
-            <div class="text-sm font-semibold">{{ '%.0f'|format(p.score * 100) }}</div>
-          </div>
+          <div class="w-8 text-center text-xs text-ink-500">#{{ loop.index }}</div>
           <div class="w-28">
             <a href="/analysis/{{ p.symbol }}" class="font-semibold hover:underline">{{ p.symbol }}</a>
             {% if p.side == 'sell_call' %}
@@ -43,43 +77,52 @@
           <div class="flex-1 text-sm">
             <div>
               <span class="font-medium">{{ '%g'|format(p.strike) }}</span>
-              <span class="text-ink-400">({{ '%+.0f'|format(p.pct_otm) }}% OTM · {{ p.days_to_expiry }}d · {{ p.expiry_date }})</span>
+              <span class="text-ink-400">({{ '%+.0f'|format(p.pct_otm) }}% OTM · {{ '%.1f'|format(p.sigma_distance) }}σ · {{ p.days_to_expiry }}d · {{ p.expiry_date }})</span>
             </div>
             <div class="text-xs text-ink-400">{{ p.rationale }}</div>
           </div>
-          <div class="w-32 text-right text-xs text-ink-400">
-            <div>IV ~{{ '%.0f'|format(p.iv_pct) }}% · cr ${{ '%.2f'|format(p.est_credit * 100) }}</div>
-            <div>size {{ '%.2f'|format(p.size_weight) }}
-              {% if p.day_move_pct is not none %}· {{ '%+.1f'|format(p.day_move_pct) }}% today{% endif %}
+          <div class="w-44 text-right text-xs text-ink-400 tabular-nums">
+            <div>HV {{ '%.0f'|format(p.hv_pct) }}%{% if p.hv_percentile is not none %} (rank {{ '%.0f'|format(p.hv_percentile) }}){% endif %} · cr ${{ '%.2f'|format(p.est_credit * 100) }} · {{ '%.0f'|format(p.credit_yield_ann) }}%/yr</div>
+            <div>
+              {% if p.contracts is not none %}{{ p.contracts }} contract{{ "s" if p.contracts != 1 else "" }}{% else %}size n/a{% endif %}
+              {% if p.day_move_pct is not none %}· today {{ '%+.1f'|format(p.day_move_pct) }}%{% endif %}
+              {% if p.day_move_residual_pct is not none %}({{ '%+.1f'|format(p.day_move_residual_pct) }}% vs sector){% endif %}
             </div>
           </div>
         </div>
 
-        <!-- Why this trade (expandable score derivation) -->
+        <!-- Why this trade -->
         <details class="border-t border-ink-800/60 px-3 py-2 text-xs">
           <summary class="cursor-pointer text-ink-400 hover:text-ink-200 select-none">Why this trade</summary>
           <div class="mt-3 grid sm:grid-cols-2 gap-x-6 gap-y-3">
             <div class="space-y-1.5">
-              {% for key, label, weight in score_inputs %}
-              {% set val = p.score_breakdown.get(key, 0) %}
-              <div>
-                <div class="flex justify-between text-ink-400">
-                  <span>{{ label }} <span class="text-ink-600">×{{ '%.2f'|format(weight) }}</span></span>
-                  <span class="tabular-nums">{{ '%.2f'|format(val) }} → {{ '%.3f'|format(val * weight) }}</span>
-                </div>
-                <div class="h-1 bg-ink-800 rounded">
-                  <div class="h-1 bg-sky-600 rounded" style="width: {{ (val * 100)|round }}%"></div>
-                </div>
+              <div class="text-ink-500 uppercase tracking-wide">Filters passed</div>
+              <div class="text-ink-400">
+                {% if p.earnings_known %}earnings outside expiry{% else %}<span class="text-warn-600">earnings: unknown</span>{% endif %}
+                · HV percentile floor · ADV-20 floor · price floor
               </div>
-              {% endfor %}
-              <div class="flex justify-between pt-1 font-medium text-ink-200">
-                <span>Score</span><span class="tabular-nums">{{ '%.3f'|format(p.score) }}</span>
-              </div>
+              <div class="text-ink-500 uppercase tracking-wide pt-1">Rank</div>
+              <div class="flex justify-between text-ink-400"><span>Day move ({% if p.side == 'sell_put' %}sector-residual{% else %}raw{% endif %})</span><span class="tabular-nums text-ink-200">{{ '%+.2f'|format(p.move_sigma) }}σ</span></div>
+              <div class="flex justify-between text-ink-400"><span>Trend alignment ({{ p.trend_bucket }})</span><span class="tabular-nums text-ink-200">{{ '%.2f'|format(p.trend_align) }}</span></div>
+              <div class="flex justify-between text-ink-400"><span>HV percentile (tie-break)</span><span class="tabular-nums text-ink-200">{% if p.hv_percentile is not none %}{{ '%.0f'|format(p.hv_percentile) }}{% else %}n/a{% endif %}</span></div>
+              <div class="flex justify-between pt-1 font-medium text-ink-200"><span>Rank key</span><span class="tabular-nums">{{ '%.3f'|format(p.rank_key) }}</span></div>
             </div>
             <div class="text-ink-400 space-y-1.5">
-              <div>Day move: <span class="text-ink-200">{% if p.day_move_pct is not none %}{{ '%+.1f'|format(p.day_move_pct) }}%{% else %}n/a{% endif %}</span> · trend <span class="text-ink-200">{{ p.trend_bucket }}</span></div>
-              <div>Strike δ ~{{ '%.2f'|format(p.delta) }} · {{ p.confluence_count }} EMA confluence(s)</div>
-              {% if p.days_to_earnings is not none %}<div>Earnings in {{ p.days_to_earnings }}d</div>{% endif %}
+              <div>Strike δ ~{{ '%.2f'|format(p.delta) }} · {{ '%.1f'|format(p.sigma_distance) }}σ from spot over {{ p.days_to_expiry }}d</div>
+              <div>Key EMAs near the strike: {% if p.confluences %}{{ p.confluences|join("; ") }}{% else %}none{% endif %}</div>
+              <div>Earnings:
+                {% if not p.earnings_known %}<span class="text-warn-600">unknown</span>
+                {% elif p.days_to_earnings is not none %}in {{ p.days_to_earnings }}d
+                {% else %}none on file{% endif %}
+              </div>
+              {% set rate = base_rates.get(p.symbol) %}
+              <div>Base rate — {% if p.side == 'sell_put' %}red-day put-sales{% else %}green-day call-sales{% endif %} in <code>{{ p.trend_bucket }}</code> names, gate {% if regime and regime.trend_gate_open %}open{% elif regime %}closed{% else %}n/a{% endif %}:
+                {% if rate and rate[0] >= base_rate_min_n %}
+                  <span class="text-ink-200">{{ rate[0] }} proposed, {{ rate[1] }} breached ({{ '%.0f'|format(rate[1] / rate[0] * 100) }}%)</span>
+                {% else %}
+                  <span class="text-ink-500">n &lt; {{ base_rate_min_n }}</span>
+                {% endif %}
+              </div>
               <div class="pt-1">
                 <a href="/analysis/{{ p.symbol }}" class="text-sky-400 hover:underline">Full analysis →</a>
               </div>

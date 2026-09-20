@@ -12,7 +12,6 @@ import json
 import logging
 import re
 import secrets
-import time
 from collections.abc import Callable, Iterator
 from datetime import UTC, datetime
 from pathlib import Path
@@ -743,7 +742,7 @@ def attach_hx_toast(response: Response, kind: str, message: str) -> Response:
     """Attach an HX-Trigger toast event to an already-built response.
 
     Use this when a route already calls ``render()`` to produce its
-    partial (e.g., the dashboard news/signals refresh handlers) and
+    partial (e.g., the backtest run handlers) and
     wants to additionally pop a toast on the client.
     """
     if not message:
@@ -752,36 +751,6 @@ def attach_hx_toast(response: Response, kind: str, message: str) -> Response:
         {"toast": {"kind": kind, "message": message}}
     )
     return response
-
-
-# ----------------------------------------------------------------------
-# Rate limiter — single-process, single-user. Used by the refresh
-# endpoints (POST /news/refresh, POST /signals/refresh) to debounce a
-# user mashing the refresh button or browsers double-submitting.
-#
-# Per-key cooldown: rate_limit_check("news.refresh", 10) returns None
-# if the action is allowed (and records the call), or the number of
-# seconds the caller should wait. Caller decides what to render in the
-# blocked case (typically: the current state + a "wait" toast).
-# ----------------------------------------------------------------------
-
-_RATE_LIMIT_LAST_CALL: dict[str, float] = {}
-
-
-def rate_limit_check(key: str, cooldown_seconds: float) -> float | None:
-    """Return None if allowed (records the call), else seconds remaining.
-
-    Not thread-safe in the strict sense, but for a single-user local
-    app the dict-write race is benign (worst case: two near-simultaneous
-    refreshes both go through). No pruning; the dict has at most
-    one entry per refresh endpoint, so it never grows.
-    """
-    now = time.monotonic()
-    last = _RATE_LIMIT_LAST_CALL.get(key)
-    if last is None or (now - last) >= cooldown_seconds:
-        _RATE_LIMIT_LAST_CALL[key] = now
-        return None
-    return cooldown_seconds - (now - last)
 
 
 def get_session() -> Iterator[Session]:

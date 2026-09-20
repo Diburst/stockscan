@@ -29,15 +29,7 @@
     </div>
     <div class="flex items-center gap-3 text-xs">
       <span id="wlc-asof" class="text-ink-500"
-            title="Date of the last bar in the composite. Composites refresh when you add/remove symbols or click Rebuild.">—</span>
-      <form action="/watchlist/composite/rebuild" method="post" class="inline">
-        <input type="hidden" name="list_id" value="{{ selected_id }}">
-        <button type="submit"
-                class="text-ink-500 hover:text-ink-900 underline"
-                title="Recompute both composites from current membership and the latest stored bars (no data is fetched from the provider).">
-          ↻ Rebuild
-        </button>
-      </form>
+            title="Date of the last bar in the composite. Composites rebuild when you add/remove symbols.">—</span>
     </div>
   </div>
 
@@ -334,8 +326,8 @@
         WRAP.classList.add('hidden');
         LEGEND.classList.add('hidden');
         EMPTY.innerHTML = 'No composite yet for this list. It builds automatically when you ' +
-          'add or remove symbols — or click <strong>↻ Rebuild</strong> above (needs price ' +
-          'history, so run a Refresh first if these symbols are brand new).';
+          'add or remove symbols (needs price history, so run a Refresh first if these ' +
+          'symbols are brand new).';
         EMPTY.classList.remove('hidden');
         renderChips(payload.members || []);
         return;

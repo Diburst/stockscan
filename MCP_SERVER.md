@@ -14,15 +14,16 @@ Read tools (always available) — 21:
 - Signals: `list_signals` (filters: strategy, days, side, score band, symbol; gated to current strategy versions), `get_signal` (one by id, with the full score breakdown).
 - Strategies: `list_strategies`, `get_strategy` (includes the long-form `manual`).
 - Watchlist: `list_watchlists` (the named lists + counts), `list_watchlist` (items, enriched with latest close / % change).
-- Analysis: `get_analysis` (full per-symbol pipeline), `analyze_watchlist` (cross-section across watched symbols, with a `facet` to keep payloads small — summary/trend/volatility/`options_summary` (lean: IV + nearest 15Δ strikes + earnings flag + EMA-confluence count)/`options_context` (full strike sets + greeks — large)/full), `get_regime`.
+- Analysis: `get_analysis` (full per-symbol pipeline), `analyze_watchlist` (cross-section across watched symbols, with a `facet` to keep payloads small — summary/trend/volatility/`options_summary` (lean: HV + nearest 15Δ strikes + earnings flag + EMA-confluence count)/`options_context` (full strike sets + greeks — large)/full), `get_regime`.
 - Market context: `get_fundamentals`, `screen_by_market_cap`, `get_earnings`, `upcoming_earnings`, `get_news` (headlines/snippets), `get_article` (full body on demand — re-fetches from EODHD, ~1 credit, needs key), `get_insider` (per-symbol), `watchlist_insider` (net-buys across the watchlist), `upcoming_econ_events`.
+- Options: `propose_options` (the ranked short-premium book; per row `symbol, side, strike, dte, expiry, credit_per_contract, pct_otm, sigma_distance, credit_yield_ann, hv_pct, hv_percentile, move_sigma, trend_align, rank_key, contracts, day_move_pct, day_move_residual_pct, days_to_earnings, earnings_known, trend_bucket, confluences, rationale`; header `regime: {label, trend_gate_open, vol_scalar, credit_stress_flag}`, `book_mult`, `macro_events`, `candidates`, `book_size`). HV is realized vol, not a chain.
 - Backtests: `list_backtests`, `get_backtest` (export a run's trades/score-breakdowns/equity).
-- `get_refresh_status` — read side of the fire-and-poll refresh.
+- `get_refresh_status` — read side of the fire-and-poll refresh: the current step while running, the full result (bars, scans, trades, options, feeds, alerts, step_failures) when done.
 
 Write tools (only when writes are enabled — see `STOCKSCAN_MCP_ALLOW_WRITES`) — 16:
 
 - Watchlist management: `add_to_watchlist`, `add_symbols` (bulk), `remove_from_watchlist`, `create_watchlist`, `rename_watchlist`, `delete_watchlist`, `set_target`, `toggle_alert`.
-- Scans: `run_scan` (run a strategy or all, persist signals), `refresh_data` (background bars+strategies refresh — **fire-and-poll**: returns immediately, poll `get_refresh_status`).
+- Scans: `run_scan` (run a strategy or all, persist signals), `refresh_data` (starts the full refresh pipeline — the same run as the Dashboard's Refresh button and the nightly job — in the background, single-flight; **fire-and-poll**: returns immediately, poll `get_refresh_status`).
 - Data backfill / refresh (external EODHD API, costs credits; return `{"error": "no_api_key"}` if unconfigured): `backfill_bars`, `refresh_fundamentals`, `refresh_news`, `refresh_earnings`, `refresh_insider` (~23h cooldown), `refresh_universe`.
 
 Deliberately out of scope: anything that places trades, deletes signals, trains

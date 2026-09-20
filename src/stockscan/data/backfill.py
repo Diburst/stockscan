@@ -12,8 +12,10 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Iterable
 from zoneinfo import ZoneInfo
 
+from sqlalchemy.orm import Session
+
 from stockscan.data.providers.base import DataProvider
-from stockscan.data.store import latest_bar_date, upsert_bars
+from stockscan.data.store import latest_bar_date, latest_bar_dates, upsert_bars
 
 log = logging.getLogger(__name__)
 
@@ -96,7 +98,7 @@ def backfill_universe(
 
 
 # -----------------------------------------------------------------------
-# Bulk daily refresh path (Phase 3)
+# Bulk daily refresh path
 # -----------------------------------------------------------------------
 @dataclass(frozen=True, slots=True)
 class BulkRefreshResult:
@@ -182,3 +184,78 @@ def trading_days_since(last_date: date | None, until: date) -> list[date]:
             out.append(d)
         d += timedelta(days=1)
     return out
+
+
+
+def missing_bulk_dates(days_back: int, *, session: Session | None = None) -> list[date]:
+    """Trading days the bulk pass should fetch — empty when the store is
+    current.
+
+    Gap-fills from the latest stored daily bar up to the latest *completed*
+    session with no overlap: each full-market bulk call costs 100 EODHD
+    credits, so a store that already holds the latest available session
+    fetches nothing. A long outage is clamped to ``days_back`` so a stale
+    store cannot balloon into a huge fetch; an empty store starts there too.
+    """
+    from stockscan.data.store import latest_daily_bar_date
+
+    floor = date.today() - timedelta(days=days_back)
+    latest = latest_daily_bar_date(session=session)
+    start_after = max(latest, floor) if latest is not None else floor
+    return trading_days_since(start_after, latest_completed_session())
+
+
+# -----------------------------------------------------------------------
+# Per-symbol catch-up for names the bulk pass cannot bring current
+# -----------------------------------------------------------------------
+# Enough history for SMA(200) warm-up plus the analysis page's lookback on
+# a name that has no bars at all.
+CATCH_UP_CALENDAR_DAYS = 1140
+
+
+@dataclass(frozen=True, slots=True)
+class CatchUpResult:
+    upserted: int = 0
+    symbols_fetched: tuple[str, ...] = ()
+    failed: tuple[str, ...] = ()
+
+
+def catch_up_lagging_symbols(
+    provider: DataProvider,
+    symbols: Iterable[str],
+    *,
+    target: date,
+    session: Session | None = None,
+) -> CatchUpResult:
+    """Fetch, per symbol, every name whose latest stored bar is behind
+    ``target`` (the freshest market-wide bar date).
+
+    The bulk pass only fills the days the *market* is missing, judged by
+    the freshest bar in the store, so a symbol that fell behind on its own
+    — added to a watchlist after a gap, absent from a bulk day, or listed
+    on an exchange the bulk endpoint does not cover — never catches up
+    through it. This is the repair: one ``get_bars`` call per lagging
+    symbol from its own last bar forward, and no call at all for names
+    that are current. Meant for the watchlist, not the whole historical
+    index (delisted ex-members lag forever by construction).
+    """
+    syms = sorted({s for s in symbols if s})
+    if not syms:
+        return CatchUpResult()
+    latest = latest_bar_dates(syms, session=session)
+    lagging = [s for s in syms if latest.get(s) is None or latest[s] < target]
+    if not lagging:
+        return CatchUpResult()
+    log.info("catch-up: %d of %d symbols behind %s: %s", len(lagging), len(syms), target, lagging)
+    start = date.today() - timedelta(days=CATCH_UP_CALENDAR_DAYS)
+    upserted = 0
+    fetched: list[str] = []
+    failed: list[str] = []
+    for sym in lagging:
+        try:
+            upserted += backfill_symbol(provider, sym, start=start)
+            fetched.append(sym)
+        except Exception as exc:  # noqa: BLE001 — one bad name never aborts the rest
+            log.warning("catch-up: %s failed: %s", sym, exc)
+            failed.append(sym)
+    return CatchUpResult(upserted=upserted, symbols_fetched=tuple(fetched), failed=tuple(failed))

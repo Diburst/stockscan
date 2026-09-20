@@ -14,7 +14,7 @@ Personal swing-trading scanner, backtester, and position manager.
 - **Market regime layer**: SPY 200-day trend gate with a 3-close dwell (blocks new entries only), realized-vol position scalar (top tercile of the trailing year, per-strategy opt-in), HY OAS credit-stress breaker. Labels `risk_on` / `risk_off` / `credit_stress`. The backtest engine applies the same rules from the same `regime_frame`
 - **Sizing**: `size_for_strategy` shared by the live runner and the backtest engine — risk % against the strategy's stop, or a fixed fraction for stop-less strategies, times the vol scalar where the strategy opts in. Sector cap, ADV cap and per-strategy position cap all bind in both paths
 - **Event-driven backtester** sharing strategy, sizing and regime code with the live engine; metrics module; `backtest debug` replays `signals()` day by day for one symbol
-- **Web UI** (mobile-first responsive): top nav is Dashboard, Signals, Watchlist, Options, Hedge, Trades, Backtests, with Strategies and Docs in the footer. Dashboard with regime card (trend gate / vol scalar / credit stress + per-strategy sizing lines), latest-scan passing signals + news card, Signals (with Fetch Latest + freshness chip), Signal detail (full attribution: outcome, score derivation, sizing breakdown, regime context, strategy version), Watchlist, Trades, Backtests, Base-Rate Analyzer, Strategies (sizing rule + tuning knobs per strategy), per-symbol Analysis (trend, volatility, earnings, insider activity, options context — reached from any symbol link or the Watchlist's Analyse button)
+- **Web UI** (mobile-first responsive): top nav is Dashboard, Signals, Watchlist, Options, Hedge, Trades, Backtests, with Strategies and Docs in the footer. Dashboard with the single **Refresh** button (runs the whole pipeline in the background with per-step status; the only fetch/analyze control in the app), regime card (trend gate / vol scalar / credit stress + per-strategy sizing lines), latest-scan passing signals + news card, Signals (with freshness chip), Signal detail (full attribution: outcome, score derivation, sizing breakdown, regime context, strategy version), Watchlist, Trades, Backtests, Base-Rate Analyzer, Strategies (sizing rule + tuning knobs per strategy), per-symbol Analysis (trend, volatility, earnings, insider activity, options context — reached from any symbol link or the Watchlist's Analyse button)
 - **In-app news reader**: Dashboard news card with per-article expand-on-click, on-demand re-fetch from EODHD (not persisted, no content-rights concerns)
 - **Watchlist** with per-symbol price-target alerts (above/below), auto-disable after firing, "+ Watch" quick-add from Dashboard
 - **Strategy-owned signal scores**: each strategy computes its own ranking score and persists the inputs behind it in `signals.metadata`; the signal-detail page renders them with trader-language labels
@@ -165,8 +165,8 @@ Available pages:
 
 | URL | What it shows |
 |---|---|
-| `/` | Dashboard — equity, the latest scan's passing signals (with "+ Watch" quick-add), open positions, **Market Regime** card showing the trend gate (with days on side), the vol scalar (realized vol + percentile rank) and the credit-stress flag, each with a dropdown explanation, plus a per-strategy line saying its sizing rule and whether the vol scalar applies, **news card** with per-article expand-on-click reader |
-| `/signals` | Today's passing + rejected signals, filterable by strategy. **Header strip**: "Last scan: Xh ago · N today" + "Bars current through: YYYY-MM-DD [fresh/Nd behind]" + ⟳ Fetch Latest button (HTMX-swapped: backfills 7 days of bars + re-runs every strategy). **Score** column (the strategy's own ranking metric — idiosyncratic drop for RSI(2), closeness + slope quality + residual tilt for momentum — with the inputs on the detail page) |
+| `/` | Dashboard — the **Refresh** button and its status strip (step k/9, elapsed, then the result), equity, the latest scan's passing signals (with "+ Watch" quick-add), open positions, **Market Regime** card showing the trend gate (with days on side), the vol scalar (realized vol + percentile rank) and the credit-stress flag, each with a dropdown explanation, plus a per-strategy line saying its sizing rule and whether the vol scalar applies, **news card** with per-article expand-on-click reader |
+| `/signals` | Today's passing + rejected signals, filterable by strategy. **Header strip**: "Last scan: Xh ago · N today" + "Bars current through: YYYY-MM-DD [fresh/Nd behind]". **Score** column (the strategy's own ranking metric — idiosyncratic drop for RSI(2), closeness + slope quality + residual tilt for momentum — with the inputs on the detail page) |
 | `/signals/{id}` | Full signal attribution: Outcome (entry/stop/qty/risk-per-share/notional — or "no stop" for stop-less strategies), Score derivation (humanized strategy metadata with one-line tooltips per input), Position sizing (the strategy's rule × the vol scalar where it applies, plus the trend gate and credit-stress state), Market regime context (gate, SPY vs SMA(200), realized vol + rank, HY OAS + rank), Strategy version at scan time |
 | `/signals/{id}/base-rates` | Historical-setup outcome stats for that strategy on that symbol |
 | `/news/{article_id}/content` | HTMX fragment endpoint — re-fetches the article body from EODHD on demand (not persisted) |
@@ -178,6 +178,7 @@ Available pages:
 | `/strategies` | Registered strategies with descriptions and each card's sizing rule (risk % against the stop, or a fixed fraction per position, and whether it is vol-scaled) |
 | `/strategies/{name}` | Strategy detail with the sizing summary (rule, max open positions, vol scalar applies or not), the rendered manual, the **tuning knobs** table read off the class, and the freshness of any non-bar inputs (e.g. latest sector-composite bar) |
 | `/analysis` · `/analysis/{symbol}` | Per-symbol analysis: trend bucket (MA stack + returns), realized-volatility state, options context (Black-Scholes strike framing), insider activity |
+| `/options` | Proposed short-premium book, computed on demand. Header: trend gate / vol scalar / credit stress, the book multiplier and any high-importance US macro event inside the expiry. Rows: strike, %OTM, σ-distance, DTE, HV% (realized, not a chain) and its percentile, estimated credit and annualised yield, contracts, today's move (raw and vs. sector). "Why this trade" lists the filters passed, the rank inputs (`move_sigma` × trend alignment, HV percentile tie-break), key EMAs near the strike as a fact, the earnings flag (amber when the date is unknown) and the trigger-class base rate from settled proposals (`n < 30` until there are enough). `?list=` and `?n=` narrow it |
 | `/health` | JSON status (DB, TimescaleDB extension, registered strategies) |
 | `/docs` | **Documentation hub** — index of all repo markdown docs (README, DESIGN, USER_STORIES, TODO, DEPLOY, MIGRATION, regime-research) plus the auto-generated CLI reference. Renders markdown with TOC + anchor links; CLI reference walks the live Typer command tree |
 | `/docs/cli` | Auto-generated CLI reference. Captures `--help` for every `stockscan` command/group/leaf via `typer.testing.CliRunner` — single source of truth, never drifts |
@@ -212,7 +213,7 @@ Valid names: `eod`, `bulk`, `universe`, `fundamentals`, `news`, `calendar`,
 `insider`, `econ_events`. With a family excluded:
 
 - `stockscan refresh fundamentals` / `refresh news` print a one-line notice and exit 0 (so the Sunday fundamentals cron and any scripts keep working), and the watchlist / analysis / MCP refresh paths skip that leg — **no request is made**, nothing counts against quota, no `DEGRADED` nightly summaries.
-- Stored rows are still shown everywhere (the news card, insider tables, fundamentals). Refresh buttons become a muted "not available on current data plan" note.
+- Stored rows are still shown everywhere (the news card, insider tables, fundamentals); the pipeline's feeds step skips those families and the Refresh strip lists them as "not on plan".
 - The sector composites both strategies rank against keep building from bars, but their sector map comes from the frozen `fundamentals_snapshot`; each strategy page shows the latest composite bar date.
 - `stockscan refresh universe` switches to a **Wikipedia fallback** (see below) so newly added index members still get scanned.
 - `stockscan health` lists the enabled families; startup logs a warning naming the excluded ones.
@@ -260,13 +261,13 @@ OHLCV rows to the `bars` table. The watchlist UI, the per-symbol
 technical analysis (`/analysis`), and any `backtest run` invocation that
 references the symbol all read straight from this table.
 
-**Universe-wide** — omit positional args to backfill every symbol ever in
-the S&P 500 (current + historical members). Restoring delisted members
-eliminates survivorship bias on backtests.
+**Universe-wide** — omit positional args to backfill every *tracked*
+symbol: every symbol ever in the S&P 500 (current + historical members,
+so backtests stay survivorship-free) plus every symbol on a watchlist.
 
 Defaults:
 
-- **Symbols:** all symbols ever in the S&P 500 (current + historical, ~1,200–1,500 names). Use `--current-only` to fetch just the current ~500.
+- **Symbols:** the tracked set (~1,200–1,500 ever-members + the watchlist). Use `--current-only` to fetch just the current ~500.
 - **Start date:** 2007-01-01 (override with `--start YYYY-MM-DD`)
 - **End date:** today (override with `--end YYYY-MM-DD`)
 - **Interval:** daily
@@ -285,6 +286,8 @@ Hits EODHD's `/eod/{TICKER}.US` once per symbol. Initial backfill numbers:
 Subsequent runs are **incremental** — each symbol re-fetches `last_cached_date − 5 days` to today, so a daily refresh takes seconds.
 
 **Why default to all historical members?** A backtest of, say, 2015 needs bars for companies that were S&P 500 members back then but have since been removed (acquired, bankrupted, demoted). Without those bars, the backtest silently drops trades on delisted losers and inflates returns — that's survivorship bias. Fetching all ever-members eliminates it.
+
+**Keeping the watchlist current.** The refresh pipeline (the Dashboard's Refresh button and the nightly job) pulls the market's missing days through the bulk endpoint, filtered to the same tracked set, and then run a per-symbol catch-up for any watched name whose own latest bar is behind the freshest market-wide bar (one `/eod` call per lagging name, none when current). A watched name outside the index therefore never goes stale, even after weeks off the bulk filter.
 
 **Per-bar fields stored** in the `bars` table:
 
@@ -372,7 +375,7 @@ uv run stockscan composites build                                    # full rebu
 uv run stockscan composites symbol AAPL                              # which composite a symbol maps to
 
 # Scheduled jobs (run by supercronic / launchd in production)
-uv run stockscan jobs nightly-scan               # bars → macro → regime → composites → scans → alerts → summary
+uv run stockscan jobs nightly-scan               # the refresh pipeline + summary: bars → macro → regime → composites → scans → trades → options → feeds → alerts
 
 # Web + tests
 make run-web                                     # FastAPI dev server on :8000
@@ -432,7 +435,7 @@ stock-scan/
 │   ├── regime/                        # rules.py (pure math, regime_frame) + detect.py + store.py
 │   ├── analyzer/                      # Per-signal historical base-rate analysis
 │   ├── analysis/                      # Per-symbol trend / volatility / options context
-│   ├── scan/                          # ScanRunner + signals_freshness + refresh_signals (Fetch Latest)
+│   ├── scan/                          # ScanRunner + signals_freshness + has_run_covering
 │   ├── risk/                          # sizer.py (size_for_strategy) + filters.py (filter chain)
 │   ├── broker/                        # Broker ABC + Suggestion + Paper (E*TRADE in Phase 4)
 │   ├── backtest/                      # Event-driven engine + slippage + persistence + profile
@@ -443,7 +446,7 @@ stock-scan/
 │   ├── proposals/, hedge/, cycles/    # Options proposals, delta hedging, cycle tools
 │   ├── watchlist/                     # Store + alerts + nightly hook
 │   ├── notify/                        # Email (SMTP) + Discord webhook + router
-│   ├── jobs/                          # Nightly orchestration
+│   ├── jobs/                          # pipeline.py (the refresh pipeline) + background.py (single-flight runner)
 │   ├── mcp/                           # MCP server (see MCP_SERVER.md)
 │   └── web/                           # FastAPI app, routes, Jinja templates (mobile-first),
 │                                        self-hosted static assets (Tailwind build + htmx)
@@ -491,7 +494,7 @@ stock-scan/
 | News integration | ✅ Done | EODHD `/news` for general feed + watchlist symbols, sentiment-aware ranking, dashboard card with **on-demand article reader** (per-row expand → re-fetch from provider, never persisted), CLI `refresh news` |
 | Strategy canon review (2026-09) | ✅ Done | Book reduced to RSI(2) pullback + 52-week-high momentum, both v2.0.0; knobs as class constants; exits (stops included) strategy-owned; sizing shared by runner and engine. Settling backtests listed in `TODO.md` |
 | Signal-detail full attribution | ✅ Done | Outcome, Score derivation (humanized strategy metadata + tooltips), Position sizing (strategy rule × vol scalar, gate + credit-stress state), Market regime context (gate, realized vol + rank, HY OAS + rank), Strategy version at scan time, raw JSONB fallback |
-| Signals freshness + Fetch Latest | ✅ Done | Header strip on `/signals` showing last scan + bars-current-through with [fresh/Nd behind] badge. POST `/signals/refresh` button: 7-day bulk-EOD bars catch-up + re-runs every registered strategy via HTMX |
+| Signals freshness + the one Refresh button | ✅ Done | Header strip on `/signals` showing last scan + bars-current-through with [fresh/Nd behind] badge. The Dashboard's Refresh button runs the full pipeline (`jobs.pipeline`) in the background, single-flight, with per-step status |
 | Options + hedging | ✅ Done | Weekly short-premium proposals (`stockscan options propose`), delta-hedge daemon and playground (`/hedge`), MCP tools for both |
 | 4 — E*TRADE integration | Pending | OAuth flow, broker impl, fill reconciliation |
 | 5 — Hardening | Pending | Reconciliation drift alerts, error handling, journal export |

@@ -54,6 +54,13 @@
 {%- set health_degraded = (not health.ok) or (not health.timescaledb) or health.timescaledb == "(missing)" -%}
 <div class="space-y-6">
 
+  {% include "_refresh_strip.html" %}
+
+  {# Everything below reloads in place when a refresh run finishes. #}
+  <div id="dashboard-body" class="space-y-6"
+       hx-get="/" hx-trigger="refresh-done from:body"
+       hx-select="#dashboard-body" hx-swap="outerHTML">
+
   {# Headline numbers #}
   <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
     <div class="bg-white rounded-xl shadow-sm border border-ink-300/40 p-4">
@@ -230,7 +237,7 @@
   {% if 'econ_events' in features or macro_events %}
   {% call card(
       title="Macro this week",
-      subtitle="High / medium-importance US economic releases, next 7 days. Refreshes with Refresh bars on the Watchlist."
+      subtitle="High / medium-importance US economic releases, next 7 days. Refreshes with the Refresh button above."
   ) %}
     {% if not macro_events %}
       <p class="text-sm text-ink-500">No high/medium-importance US releases in the next 7 days, or not yet refreshed.</p>
@@ -361,6 +368,6 @@
       {% endif %}
     </div>
   {% endif %}
-
+  </div>
 </div>
 {% endblock %}

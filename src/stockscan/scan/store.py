@@ -4,9 +4,9 @@ The scanner itself (``runner.py``) writes ``signals`` and ``strategy_runs``
 rows. This module is the read-side companion: thin SQL functions for
 the dashboard / Signals page that don't belong inside the runner class.
 
-Currently exposes :func:`signals_freshness` — a small bundle of "how
-fresh is the signals table?" facts. Add more (e.g., per-strategy
-recency, intraday refresh stats) as new UI surfaces need them.
+Exposes :func:`signals_freshness` — a small bundle of "how fresh is the
+signals table?" facts — and :func:`has_run_covering`, which the refresh
+pipeline uses to skip scans that would only repeat the last run.
 """
 
 from __future__ import annotations
@@ -74,6 +74,25 @@ def signals_freshness(*, session: Session | None = None) -> SignalsFreshness:
             latest_bar_date=max_bar[0] if max_bar else None,
             signals_today_count=int(today[0]) if today and today[0] is not None else 0,
         )
+
+    if session is not None:
+        return _run(session)
+    with session_scope() as s:
+        return _run(s)
+
+
+def has_run_covering(
+    strategy_name: str, strategy_version: str, bar_date: date, *, session: Session | None = None
+) -> bool:
+    """True when a run of this strategy version has an as-of date at or
+    past ``bar_date`` — i.e. it already saw every stored bar."""
+    sql = text(
+        "SELECT 1 FROM strategy_runs WHERE strategy_name = :n AND strategy_version = :v "
+        "AND as_of_date >= :d LIMIT 1"
+    )
+
+    def _run(s: Session) -> bool:
+        return s.execute(sql, {"n": strategy_name, "v": strategy_version, "d": bar_date}).first() is not None
 
     if session is not None:
         return _run(session)

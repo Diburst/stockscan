@@ -1,4 +1,4 @@
-"""Scan + refresh tools. ``refresh_data`` is fire-and-poll."""
+"""Scan + refresh tools. ``refresh_data`` starts the background pipeline; poll ``get_refresh_status``."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ from typing import Any
 
 from stockscan.mcp.serialize import jsonable
 from stockscan.scan import ScanRunner
-from stockscan.scan.refresh_job import current_job, start_refresh
+from stockscan.jobs import background
 from stockscan.strategies import STRATEGY_REGISTRY, discover_strategies
 
 
@@ -57,45 +57,68 @@ def run_scan(
     return {"results": results}
 
 
-def refresh_data(days_back: int = 7) -> dict[str, Any]:
-    """Start a background data refresh (bars + re-run strategies). WRITE, async.
+def refresh_data() -> dict[str, Any]:
+    """Start the full refresh pipeline in the background. WRITE, async.
 
-    Fire-and-poll: this returns immediately. The refresh is single-flight — if
-    one is already running, this joins it rather than starting a second. Poll
-    ``get_refresh_status`` to see progress and the final summary.
-
-    Args:
-        days_back: How many days of bars to backfill before re-running (default 7).
+    The same run the Dashboard's Refresh button starts: bars + catch-up,
+    FRED macro, regime, sector and watchlist composites, strategy scans
+    (skipped when nothing is new), paper-trade upkeep, tonight's options
+    book + settlement, the feeds the data plan allows, watchlist alerts.
+    Single-flight: if a run is already in flight this joins it. Poll
+    ``get_refresh_status`` for the current step and the final result.
 
     Returns:
-        {"ok", "started_new", "status", "started_at", "elapsed_seconds"}.
+        {"ok", "started_new", "status", "step", "started_at", "elapsed_seconds"}.
     """
-    state, started_new = start_refresh(days_back=days_back)
+    state, started_new = background.start()
     return {
         "ok": True,
         "started_new": started_new,
         "status": state.status,
+        "step": f"{state.step_index}/{state.step_total} {state.step}",
         "started_at": state.started_at.isoformat(),
         "elapsed_seconds": state.elapsed_seconds,
-        "note": "Poll get_refresh_status for progress and the final summary.",
+        "note": "Poll get_refresh_status for progress and the final result.",
     }
 
 
 def get_refresh_status() -> dict[str, Any]:
-    """Check the status of the current/most-recent data refresh.
+    """Check the current/most-recent refresh run.
 
     Returns:
-        {"status": "idle" | "running" | "done" | "error", ...}. When done,
-        includes the refresh ``summary`` (bars upserted, signals emitted, etc.).
+        {"status": "idle" | "running" | "done" | "error", ...}. While
+        running, ``step`` names the step in progress; when done, ``result``
+        carries the counts (bars, scans, trades, options, feeds, alerts,
+        step_failures).
     """
-    job = current_job()
+    job = background.current()
     if job is None:
         return {"status": "idle", "job": None}
+    r = job.result
     return {
         "status": job.status,
+        "step": f"{job.step_index}/{job.step_total} {job.step}",
         "started_at": job.started_at.isoformat(),
         "finished_at": job.finished_at.isoformat() if job.finished_at else None,
         "elapsed_seconds": job.elapsed_seconds,
-        "summary": jsonable(job.summary),
+        "result": None if r is None else {
+            "as_of": r.as_of.isoformat(),
+            "bars_upserted": r.bars_upserted,
+            "caught_up": list(r.caught_up),
+            "scans_skipped": r.scans_skipped,
+            "scans": [
+                {"strategy": s.strategy_name, "version": s.strategy_version,
+                 "signals_emitted": s.signals_emitted, "rejected_count": s.rejected_count}
+                for s in r.scans
+            ],
+            "trades_marked": r.trades_marked,
+            "trades_auto_closed": r.trades_auto_closed,
+            "options_run_id": r.options_run_id,
+            "options_settled": r.options_settled,
+            "feeds": r.feeds,
+            "watchlist_alerts_fired": r.watchlist_alerts_fired,
+            "step_failures": r.step_failures,
+            "duration_seconds": round(r.duration_seconds, 1),
+        },
         "error": job.error,
     }

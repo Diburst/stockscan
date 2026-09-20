@@ -5,10 +5,9 @@ regime-sized, diversified book of short-premium trade proposals. It is NOT a
 ``Strategy`` (those are per-symbol/directional); it's a sibling to the scan
 runner that consumes ``SymbolAnalysis`` and constructs a portfolio.
 
-Reads like a book: the candidate scoring, side selection, and sizing rules live
-inline in ``engine.py`` / ``portfolio.py`` with trader-language comments.
-
-See ``options_proposal_engine_design.md`` for the full design + decisions.
+Reads like a book: the trigger, side selection, hard filters and rank key live
+inline in ``engine.py``; the book multiplier, contract sizing and the
+diversification caps in ``portfolio.py``. DESIGN.md §4.16 is the design note.
 """
 
 from __future__ import annotations

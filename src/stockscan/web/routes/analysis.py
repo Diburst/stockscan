@@ -2,7 +2,6 @@
 
   GET  /analysis                          - listing: every watched symbol with summary card + mini chart.
   GET  /analysis/{symbol}                 - detail: large chart + full breakdown.
-  POST /analysis/{symbol}/refresh-insider - on-demand insider pull (10 API credits; 23h cooldown).
 """
 
 from __future__ import annotations
@@ -20,16 +19,10 @@ from stockscan.analysis import (
     build_chart_payload,
     render_chart_svg,
 )
-from stockscan.config import settings
-from stockscan.data.providers.eodhd import EODHDError, EODHDProvider
 from stockscan.earnings import latest_trend, next_earnings
-from stockscan.insider import (
-    net_buys_90d,
-    recent_transactions,
-    refresh_insider_for_symbol,
-)
+from stockscan.insider import net_buys_90d, recent_transactions
 from stockscan.watchlist.store import list_watchlists, resolve_selection
-from stockscan.web.deps import flash_redirect, get_session, render
+from stockscan.web.deps import get_session, render
 
 router = APIRouter(prefix="/analysis")
 log = logging.getLogger(__name__)
@@ -148,56 +141,4 @@ def analysis_detail(
         earnings_trends=trends,
         insider_txns=insider_txns,
         insider_summary=insider_summary,
-    )
-
-
-@router.post("/{symbol}/refresh-insider")
-def analysis_refresh_insider(
-    symbol: str,
-    request: Request,
-    s: Session = Depends(get_session),
-):
-    """On-demand per-symbol insider refresh from the analysis page.
-
-    Costs 10 API credits per successful call — gated by the 23h
-    per-symbol cooldown in ``insider_refresh_log``. The cooldown
-    survives app restarts and page reloads because the timestamp lives
-    in the DB, not in process memory.
-    """
-    sym = symbol.upper().strip()
-    if not sym:
-        raise HTTPException(status_code=400, detail="empty symbol")
-    api_key = settings.eodhd_api_key.get_secret_value()
-    if not api_key:
-        return flash_redirect(
-            f"/analysis/{sym}",
-            "error",
-            "EODHD_API_KEY is not set; can't refresh insider data.",
-        )
-    try:
-        with EODHDProvider(api_key=api_key) as provider:
-            result = refresh_insider_for_symbol(provider, sym, session=s)
-    except EODHDError as exc:
-        return flash_redirect(f"/analysis/{sym}", "error", f"Provider error: {exc}")
-    except Exception as exc:  # safety
-        log.exception("analysis_refresh_insider: unexpected error")
-        return flash_redirect(f"/analysis/{sym}", "error", f"Refresh failed: {exc}")
-
-    if result.skipped_reason:
-        return flash_redirect(
-            f"/analysis/{sym}", "warn", f"Insider data is {result.skipped_reason}"
-        )
-    if result.skipped:
-        h = (result.cooldown_remaining_secs or 0) / 3600.0
-        return flash_redirect(
-            f"/analysis/{sym}",
-            "warn",
-            f"Insider data was refreshed recently — try again in {h:.1f}h",
-        )
-    if result.error:
-        return flash_redirect(f"/analysis/{sym}", "warn", f"Insider refresh: {result.error}")
-    return flash_redirect(
-        f"/analysis/{sym}",
-        "success",
-        f"Insider refreshed — {result.transactions_upserted} transaction(s) updated",
     )

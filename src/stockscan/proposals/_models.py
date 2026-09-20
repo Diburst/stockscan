@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from datetime import date
 from typing import Any
 
-# Side identifiers — short-premium only in v1.
+# Side identifiers — short premium only.
 SELL_PUT = "sell_put"
 SELL_CALL = "sell_call"
 
@@ -15,10 +15,10 @@ SELL_CALL = "sell_call"
 class OptionProposal:
     """One proposed short-premium trade (one side of one name, nearest expiry).
 
-    ``score`` is the 0–1 attractiveness used for ranking; ``size_weight`` is the
-    regime-and-side-adjusted relative size (0–1) you scale your per-trade risk
-    by. ``score_breakdown`` keeps the per-input contributions so the UI/agent can
-    explain the rank, mirroring the signal score-derivation card.
+    ``rank_key`` (|move_sigma| × trend alignment) is the only ranking input.
+    ``size_weight`` is the book multiplier the regime layer set for every row;
+    ``contracts`` is this row's size against live equity. ``score_breakdown``
+    holds the rank inputs so the page and the agent can explain the order.
     """
 
     symbol: str
@@ -29,15 +29,28 @@ class OptionProposal:
     delta: float
     est_credit: float  # BS fair value per share (× 100 = per contract)
     pct_otm: float
-    iv_pct: float
+    hv_pct: float  # annualised realized vol the leg was priced off
+    hv_percentile: float | None  # 21d vol ranked in its trailing 252 (0–100)
 
-    score: float
-    size_weight: float
+    # Rank.
+    move_sigma: float  # today's move in daily-σ units (residual for puts, raw for calls)
+    trend_align: float
+    rank_key: float
+
+    # Size.
+    size_weight: float  # book multiplier (identical per row)
+    contracts: int | None
+
+    # What a seller reads.
+    sigma_distance: float  # strike distance in σ of the tenor's expected move
+    credit_yield_ann: float  # est_credit / strike, annualised, in %
 
     # Context that drove the proposal.
     day_move_pct: float | None
+    day_move_residual_pct: float | None
     days_to_earnings: int | None
-    confluence_count: int  # key EMAs within 0.5×ATR of the strike
+    earnings_known: bool
     trend_bucket: str
+    confluences: tuple[str, ...]  # displayed fact only; not ranked
     rationale: str
     score_breakdown: dict[str, Any] = field(default_factory=dict)

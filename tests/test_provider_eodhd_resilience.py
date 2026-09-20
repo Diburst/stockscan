@@ -27,7 +27,7 @@ from stockscan.data.providers.eodhd import (
     _retry_wait,
     _RetryPolicy,
 )
-from stockscan.scan.refresh import _bulk_dates
+from stockscan.data.backfill import missing_bulk_dates
 
 
 def _state(exc: BaseException | None, attempt: int = 1) -> MagicMock:
@@ -150,7 +150,7 @@ def test_provider_429_exhaustion_raises_eodhd_error(monkeypatch):
 # --- bulk-refresh gap-fill -------------------------------------------------
 def test_bulk_dates_full_window_when_store_empty():
     with patch("stockscan.data.store.latest_daily_bar_date", return_value=None):
-        dates = _bulk_dates(7)
+        dates = missing_bulk_dates(7)
     # A 7-day window always contains at least 5 weekdays.
     assert len(dates) >= 4
 
@@ -158,7 +158,7 @@ def test_bulk_dates_full_window_when_store_empty():
 def test_bulk_dates_gapfills_when_current():
     today = dt.date.today()
     with patch("stockscan.data.store.latest_daily_bar_date", return_value=today):
-        dates = _bulk_dates(7)
+        dates = missing_bulk_dates(7)
     # Store already current → only the single overlap day (or none on a
     # weekend), never the whole trailing window.
     assert len(dates) <= 1
@@ -167,8 +167,8 @@ def test_bulk_dates_gapfills_when_current():
 def test_bulk_dates_caps_long_outage_at_days_back():
     stale = dt.date.today() - dt.timedelta(days=90)
     with patch("stockscan.data.store.latest_daily_bar_date", return_value=stale):
-        capped = _bulk_dates(7)
+        capped = missing_bulk_dates(7)
     with patch("stockscan.data.store.latest_daily_bar_date", return_value=None):
-        full = _bulk_dates(7)
+        full = missing_bulk_dates(7)
     # A 90-day-stale store doesn't balloon — it's clamped to the days_back floor.
     assert capped == full

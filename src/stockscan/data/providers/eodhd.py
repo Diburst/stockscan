@@ -582,9 +582,3 @@ class EODHDProvider(DataProvider):
 
     def close(self) -> None:
         self._client.close()
-
-    def __enter__(self) -> EODHDProvider:
-        return self
-
-    def __exit__(self, *_args: object) -> None:
-        self.close()

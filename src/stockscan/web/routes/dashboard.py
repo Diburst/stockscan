@@ -21,6 +21,7 @@ from stockscan.strategies import (
 )
 from stockscan.watchlist import watchlist_symbols
 from stockscan.web.deps import get_session, render
+from stockscan.web.routes.refresh import strip_context
 
 router = APIRouter()
 
@@ -162,9 +163,8 @@ def dashboard(request: Request, s: Session = Depends(get_session)):
         watching=watching,
         news_articles=news_articles,
         news_last_fetched=news_last_fetched,
-        news_refresh_error=None,
-        news_refresh_summary=None,
         calendar_state=calendar_state,
         macro_events=macro_events,
         watch_earnings=watch_earnings,
+        **strip_context(),
     )

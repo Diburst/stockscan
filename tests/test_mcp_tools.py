@@ -103,7 +103,7 @@ async def test_write_tools_gated():
 # refresh status (no DB when idle)
 # ----------------------------------------------------------------------
 def test_get_refresh_status_idle():
-    from stockscan.scan.refresh_job import _reset_for_tests
+    from stockscan.jobs.background import _reset_for_tests
 
     _reset_for_tests()
     out = t_scan.get_refresh_status()
@@ -276,11 +276,13 @@ def test_options_summary_facet_is_lean():
         pct_to_support=8.13,
         pct_to_resistance=0.94,
     )
-    a = SimpleNamespace(symbol="TEST", available=True, last_close=100.0, options_context=oc)
+    a = SimpleNamespace(
+        symbol="TEST", available=True, last_close=100.0, last_bar_date=None, options_context=oc
+    )
 
     out = _project(a, "options_summary")
     assert out["symbol"] == "TEST"
-    assert out["iv_pct"] == 86
+    assert out["hv_pct"] == 86
     assert out["call_15d"] == {"strike": 110.0, "pct_otm": 10.0}
     assert out["put_15d"]["pct_otm"] == -10.0
     assert out["confluence_count"] == 3
@@ -290,6 +292,46 @@ def test_options_summary_facet_is_lean():
 
     blob = json.dumps(out)
     assert "theta" not in blob and "vega" not in blob and "confluences" not in blob
+
+
+def test_propose_options_payload(monkeypatch):
+    from types import SimpleNamespace
+
+    from stockscan.mcp.tools import proposals as t_proposals
+    from stockscan.proposals._models import OptionProposal
+    from stockscan.proposals.service import ProposalRun
+
+    row = OptionProposal(
+        symbol="AAPL", side="sell_put", expiry_date=dt.date(2026, 9, 25), days_to_expiry=7,
+        strike=180.0, delta=-0.15, est_credit=1.25, pct_otm=-8.0, hv_pct=32.0,
+        hv_percentile=71.0, move_sigma=-1.8, trend_align=1.0, rank_key=1.8,
+        size_weight=0.72, contracts=3, sigma_distance=1.5, credit_yield_ann=36.2,
+        day_move_pct=-2.4, day_move_residual_pct=-2.1, days_to_earnings=None,
+        earnings_known=False, trend_bucket="up", confluences=("50 EMA $180.40",),
+        rationale="Red day.", score_breakdown={"rank_key": 1.8},
+    )
+    regime = SimpleNamespace(
+        regime="risk_on", trend_gate_open=True, vol_multiplier=0.72, credit_stress_flag=False
+    )
+    run = ProposalRun(
+        as_of=dt.date(2026, 9, 18), regime=regime, candidates=4, book=[row],
+        book_mult=0.72, macro_events=["CPI Thu"], equity=125_000.0,
+    )
+    monkeypatch.setattr(t_proposals, "generate_book", lambda **k: run)
+
+    out = t_proposals.propose_options(n=5)
+    assert out["regime"] == {
+        "label": "risk_on", "trend_gate_open": True, "vol_scalar": 0.72, "credit_stress_flag": False,
+    }
+    assert out["book_mult"] == 0.72 and out["macro_events"] == ["CPI Thu"]
+    assert out["candidates"] == 4 and out["book_size"] == 1
+    [r] = out["book"]
+    assert {"hv_pct", "earnings_known", "sigma_distance", "credit_yield_ann", "contracts",
+            "move_sigma", "rank_key"} <= set(r)
+    assert r["hv_pct"] == 32.0 and r["earnings_known"] is False and r["contracts"] == 3
+    assert r["credit_per_contract"] == 125.0 and r["expiry"] == "2026-09-25"
+    assert r["confluences"] == ["50 EMA $180.40"]
+    assert "iv_pct" not in r and "score" not in r
 
 
 def test_backfill_bars_requires_symbols():

@@ -3,8 +3,8 @@
 Covers:
   * ``compute_trend`` populates the EMA dict (periods from _EMA_PERIODS).
   * ``compute_options_context`` emits one StrikeSet per configured tenor,
-    with the right days-to-expiry, target delta, expiry date, and OTM
-    direction (put below spot, call above).
+    snapped to the next Friday, with the DTE recomputed from that Friday,
+    the right target delta, and OTM direction (put below spot, call above).
   * ``_strike_confluences`` flags an EMA within 0.5×ATR and ignores ones
     outside the band (and no-ops when ATR is unknown).
   * The confluence shows up end-to-end on the produced OptionStrike and in
@@ -13,7 +13,8 @@ Covers:
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, timedelta
+from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
@@ -69,34 +70,79 @@ def test_compute_trend_populates_emas():
 # Multi-tenor strike ladder
 # ---------------------------------------------------------------------------
 def test_strike_sets_match_configured_tenors():
+    as_of = date(2026, 6, 13)  # Saturday
     ctx = compute_options_context(
-        symbol="AAPL", as_of=date(2026, 6, 13), last_close=150.0,
+        symbol="AAPL", as_of=as_of, last_close=150.0,
         trend=TrendState.unavailable(), volatility=_vol_state(),
         session=None,
     )
     assert len(ctx.strike_sets) == len(_STRIKE_TENORS)
     for ss, (days, delta) in zip(ctx.strike_sets, _STRIKE_TENORS, strict=True):
-        assert ss.days_to_expiry == days
+        assert ss.expiry_date.weekday() == 4
+        assert ss.expiry_date >= as_of + timedelta(days=days)
+        assert ss.days_to_expiry == (ss.expiry_date - as_of).days
         assert ss.target_delta == delta
-        assert ss.expiry_date == date(2026, 6, 13) + pd.Timedelta(days=days).to_pytimedelta()
         # Put below spot, call above; deltas carry the right sign.
         assert ss.put.strike < 150.0 < ss.call.strike
         assert ss.call.delta > 0 and ss.put.delta < 0
         assert abs(ss.call.delta) == round(delta, 4)
 
 
-def test_expiries_land_on_the_two_fridays_from_a_saturday():
-    # Sat 2026-06-13: 6 days → Fri 06-19, 13 days → Fri 06-26.
+def test_expiries_snap_to_fridays_from_a_saturday():
+    # Sat 2026-06-13: 6 days → Fri 06-19, 13 days → Fri 06-26, 30 days →
+    # Mon 07-13 → Fri 07-17 (34 days).
     ctx = compute_options_context(
         symbol="X", as_of=date(2026, 6, 13), last_close=100.0,
         trend=TrendState.unavailable(), volatility=_vol_state(),
         session=None,
     )
-    by_days = {ss.days_to_expiry: ss for ss in ctx.strike_sets}
-    assert by_days[6].expiry_date == date(2026, 6, 19)
-    assert by_days[6].expiry_date.weekday() == 4  # Friday
-    assert by_days[13].expiry_date == date(2026, 6, 26)
-    assert by_days[13].expiry_date.weekday() == 4
+    assert [(ss.days_to_expiry, ss.expiry_date) for ss in ctx.strike_sets] == [
+        (6, date(2026, 6, 19)),
+        (13, date(2026, 6, 26)),
+        (34, date(2026, 7, 17)),
+    ]
+
+
+def test_expiries_snap_to_fridays_from_a_weekday_and_legs_price_off_that_dte():
+    # Wed 2026-06-17: 6 days → Tue 06-23 → Fri 06-26 (9 days); 13 days →
+    # Tue 06-30 → Fri 07-03 (16 days); 30 days → Fri 07-17 (30 days).
+    ctx = compute_options_context(
+        symbol="X", as_of=date(2026, 6, 17), last_close=100.0,
+        trend=TrendState.unavailable(), volatility=_vol_state(),
+        session=None,
+    )
+    assert [(ss.days_to_expiry, ss.expiry_date) for ss in ctx.strike_sets] == [
+        (9, date(2026, 6, 26)),
+        (16, date(2026, 7, 3)),
+        (30, date(2026, 7, 17)),
+    ]
+    for ss in ctx.strike_sets:
+        assert ss.put.days_to_expiry == ss.call.days_to_expiry == ss.days_to_expiry
+        assert ss.label.startswith(f"{ss.days_to_expiry}-day")
+
+
+class _EarningsSession:
+    def __init__(self, next_report: date | None):
+        self.next_report = next_report
+
+    def execute(self, sql, params=None):
+        assert "FROM earnings_calendar" in str(sql)
+        return SimpleNamespace(first=lambda: (self.next_report,))
+
+
+def test_earnings_known_only_with_a_calendar_date():
+    known = compute_options_context(
+        symbol="X", as_of=date(2026, 6, 13), last_close=100.0,
+        trend=TrendState.unavailable(), volatility=_vol_state(),
+        session=_EarningsSession(date(2026, 7, 1)),
+    )
+    assert known.earnings_known and known.days_to_earnings == 18
+    unknown = compute_options_context(
+        symbol="X", as_of=date(2026, 6, 13), last_close=100.0,
+        trend=TrendState.unavailable(), volatility=_vol_state(),
+        session=_EarningsSession(None),
+    )
+    assert not unknown.earnings_known and unknown.days_to_earnings is None
 
 
 def test_no_strike_sets_without_vol():
@@ -183,15 +229,14 @@ def test_confluence_surfaces_end_to_end():
         trend=TrendState.unavailable(), volatility=_vol_state(atr_14=3.0),
         session=None,
     )
-    call_30 = {ss.days_to_expiry: ss for ss in ctx.strike_sets}[30].call
+    call_far = ctx.strike_sets[-1].call
     # Now rebuild with the 200 EMA sitting on that strike.
     ctx2 = compute_options_context(
         symbol="AAPL", as_of=date(2026, 6, 13), last_close=150.0,
-        trend=_trend_with_ema(200, call_30.strike),
+        trend=_trend_with_ema(200, call_far.strike),
         volatility=_vol_state(atr_14=3.0), session=None,
     )
-    call_30b = {ss.days_to_expiry: ss for ss in ctx2.strike_sets}[30].call
-    assert call_30b.confluences
+    assert ctx2.strike_sets[-1].call.confluences
     assert any("confluence" in o.lower() for o in ctx2.observations)
 
 

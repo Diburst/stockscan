@@ -56,6 +56,7 @@ def _project(a: Any, facet: str) -> dict[str, Any]:
         "symbol": a.symbol,
         "available": a.available,
         "last_close": jsonable(a.last_close),
+        "last_bar_date": jsonable(a.last_bar_date),
     }
     if not a.available:
         base["reason"] = list(getattr(a, "failures", []) or []) or "unavailable"
@@ -85,7 +86,7 @@ def _project(a: Any, facet: str) -> dict[str, Any]:
                 if iv is None:
                     iv = nearest.put.vol_pct
                 n_conf += len(nearest.put.confluences)
-        base["iv_pct"] = round(iv) if iv is not None else None
+        base["hv_pct"] = round(iv) if iv is not None else None
         base["days_to_earnings"] = oc.days_to_earnings
         base["earnings_warning"] = oc.earnings_warning
         base["nearest_expiry"] = (
@@ -126,7 +127,7 @@ def analyze_watchlist(
         list_id: Restrict to one named list (see list_watchlists); None = all.
         facet: Which slice to return per symbol. One of: "summary" (default —
             last_close + trend/vol buckets), "trend", "volatility",
-            "options_summary" (lean options view — IV, earnings flag, nearest
+            "options_summary" (lean options view — HV, earnings flag, nearest
             15-delta call/put strikes, EMA confluence count; preferred for an
             options cross-section),
             "options_context" (full strike sets with greeks + confluences —

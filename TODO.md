@@ -179,9 +179,9 @@ Done badly — without walk-forward, without OOS hold-out, without deflated Shar
 
 ## Smaller items
 
-### On-device verification of the Compose build and background Fetch Latest
+### On-device verification of the Compose build and the background Refresh
 
-Left over from the 2026-06 hardening pass, which ran in a sandbox without a Docker daemon: run `docker compose build` on the Mac mini and click through the background-refresh UX (POST `/signals/refresh` → status polling → swap) on a phone.
+Left over from the 2026-06 hardening pass, which ran in a sandbox without a Docker daemon: run `docker compose build` on the Mac mini and click through the Refresh UX (POST `/refresh` → step polling → dashboard reload) on a phone.
 
 ### Filter-table-by-selected-symbol on Backtest detail
 

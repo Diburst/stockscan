@@ -89,10 +89,10 @@
     {% endcall %}
   </div>
 
-  <!-- Quick actions strip: data-freshness indicator + refresh + analysis link -->
+  <!-- Quick actions strip: data-freshness indicator + analysis link -->
   <div class="flex items-center justify-between flex-wrap gap-3">
     <div class="text-xs text-ink-500"
-         title="Date of the most recent end-of-day bar across all watched symbols. Click Refresh to pull the latest from the data provider.">
+         title="Date of the most recent end-of-day bar across all watched symbols.">
       {% if bars_as_of %}
         Bars as of <span class="font-mono">{{ bars_as_of }}</span>
       {% else %}
@@ -100,14 +100,6 @@
       {% endif %}
     </div>
     <div class="flex items-center gap-2">
-      <form action="/watchlist/refresh-bars" method="post">
-        <button type="submit"
-                class="inline-flex items-center gap-1.5 text-sm px-3 py-2 rounded
-                       border border-ink-300 bg-white hover:bg-ink-100 transition-colors min-h-[40px]"
-                title="Pull the latest end-of-day bars for the S&P 500 universe + every watched symbol, re-run all strategies, then jump to Analysis. Equivalent to `stockscan refresh daily`.">
-          ↻ Refresh bars
-        </button>
-      </form>
       <a href="/analysis{{ ('?list=' ~ selected_id) if selected_id is not none else '?list=all' }}"
          class="inline-flex items-center gap-1.5 text-sm px-3 py-2 rounded
                 bg-ink-900 text-white hover:bg-ink-800 transition-colors min-h-[40px]"

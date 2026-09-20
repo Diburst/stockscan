@@ -2,9 +2,8 @@
 
 {% block title %}Signals{% endblock %}
 
-{# All page content lives in _signals_content.html so the same partial
-   can be re-rendered by POST /signals/refresh and HTMX-swapped in
-   place. The wrapping <div id="signals-content"> is inside the partial. #}
+{# All page content lives in _signals_content.html. The wrapping
+   <div id="signals-content"> is inside the partial. #}
 {% block content %}
   {% include "signals/_signals_content.html" %}
 {% endblock %}

@@ -1,9 +1,7 @@
-"""Scheduled job orchestration. Each job is a single CLI entry point that
-runs the same logic the scheduler will invoke at its scheduled time.
+"""The refresh pipeline and its two invocations: the scheduled nightly
+run (``stockscan jobs nightly-scan``) and the Dashboard's background
+Refresh (``stockscan.jobs.background``)."""
 
-Phase 3 ships the nightly-scan job. Phase 4 will add place-orders + reconcile.
-"""
+from stockscan.jobs.pipeline import STEPS, PipelineResult, run_pipeline
 
-from stockscan.jobs.nightly import NightlyResult, run_nightly_scan
-
-__all__ = ["NightlyResult", "run_nightly_scan"]
+__all__ = ["STEPS", "PipelineResult", "run_pipeline"]

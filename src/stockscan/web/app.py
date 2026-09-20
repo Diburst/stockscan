@@ -33,7 +33,7 @@ from stockscan.web.routes import (
     news,
     options,
     paper_trades,
-    regime,
+    refresh,
     signals,
     strategies,
     trades,
@@ -289,6 +289,7 @@ def create_app() -> FastAPI:
     # Phase 2 routes
     # ------------------------------------------------------------------
     app.include_router(dashboard.router)
+    app.include_router(refresh.router)
     app.include_router(signals.router)
     app.include_router(paper_trades.router)
     app.include_router(trades.router)
@@ -301,7 +302,6 @@ def create_app() -> FastAPI:
     app.include_router(analysis.router)
     app.include_router(options.router)
     app.include_router(hedge.router)
-    app.include_router(regime.router)
 
     # Graft the MCP app's concrete routes onto the FastAPI router: the message
     # endpoint at settings.mcp_path (e.g. /mcp) and the OAuth + well-known routes

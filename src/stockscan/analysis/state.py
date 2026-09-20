@@ -143,8 +143,11 @@ class StrikeSet:
     A tenor is a (days-to-expiry, target-delta) pair — e.g. 6-day Δ0.15
     for "this Friday", 30-day Δ0.20 for "about a month out". The tenors
     themselves are configured in :mod:`stockscan.analysis.options_context`
-    (``_STRIKE_TENORS``). ``expiry_date`` is ``as_of + days_to_expiry``
-    and ``label`` is the human header shown on the card.
+    (``_STRIKE_TENORS``). ``expiry_date`` is the first Friday at-or-after
+    ``as_of + tenor days`` (listed weekly expiries) and ``days_to_expiry``
+    is the calendar distance to that Friday, which is also the DTE the legs
+    are priced off. ``label`` is the human header shown on the card. Only
+    ``sets[0]`` reaches the proposal engine.
     """
 
     days_to_expiry: int
@@ -171,6 +174,9 @@ class OptionsContext:
     days_to_earnings: int | None  # None if no upcoming earnings on file
     earnings_date: _date | None
     earnings_warning: bool  # True if within 5 trading days of earnings
+    # False when the calendar has no upcoming report on file. A missing date
+    # is a flag for the proposal engine, not a pass.
+    earnings_known: bool = False
     # Suggested Black-Scholes strikes, one StrikeSet per expiry tenor
     # (empty when vol/price unavailable). Ordered nearest-expiry first.
     strike_sets: list[StrikeSet] = field(default_factory=list)
@@ -181,7 +187,8 @@ class OptionsContext:
     def unavailable(cls) -> OptionsContext:
         return cls(
             available=False, days_to_earnings=None, earnings_date=None,
-            earnings_warning=False, strike_sets=[], observations=[],
+            earnings_warning=False, earnings_known=False,
+            strike_sets=[], observations=[],
         )
 
 
@@ -195,14 +202,25 @@ class SymbolAnalysis:
     """
 
     symbol: str
-    as_of: _date
+    as_of: _date  # the date the analysis was requested for
     available: bool
     last_close: float | None
+    # Date of the last bar actually used. Lags ``as_of`` over weekends,
+    # holidays and before the nightly refresh lands.
+    last_bar_date: _date | None
     last_volume: float | None  # dollar volume on the most recent bar
     bars_count: int  # rows in the underlying frame (for diagnostics)
     trend: TrendState
     volatility: VolatilityState
     options_context: OptionsContext
+    # Mean close × volume over the last 20 bars; None with fewer bars.
+    adv_20d: float | None = None
+    # 1-day % change of adj_close, and the same net of the sector composite's
+    # 1-day return (None when the symbol has no sector composite).
+    day_move_pct: float | None = None
+    day_move_residual_pct: float | None = None
+    # One day of vol in %: annualised (EWMA, else 21d) vol / √252.
+    daily_sigma_pct: float | None = None
     # Keep a small slice of the raw close history so chart.py doesn't
     # need to re-query the DB. Indexed chronologically; most-recent
     # close is closes_history[-1]. Length capped at 252 trading days
@@ -223,7 +241,7 @@ class SymbolAnalysis:
     def unavailable(cls, symbol: str, as_of: _date, reason: str = "") -> SymbolAnalysis:
         return cls(
             symbol=symbol, as_of=as_of, available=False,
-            last_close=None, last_volume=None, bars_count=0,
+            last_close=None, last_bar_date=None, last_volume=None, bars_count=0,
             trend=TrendState.unavailable(),
             volatility=VolatilityState.unavailable(),
             options_context=OptionsContext.unavailable(),

@@ -1,0 +1,61 @@
+{# The one Refresh button, with its status.
+
+   Three states from the background job (``job``): none / finished → the
+   button plus the last result; running → the button disabled, the current
+   step, and a 2 s poll of GET /refresh/status that replaces this element.
+
+   Inputs: job (JobState | None), running (bool) #}
+{% from "_macros.html" import badge %}
+<div id="refresh-strip"
+     {% if running %}
+     hx-get="/refresh/status?was_running=true"
+     hx-trigger="every 2s"
+     hx-swap="outerHTML"
+     {% endif %}
+     class="bg-white rounded-xl shadow-sm border border-ink-300/40 px-4 py-3 flex items-center gap-4 flex-wrap text-sm">
+  <form action="/refresh" method="post"
+        hx-post="/refresh" hx-target="#refresh-strip" hx-swap="outerHTML"
+        hx-disabled-elt="find button" class="inline">
+    <button type="submit"
+            {% if running %}disabled{% endif %}
+            class="px-3 py-1.5 rounded-lg bg-ink-900 text-white text-sm font-medium hover:bg-ink-700 disabled:opacity-50 disabled:cursor-wait"
+            title="Fetch bars and macro, recompute the regime and composites, run the strategies, mark paper trades, save the options book, pull the feeds, check alerts">
+      {% if running %}Refreshing…{% else %}Refresh{% endif %}
+    </button>
+  </form>
+
+  {% if running %}
+    <span class="inline-flex items-center gap-2 text-ink-600" role="status">
+      <span class="inline-block w-3.5 h-3.5 border-2 border-ink-300 border-t-ink-700 rounded-full animate-spin" aria-hidden="true"></span>
+      step {{ job.step_index }}/{{ job.step_total }} · <span class="font-medium">{{ job.step }}</span>
+      {%- if job.elapsed_seconds > 0 %} · {{ job.elapsed_seconds }}s{% endif %}
+      <span class="text-ink-400">(pages stay usable)</span>
+    </span>
+  {% elif job and job.error %}
+    <span class="inline-flex items-center gap-2" role="status">
+      {{ badge("failed", "bad") }}
+      <span class="text-bad-600">{{ job.error }}</span>
+    </span>
+  {% elif job and job.result %}
+    {%- set r = job.result -%}
+    {%- set passing = r.scans | sum(attribute="signals_emitted") -%}
+    <span class="inline-flex items-center gap-2 flex-wrap text-ink-600" role="status">
+      {{ badge("degraded" if r.degraded else "done", "warn" if r.degraded else "ok") }}
+      <span>{{ "{:,}".format(r.bars_upserted) }} bars{% if r.caught_up %} (caught up {{ r.caught_up | join(", ") }}){% endif %}</span>
+      <span>·</span>
+      <span>{% if r.scans_skipped %}scans skipped, nothing new{% else %}{{ r.scans | length }} scans, {{ passing }} passing{% endif %}</span>
+      {% if r.trades_marked or r.trades_auto_closed %}<span>·</span><span>{{ r.trades_marked }} trades marked{% if r.trades_auto_closed %}, {{ r.trades_auto_closed }} closed{% endif %}</span>{% endif %}
+      {% if r.options_run_id %}<span>·</span><span>options book saved{% if r.options_settled %}, {{ r.options_settled }} settled{% endif %}</span>{% endif %}
+      {% for name, outcome in r.feeds.items() if outcome not in ("not on plan", "no watched symbols") %}<span>·</span><span>{{ name }} {{ outcome }}</span>{% endfor %}
+      {% if r.watchlist_alerts_fired %}<span>·</span><span>{{ r.watchlist_alerts_fired }} alerts fired</span>{% endif %}
+      <span class="text-ink-400">· {{ "%.0f"|format(r.duration_seconds) }}s</span>
+    </span>
+    {% if r.step_failures %}
+      <ul class="w-full text-xs text-warn-600 space-y-0.5">
+        {% for f in r.step_failures %}<li>⚠ {{ f }}</li>{% endfor %}
+      </ul>
+    {% endif %}
+  {% else %}
+    <span class="text-ink-400">Runs every fetch and analysis step end to end; safe to click again any time.</span>
+  {% endif %}
+</div>

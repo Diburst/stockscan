@@ -576,3 +576,102 @@ def test_hedge_pages_render_money_values(client, monkeypatch):
     r = client.get("/hedge/7")
     assert r.status_code == 200
     assert "+312.50" in r.text and "-25.00" in r.text and "mark <span" in r.text
+
+
+# -----------------------------------------------------------------------
+# /options: regime controls + book multiplier + macro line in the header,
+# σ-distance / yield / contracts on the row, the rank inputs and the
+# trigger-class base rate on the card.
+# -----------------------------------------------------------------------
+
+def _proposal(**overrides):
+    from stockscan.proposals._models import OptionProposal
+
+    fields = dict(
+        symbol="AAPL", side="sell_put", expiry_date=date(2026, 9, 25), days_to_expiry=7,
+        strike=180.0, delta=-0.15, est_credit=1.25, pct_otm=-8.0, hv_pct=32.0,
+        hv_percentile=71.0, move_sigma=-1.8, trend_align=1.0, rank_key=1.8,
+        size_weight=0.72, contracts=3, sigma_distance=1.5, credit_yield_ann=36.2,
+        day_move_pct=-2.4, day_move_residual_pct=-2.1, days_to_earnings=None,
+        earnings_known=True, trend_bucket="up", confluences=("50 EMA $180.40",),
+        rationale="Red day (−1.8σ residual, −2.4% raw); sell put 180.",
+        score_breakdown={"move_sigma": -1.8, "trend_align": 1.0, "hv_percentile": 71.0, "rank_key": 1.8},
+    )
+    fields.update(overrides)
+    return OptionProposal(**fields)
+
+
+def _options_run(book, regime, **overrides):
+    from stockscan.proposals.service import ProposalRun
+
+    fields = dict(
+        as_of=date(2026, 9, 18), regime=regime, candidates=len(book) + 2, book=book,
+        book_mult=0.72, macro_events=["CPI Thu", "FOMC Wed"], equity=125_000.0,
+    )
+    fields.update(overrides)
+    return ProposalRun(**fields)
+
+
+def test_options_page_header_rows_and_card(client, monkeypatch):
+    from stockscan.web.routes import options as options_route
+
+    book = [_proposal(), _proposal(symbol="XOM", earnings_known=False, contracts=None)]
+    monkeypatch.setattr(options_route, "generate_book", lambda **k: _options_run(book, _regime()))
+    monkeypatch.setattr(
+        options_route, "trigger_base_rates",
+        lambda session=None: {("sell_put", "up", True): (41, 3)},
+    )
+    r = client.get("/options?n=5")
+    assert r.status_code == 200
+    # Header: the three regime controls, the book multiplier, the macro line.
+    assert "7 closes on side" in r.text and "×0.72" in r.text and "clear" in r.text
+    assert "Book size" in r.text and "$125,000 equity" in r.text
+    assert "CPI Thu · FOMC Wed inside expiry" in r.text
+    assert "2 of 4 candidates" in r.text
+    # Row: σ-distance, HV (never labelled IV), yield, contracts.
+    assert "1.5σ" in r.text and "HV 32% (rank 71)" in r.text and "36%/yr" in r.text
+    assert "3 contracts" in r.text and "size n/a" in r.text
+    assert "-2.1% vs sector" in r.text
+    assert "IV" not in r.text
+    # Card: rank inputs, confluences as a fact, earnings flag, base rate.
+    assert "Rank key" in r.text and "1.800" in r.text
+    assert "50 EMA $180.40" in r.text
+    assert "earnings: unknown" in r.text
+    assert "41 proposed, 3 breached (7%)" in r.text
+    assert "score" not in r.text.lower().split("why this trade", 1)[1].split("</details>", 1)[0]
+
+
+def test_options_page_base_rate_needs_thirty(client, monkeypatch):
+    from stockscan.web.routes import options as options_route
+
+    monkeypatch.setattr(
+        options_route, "generate_book",
+        lambda **k: _options_run([_proposal()], _regime(gate_open=False, stress=True)),
+    )
+    monkeypatch.setattr(
+        options_route, "trigger_base_rates",
+        lambda session=None: {("sell_put", "up", False): (12, 1)},
+    )
+    r = client.get("/options")
+    assert r.status_code == 200
+    assert "n &lt; 30" in r.text
+    assert "closed" in r.text and "firing" in r.text
+    assert "put-sales skipped; call-sales halved" in r.text
+
+
+def test_options_page_no_regime_no_book(client, monkeypatch):
+    from stockscan.web.routes import options as options_route
+
+    monkeypatch.setattr(
+        options_route, "generate_book",
+        lambda **k: _options_run([], None, candidates=0, macro_events=[], book_mult=1.0),
+    )
+
+    def _boom(session=None):
+        raise RuntimeError("relation does not exist")
+
+    monkeypatch.setattr(options_route, "trigger_base_rates", _boom)
+    r = client.get("/options?list=3")
+    assert r.status_code == 200
+    assert "Regime n/a" in r.text and "No qualifying proposals" in r.text
+    assert "No high-importance US macro events inside expiry" in r.text

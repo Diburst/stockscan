@@ -1,8 +1,6 @@
-"""News routes — manual-refresh endpoint + on-demand article reader.
+"""News routes — on-demand article reader.
 
 Endpoints:
-  POST /news/refresh             — pull fresh news from EODHD, swap
-                                    the dashboard card in place.
   GET  /news/{article_id}/content — re-fetch a single article's body
                                     on demand, return as an HTML
                                     fragment for HTMX inline expansion.
@@ -20,128 +18,12 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy.orm import Session
 
 from stockscan.config import settings
-from stockscan.data.providers.base import DISABLED_REASON
 from stockscan.data.providers.eodhd import EODHDError, EODHDProvider
-from stockscan.news import (
-    fetch_article_content,
-    get_article,
-    last_fetched_at,
-    recent_general,
-    refresh_news,
-)
-from stockscan.watchlist import watchlist_symbols
-from stockscan.web.deps import (
-    attach_hx_toast,
-    get_session,
-    rate_limit_check,
-    render,
-)
+from stockscan.news import fetch_article_content, get_article
+from stockscan.web.deps import get_session, render
 
 router = APIRouter(prefix="/news")
 log = logging.getLogger(__name__)
-
-
-def _safe_rollback(session: Session) -> None:
-    """Clear aborted-transaction state on the request session.
-
-    Refresh routes catch broad ``Exception`` so they can still render
-    the existing card with the error banner. If the failure was an
-    SQL error, Postgres has the connection in an ABORTED state and
-    refuses every subsequent statement until ROLLBACK — which would
-    cause the post-refresh SELECT to 500 with InFailedSqlTransaction
-    and hide the original error from the user.
-    """
-    try:
-        session.rollback()
-    except Exception as exc:
-        log.warning("rollback failed during error recovery: %s", exc)
-
-
-@router.post("/refresh")
-def refresh_endpoint(
-    request: Request,
-    s: Session = Depends(get_session),
-):
-    """Pull fresh news from EODHD and return the rendered news card.
-
-    HTMX swaps this response into ``#news-card`` so the dashboard
-    updates in place — no page reload. The partial is the same one the
-    dashboard renders on initial load, so the surface stays consistent.
-    """
-    # Debounce — refusing to hit the upstream if the user just refreshed.
-    # Renders the current card unchanged and pops a "wait" toast.
-    cooldown_remaining = rate_limit_check("news.refresh", cooldown_seconds=10)
-    if cooldown_remaining is not None:
-        response = render(
-            request,
-            "_news_card.html",
-            news_articles=recent_general(limit=10, session=s),
-            news_last_fetched=last_fetched_at(session=s),
-            news_refresh_error=None,
-            news_refresh_summary=None,
-        )
-        return attach_hx_toast(
-            response,
-            "warn",
-            f"Just refreshed — try again in {int(cooldown_remaining) + 1}s",
-        )
-
-    error: str | None = None
-    refresh_summary: dict[str, object] | None = None
-
-    api_key = settings.eodhd_api_key.get_secret_value()
-    if not api_key:
-        error = "EODHD_API_KEY is not set. Add it to your .env to fetch news."
-    else:
-        try:
-            with EODHDProvider(api_key=api_key) as provider:
-                result = refresh_news(
-                    provider,
-                    watchlist_symbols=watchlist_symbols(session=s),
-                    session=s,
-                )
-            if result.skipped_reason:
-                error = f"News is {result.skipped_reason}"
-            else:
-                refresh_summary = {
-                    "articles_upserted": result.articles_upserted,
-                    "api_calls": result.api_calls,
-                    "failures": result.failures,
-                }
-        except EODHDError as exc:
-            log.warning("news refresh: provider error: %s", exc)
-            error = f"Provider error: {exc}"
-            _safe_rollback(s)
-        except Exception as exc:
-            log.exception("news refresh: unexpected error")
-            error = f"Refresh failed: {exc}"
-            # SQL errors inside refresh_news leave the session in an
-            # aborted-transaction state. Without rollback, the
-            # ``recent_general()`` and ``last_fetched_at()`` calls below
-            # would 500 with InFailedSqlTransaction and the user would
-            # never see the error message we captured.
-            _safe_rollback(s)
-
-    response = render(
-        request,
-        "_news_card.html",
-        news_articles=recent_general(limit=10, session=s),
-        news_last_fetched=last_fetched_at(session=s),
-        news_refresh_error=error,
-        news_refresh_summary=refresh_summary,
-    )
-    if error and DISABLED_REASON in error:
-        return attach_hx_toast(response, "warn", "News not available on current data plan")
-    if error:
-        return attach_hx_toast(response, "error", "News refresh failed")
-    if refresh_summary:
-        n_new = refresh_summary.get("articles_upserted", 0)
-        return attach_hx_toast(
-            response,
-            "success",
-            f"News refreshed — {n_new} new article{'s' if n_new != 1 else ''}",
-        )
-    return response
 
 
 @router.get("/{article_id}/content")

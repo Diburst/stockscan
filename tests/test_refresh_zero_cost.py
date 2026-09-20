@@ -1,19 +1,19 @@
 """Zero-cost refresh: a refresh with nothing new must make no API calls.
 
-Covers the session-availability gate, the empty-when-current bulk date list,
-the refresh_signals short-circuit, and the generic refresh cooldown helper.
+Covers the session-availability gate, the empty-when-current bulk date
+list, the watchlist catch-up, and the generic refresh cooldown helper.
 """
 
 from __future__ import annotations
 
 import datetime as dt
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from unittest.mock import MagicMock, patch
 from zoneinfo import ZoneInfo
 
 from stockscan.data.backfill import EOD_AVAILABLE_HOUR_ET, latest_completed_session
 from stockscan.refresh_log import mark_refreshed, refresh_due
-from stockscan.scan.refresh import _bulk_dates, refresh_signals
+from stockscan.data.backfill import catch_up_lagging_symbols, missing_bulk_dates
 
 _NY = ZoneInfo("America/New_York")
 
@@ -49,11 +49,11 @@ def test_session_weekend_returns_friday():
         assert latest_completed_session(noon) == friday
 
 
-# --- _bulk_dates: empty when current ---------------------------------------
+# --- missing_bulk_dates: empty when current ---------------------------------------
 def test_bulk_dates_empty_when_current():
     target = latest_completed_session()
     with patch("stockscan.data.store.latest_daily_bar_date", return_value=target):
-        assert _bulk_dates(7) == []
+        assert missing_bulk_dates(7) == []
 
 
 def test_bulk_dates_nonempty_when_behind():
@@ -62,21 +62,32 @@ def test_bulk_dates_nonempty_when_behind():
         "stockscan.data.store.latest_daily_bar_date",
         return_value=target - timedelta(days=10),
     ):
-        assert len(_bulk_dates(7)) >= 1
+        assert len(missing_bulk_dates(7)) >= 1
 
 
-# --- refresh_signals short-circuit -----------------------------------------
-def test_refresh_signals_noop_when_current():
+# --- watchlist catch-up ----------------------------------------------------
+def test_catch_up_fetches_only_the_lagging_watched_name():
+    """The market is current but a watched name outside the index fell
+    behind (it was dropped by an index-only bulk filter for weeks): the
+    catch-up fetches that one symbol from its own last bar, and only it."""
     provider = MagicMock()
-    with patch("stockscan.scan.refresh.current_constituents", return_value=[]), \
-         patch("stockscan.scan.refresh.watchlist_symbols", return_value=set()), \
-         patch("stockscan.scan.refresh._bulk_dates", return_value=[]):
-        res = refresh_signals(provider, session=MagicMock())
-    assert res.up_to_date is True
-    assert res.strategies_run == 0
-    assert res.bars_upserted == 0
-    # The whole point: no provider call when there's nothing new.
-    provider.get_eod_bulk.assert_not_called()
+    provider.get_bars.return_value = []
+    with patch(
+        "stockscan.data.backfill.latest_bar_dates",
+        return_value={"SPY": date(2026, 9, 18), "AAOI": date(2026, 7, 10)},
+    ), patch("stockscan.data.backfill.latest_bar_date", return_value=date(2026, 7, 10)):
+        res = catch_up_lagging_symbols(provider, {"SPY", "AAOI"}, target=date(2026, 9, 18))
+    assert res.symbols_fetched == ("AAOI",)
+    assert provider.get_bars.call_count == 1
+    sym, start, _end = provider.get_bars.call_args.args[:3]
+    assert sym == "AAOI" and start == date(2026, 7, 5)  # its own last bar minus the overlap
+
+
+def test_catch_up_makes_no_call_when_every_name_is_current():
+    provider = MagicMock()
+    with patch("stockscan.data.backfill.latest_bar_dates", return_value={"AAOI": date(2026, 9, 18)}):
+        res = catch_up_lagging_symbols(provider, {"AAOI"}, target=date(2026, 9, 18))
+    assert res.symbols_fetched == () and res.upserted == 0
     provider.get_bars.assert_not_called()
 
 

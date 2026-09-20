@@ -137,6 +137,7 @@ def compute_options_context(
         days_to_earnings=days_to_earn,
         earnings_date=earn_date,
         earnings_warning=earnings_warning,
+        earnings_known=days_to_earn is not None,
         strike_sets=strike_sets,
         observations=observations,
     )
@@ -153,6 +154,12 @@ def _build_strike_sets(
 ) -> list[StrikeSet]:
     """Solve a put + call for every tenor in ``_STRIKE_TENORS``.
 
+    Each tenor's expiry is snapped to the first Friday at-or-after
+    ``as_of + days`` — the listed weekly expiry — and the legs are priced off
+    the calendar distance to that Friday, so a Wednesday run quotes an 8-day
+    option, not a 6-day one. Only ``sets[0]`` reaches the proposal engine;
+    its earnings buffer never applies to the later tenors.
+
     Each strike is priced off the EWMA Yang-Zhang forward vol (an IV proxy —
     we have no option chain) at the FRED risk-free rate, then annotated with
     any structural confluence (key EMA within ``_CONFLUENCE_ATR_MULT`` ×
@@ -168,7 +175,9 @@ def _build_strike_sets(
     atr14 = volatility.atr_14  # may be None → confluence check is skipped
 
     sets: list[StrikeSet] = []
-    for days, delta in _STRIKE_TENORS:
+    for tenor_days, delta in _STRIKE_TENORS:
+        expiry = _next_friday(as_of + timedelta(days=tenor_days))
+        days = (expiry - as_of).days
         legs: dict[str, OptionStrike | None] = {"call": None, "put": None}
         for kind in ("call", "put"):
             try:
@@ -203,7 +212,6 @@ def _build_strike_sets(
                     "options_context: %s %dd strike solve failed for %s: %s",
                     kind, days, symbol, exc,
                 )
-        expiry = as_of + timedelta(days=days)
         sets.append(
             StrikeSet(
                 days_to_expiry=days,
@@ -215,6 +223,11 @@ def _build_strike_sets(
             )
         )
     return sets
+
+
+def _next_friday(d: _date) -> _date:
+    """The first Friday at-or-after ``d``."""
+    return d + timedelta(days=(4 - d.weekday()) % 7)
 
 
 def _risk_free_rate(as_of: _date, session: Session | None) -> float:

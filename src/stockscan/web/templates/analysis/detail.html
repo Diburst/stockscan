@@ -24,7 +24,7 @@
     <div class="flex items-baseline justify-between flex-wrap gap-2 mt-1">
       <h1 class="text-2xl font-semibold">
         <span class="font-mono">{{ a.symbol }}</span>
-        <span class="text-base text-ink-500">· technical analysis as of {{ a.as_of }}</span>
+        <span class="text-base text-ink-500">· bars through {{ a.last_bar_date or a.as_of }}</span>
       </h1>
       <div class="flex items-baseline gap-3">
         {% if a.last_close %}
@@ -130,9 +130,9 @@
     {% endcall %}
   {% else %}
     <!-- Fallback: no bars in store — render the static SVG so the rest of the
-         page still works. The "Refresh bars" button on /watchlist or /analysis
-         is the user's path forward. -->
-    {% call card(title="Price & projection", subtitle="No bars in the local store — use the Refresh button on Watchlist or Analysis to pull data") %}
+         page still works. The Refresh button on the Dashboard is the user's
+         path forward. -->
+    {% call card(title="Price & projection", subtitle="No bars in the local store — use the Refresh button on the Dashboard to pull data") %}
       <div class="-mx-2">
         {{ chart_svg }}
       </div>
@@ -278,7 +278,7 @@
         {{ table_close() }}
       {% else %}
         <p class="text-sm text-ink-500 italic">
-          No estimate-trend data on file. Click Refresh bars on the Watchlist to pull the latest from EODHD.
+          No estimate-trend data on file. Run a Refresh from the Dashboard to pull the latest from EODHD.
         </p>
       {% endif %}
     {% endcall %}
@@ -327,14 +327,6 @@
             title="Stored transactions are still shown. Set EODHD_FEATURES to include 'insider' after upgrading the data plan.">
         ○ Insider refresh {{ DATA_PLAN_NOTE }}
       </span>
-      {% else %}
-      <form action="/analysis/{{ a.symbol }}/refresh-insider" method="post">
-        <button type="submit"
-                class="text-xs px-3 py-1.5 rounded border border-ink-300 hover:bg-ink-100 transition-colors"
-                title="Pull fresh insider data for this symbol. Costs 10 API credits; subject to a 23-hour cooldown.">
-          ↻ Refresh insider
-        </button>
-      </form>
       {% endif %}
     </div>
 

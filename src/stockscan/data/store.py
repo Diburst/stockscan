@@ -220,6 +220,28 @@ def latest_bar_date(symbol: str, *, session: Session | None = None) -> date | No
         return _run(s)
 
 
+def latest_bar_dates(
+    symbols: Iterable[str], *, session: Session | None = None
+) -> dict[str, date]:
+    """Most recent stored daily bar date per symbol, in one query. Symbols
+    with no bars are absent from the result."""
+    syms = sorted({s for s in symbols if s})
+    if not syms:
+        return {}
+    sql = text(
+        "SELECT symbol, MAX(bar_ts)::date FROM bars "
+        "WHERE interval='1d' AND symbol = ANY(:symbols) GROUP BY symbol"
+    )
+
+    def _run(s: Session) -> dict[str, date]:
+        return {row[0]: row[1] for row in s.execute(sql, {"symbols": syms}) if row[1]}
+
+    if session is not None:
+        return _run(session)
+    with session_scope() as s:
+        return _run(s)
+
+
 def latest_daily_bar_date(*, session: Session | None = None) -> date | None:
     """Most recent stored daily bar date across ALL symbols, or None.
 

@@ -1,16 +1,11 @@
 {# ============================================================
    Market Regime card — DESIGN §regime
 
-   Self-contained partial. Rendered both as part of dashboard.html
-   (via {% include %}) and directly by the regime-refresh route
-   (POST /regime/refresh) so the in-place HTMX swap returns the
-   same surface.
+   Self-contained partial, included by dashboard.html.
 
    Required context:
      regime                  — MarketRegime | None
      strategies              — list[type[Strategy]] (registry)
-     regime_refresh_error    — str | None  (set on refresh failures)
-     regime_refresh_summary  — dict | None (set on refresh success)
 
    Layout note: the controls are a plain <table>. Safari does not honour
    display:grid/flex on <summary>, so nothing here styles a summary.
@@ -24,14 +19,8 @@
 
 <div id="regime-card">
   {% call card(title="Market Regime", subtitle="Trend gate · vol scalar · credit-stress breaker") %}
-    {% if regime_refresh_error %}
-      <div class="mb-3 px-3 py-2 rounded bg-bad-100 text-bad-600 text-xs border border-bad-600/30">
-        Regime refresh failed: {{ regime_refresh_error }}
-      </div>
-    {% endif %}
-
     {% if not regime %}
-      {{ empty("No regime computed yet — click ⟳ Refresh above or run `stockscan jobs nightly-scan`.") }}
+      {{ empty("No regime computed yet — run a Refresh or `stockscan jobs nightly-scan`.") }}
     {% else %}
 
       <div class="flex items-center justify-between gap-3 flex-wrap mb-3">
@@ -47,45 +36,8 @@
           {% endif %}
           <span class="text-xs text-ink-400" title="Regime methodology v{{ regime.methodology_version }}">v{{ regime.methodology_version }}</span>
         </div>
-        <div class="flex items-center gap-3">
-          <div class="text-xs text-ink-500">as of {{ regime.as_of_date }}</div>
-          <form
-            hx-post="/regime/refresh"
-            hx-target="#regime-card"
-            hx-swap="outerHTML"
-            hx-disabled-elt="this"
-            hx-indicator="#regime-refresh-indicator"
-          >
-            <button
-              type="submit"
-              class="inline-flex items-center gap-1.5 text-xs px-3 py-1.5 rounded border border-ink-300 hover:bg-ink-100 transition-colors min-h-[36px] disabled:opacity-50 disabled:cursor-wait"
-              title="Refresh SPY bars, recompute the trend gate / vol scalar / credit-stress flag for today, persist"
-            >
-              ⟳ Refresh
-            </button>
-            <span
-              id="regime-refresh-indicator"
-              class="htmx-indicator ml-2 text-xs text-ink-500 italic"
-            >
-              Refreshing bars + recomputing…
-            </span>
-          </form>
-        </div>
+        <div class="text-xs text-ink-500">as of {{ regime.as_of_date }}</div>
       </div>
-
-      {% if regime_refresh_summary %}
-        <div class="mb-3 px-3 py-2 rounded bg-ok-100/50 text-ok-600 text-xs border border-ok-600/30">
-          ✓ Refreshed
-          {%- if regime_refresh_summary.bars_upserted is not none %}
-            · {{ regime_refresh_summary.bars_upserted }} bar{{ "s" if regime_refresh_summary.bars_upserted != 1 else "" }}
-          {%- endif %}
-          {%- if regime_refresh_summary.previous_as_of and regime_refresh_summary.previous_as_of != regime.as_of_date %}
-            · advanced from {{ regime_refresh_summary.previous_as_of }} → {{ regime.as_of_date }}
-          {%- elif regime_refresh_summary.previous_as_of == regime.as_of_date %}
-            · already current ({{ regime.as_of_date }})
-          {%- endif %}
-        </div>
-      {% endif %}
 
       {{ table_open([{"label": "Control"}, {"label": "State"}, {"label": "Input"}, {"label": "Note"}],
                     mobile="scroll", table_classes="min-w-[560px]") }}

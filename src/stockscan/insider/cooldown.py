@@ -9,10 +9,9 @@ run does (correctly).
 
 The scope strings are conventionally:
 
-  * ``"watchlist"`` — the watchlist-wide refresh fired from the
-    /watchlist/refresh-bars endpoint.
-  * ``"symbol:XYZ"`` — a single-symbol refresh fired from the analysis
-    page's on-demand button.
+  * ``"watchlist"`` — the watchlist-wide refresh in the pipeline's feeds
+    step (the Refresh button and the nightly job).
+  * ``"symbol:XYZ"`` — a single-symbol refresh (CLI / MCP).
 
 This survives app restarts AND page reloads because the timestamp
 lives in the DB, not in process memory or a request session.

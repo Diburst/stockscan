@@ -95,6 +95,7 @@ from rich.table import Table
 from stockscan import __version__
 from stockscan.config import settings
 from stockscan.data.backfill import backfill_universe
+from stockscan.data.tracked import tracked_symbols
 from stockscan.data.providers import EODHDProvider, StubProvider
 from stockscan.data.providers.base import DataProvider
 from stockscan.db import healthcheck
@@ -406,11 +407,7 @@ def refresh_daily_cmd(
         console.print("[yellow]No trading days in window.[/yellow]")
         return
 
-    filter_to = None
-    if current_only:
-        filter_to = set(current_constituents())
-    else:
-        filter_to = set(all_known_symbols())
+    filter_to = set(current_constituents()) if current_only else tracked_symbols()
     if not filter_to:
         console.print("[yellow]Universe is empty. Run `stockscan refresh universe` first.[/yellow]")
         raise typer.Exit(1)
@@ -443,7 +440,8 @@ def refresh_bars_cmd(
         None,
         help=(
             "One or more symbols to backfill (e.g. 'AAPL' or 'AAPL MSFT NVDA'). "
-            "Omit to backfill the entire historical S&P 500 universe."
+            "Omit to backfill every tracked symbol: the historical S&P 500 "
+            "universe plus the watchlist."
         ),
     ),
     start: str = typer.Option("2007-01-01", "--start", help="ISO date for initial backfill"),
@@ -472,10 +470,10 @@ def refresh_bars_cmd(
           stockscan refresh bars AAPL
           stockscan refresh bars AAPL MSFT NVDA --start 2015-01-01
 
-    * **Universe-wide** — omit the positional args to backfill every symbol
-      ever in the S&P 500 (current + historical members). Restoring
-      historical members eliminates survivorship bias on backtests.
-          stockscan refresh bars                        # all ever-members
+    * **Universe-wide** — omit the positional args to backfill every tracked
+      symbol: every S&P 500 ever-member (current + historical, so backtests
+      stay survivorship-free) plus every watched name.
+          stockscan refresh bars                        # all tracked symbols
           stockscan refresh bars --current-only         # current ~500 only
 
     All invocations are **incremental** on re-run: per symbol, only the
@@ -488,13 +486,13 @@ def refresh_bars_cmd(
     start_d = date.fromisoformat(start)
     end_d = date.fromisoformat(end) if end else date.today()
     if not symbols:
-        symbols = current_constituents() if current_only else all_known_symbols()
+        symbols = current_constituents() if current_only else sorted(tracked_symbols())
         if not symbols:
             console.print(
                 "[yellow]Universe is empty. Run `stockscan refresh universe` first.[/yellow]"
             )
             raise typer.Exit(1)
-        scope = "current S&P 500" if current_only else "all ever-members of S&P 500"
+        scope = "current S&P 500" if current_only else "S&P 500 ever-members + watchlist"
         console.print(
             f"[cyan]→[/cyan] backfilling {len(symbols)} symbols ({scope}) "
             f"from {start_d} to {end_d} (exchange={exchange})"
@@ -835,14 +833,15 @@ def watchlist_rebuild_composites_cmd(
 def jobs_nightly_scan(
     as_of: str | None = typer.Option(None, "--as-of", help="ISO date; default = today"),
 ) -> None:
-    """Bulk-refresh recent bars, run every strategy, send a summary."""
+    """Run the full refresh pipeline (bars, macro, regime, composites, scans,
+    paper trades, options book, feeds, alerts) and send the summary."""
     from datetime import date as _date
 
-    from stockscan.jobs import run_nightly_scan
+    from stockscan.jobs import run_pipeline
 
     as_of_d = _date.fromisoformat(as_of) if as_of else _date.today()
     console.print(f"[cyan]→[/cyan] nightly scan as of {as_of_d}")
-    result = run_nightly_scan(as_of_d)
+    result = run_pipeline(as_of_d)
 
     table = Table(title=f"Nightly scan — {result.as_of}")
     table.add_column("Strategy")
@@ -857,7 +856,11 @@ def jobs_nightly_scan(
             str(s.universe_size),
         )
     console.print(table)
+    if result.scans_skipped:
+        console.print("[dim]scans skipped — nothing new since the last run[/dim]")
     console.print(f"[green]✓[/green] {result.bars_upserted:,} bars refreshed")
+    for failure in result.step_failures:
+        console.print(f"[yellow]⚠[/yellow] {failure}")
 
 
 # ----------------------------------------------------------------------
@@ -1937,36 +1940,45 @@ def mcp_tools(
 @options_app.command("propose")
 def options_propose(
     n: int = typer.Option(30, "-n", "--limit", help="Max book size."),
-    min_score: float = typer.Option(0.0, "--min-score", help="Drop candidates below this score."),
     list_id: int | None = typer.Option(None, "--list", help="Restrict to one watchlist list id."),
-    save: bool = typer.Option(False, "--save", help="Persist the run (needs migration 0022)."),
+    save: bool = typer.Option(False, "--save", help="Persist the run (needs migration 0027)."),
 ) -> None:
     """Generate and print the ranked short-premium options book."""
     from stockscan.proposals import generate_book
 
-    run = generate_book(n=n, min_score=min_score, list_id=list_id)
+    run = generate_book(n=n, list_id=list_id)
     reg = run.regime
-    label = reg.regime if reg is not None else "n/a"
+    if reg is None:
+        regime_line = "regime n/a"
+    else:
+        regime_line = (
+            f"gate {'open' if reg.trend_gate_open else 'closed'} | "
+            f"vol ×{reg.vol_multiplier:.2f} | "
+            f"credit stress {'firing' if reg.credit_stress_flag else 'clear'}"
+        )
     console.print(
-        f"[cyan]→[/cyan] {run.as_of} | regime {label} | "
+        f"[cyan]→[/cyan] {run.as_of} | {regime_line} | book ×{run.book_mult:.2f} | "
         f"{len(run.book)} of {run.candidates} candidates"
     )
+    if run.macro_events:
+        console.print(f"[yellow]macro inside expiry:[/yellow] {' · '.join(run.macro_events)}")
     table = Table(title="Proposed options book")
     table.add_column("#", justify="right")
     table.add_column("Sym")
     table.add_column("Side")
     table.add_column("Strike", justify="right")
     table.add_column("OTM%", justify="right")
+    table.add_column("σ", justify="right")
     table.add_column("DTE", justify="right")
-    table.add_column("IV%", justify="right")
-    table.add_column("Score", justify="right")
-    table.add_column("Size", justify="right")
+    table.add_column("HV%", justify="right")
+    table.add_column("Yield", justify="right")
+    table.add_column("Contracts", justify="right")
     for i, p in enumerate(run.book, start=1):
         side = "[rose]call[/rose]" if p.side == "sell_call" else "[green]put[/green]"
         table.add_row(
             str(i), p.symbol, side, f"{p.strike:g}", f"{p.pct_otm:+.0f}",
-            str(p.days_to_expiry), f"{p.iv_pct:.0f}", f"{p.score:.2f}",
-            f"{p.size_weight:.2f}",
+            f"{p.sigma_distance:.1f}", str(p.days_to_expiry), f"{p.hv_pct:.0f}",
+            f"{p.credit_yield_ann:.0f}%", "-" if p.contracts is None else str(p.contracts),
         )
     console.print(table)
     if save:

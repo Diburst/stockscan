@@ -5,11 +5,11 @@ around a strict cooldown gate:
 
   * ``refresh_insider_for_watchlist`` — single watchlist-wide refresh,
     runs at most once per 23 hours (tracked in ``insider_refresh_log``).
-    Wired into the watchlist's "Refresh bars" button so cumulative call
-    cost is bounded regardless of how often the user clicks refresh.
+    The refresh pipeline's feeds step calls it, so cumulative call cost
+    is bounded regardless of how often Refresh is clicked.
 
-  * ``refresh_insider_for_symbol`` — on-demand per-symbol from the
-    analysis page, with its own per-scope 23h cooldown.
+  * ``refresh_insider_for_symbol`` — on-demand per-symbol (MCP
+    ``refresh_insider``), with its own per-scope 23h cooldown.
 
   * ``net_buys_90d(symbol)`` — UI aggregation surfaced as a small pill on
     the watchlist and a card on analysis detail.

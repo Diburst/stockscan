@@ -2,15 +2,11 @@
 
 Endpoints:
   GET  /signals                    — full page render
-  POST /signals/refresh            — backfill recent bars + re-run all
-                                      strategies, then return the
-                                      page-content partial for HTMX swap
   GET  /signals/{signal_id}        — detail view
 """
 
 from __future__ import annotations
 
-import logging
 from typing import Any
 
 from fastapi import APIRouter, Depends, Query, Request
@@ -20,27 +16,15 @@ from sqlalchemy.orm import Session
 from stockscan.regime import get_regime
 from stockscan.regime.store import MarketRegime
 from stockscan.scan import signals_freshness
-from stockscan.scan.refresh_job import (
-    consume_finished as consume_refresh_job,
-    current_job as current_refresh_job,
-    start_refresh,
-)
 from stockscan.signals import SORT_COLUMNS, query_signals
 from stockscan.strategies import (
     STRATEGY_REGISTRY,
     Strategy,
     discover_strategies,
 )
-from stockscan.web.deps import (
-    attach_hx_toast,
-    get_session,
-    rate_limit_check,
-    render,
-    safe,
-)
+from stockscan.web.deps import get_session, render, safe
 
 router = APIRouter(prefix="/signals")
-log = logging.getLogger(__name__)
 
 
 # Valid sort columns + their SQL expressions.
@@ -78,8 +62,8 @@ def _query_signals_view(
 ) -> dict[str, Any]:
     """Bundle the template context for the signals list view.
 
-    The SELECT itself lives in :func:`stockscan.signals.query_signals` so the
-    POST /refresh endpoint and the MCP ``list_signals`` tool share one query.
+    The SELECT itself lives in :func:`stockscan.signals.query_signals` so this
+    page and the MCP ``list_signals`` tool share one query.
     This helper only splits passing/rejected and adds the template-specific
     bits (strategy registry, freshness, filter/sort echo state).
     """
@@ -136,8 +120,7 @@ def signals_list(
 ):
     """Full page render of passing + rejected signals (current strategy
     versions only), with symbol/side/score-range filters and column sorting
-    via query params. If a background refresh is already in flight, the
-    fresh page-load joins its polling loop rather than starting a new job."""
+    via query params."""
     ctx = _query_signals_view(
         s,
         strategy=strategy,
@@ -150,224 +133,11 @@ def signals_list(
         sort=sort,
         sort_dir=dir,
     )
-    # If a background refresh is in flight (started from another tab or a
-    # prior visit), the fresh page-load joins the polling loop too.
-    job = current_refresh_job()
-    job_running = job is not None and job.status == "running"
     return render(
         request,
         "signals/list.html",
-        signals_refresh_error=None,
-        signals_refresh_summary=None,
-        refresh_job_active=job_running,
-        refresh_qs=_refresh_qs(
-            strategy=strategy, days=days, show_rejected=show_rejected,
-            symbol=symbol, side=side, score_min=score_min, score_max=score_max,
-            sort=sort, dir=dir,
-        ),
-        refresh_elapsed=job.elapsed_seconds if job_running else 0,
         **ctx,
     )
-
-
-def _refresh_qs(
-    *,
-    strategy: str | None,
-    days: int,
-    show_rejected: bool,
-    symbol: str | None,
-    side: str | None,
-    score_min: str | None,
-    score_max: str | None,
-    sort: str | None,
-    dir: str | None,
-) -> str:
-    """Query string carrying the user's filter/sort state through the
-    polling loop, so the post-refresh render matches what they were
-    looking at. Only non-empty params are emitted (empty floats 422)."""
-    parts = [f"days={days}", f"show_rejected={'true' if show_rejected else 'false'}"]
-    for key, value in (
-        ("strategy", strategy), ("symbol", symbol), ("side", side),
-        ("score_min", score_min), ("score_max", score_max),
-        ("sort", sort), ("dir", dir),
-    ):
-        if value:
-            parts.append(f"{key}={value}")
-    return "&".join(parts)
-
-
-@router.post("/refresh")
-def refresh_endpoint(
-    request: Request,
-    strategy: str | None = Query(None),
-    days: int = Query(7, ge=1, le=90),
-    show_rejected: bool = Query(True),
-    # Filters — forwarded so the post-refresh view preserves the user's filters
-    symbol: str | None = Query(None),
-    side: str | None = Query(None),
-    score_min: str | None = Query(None),
-    score_max: str | None = Query(None),
-    sort: str | None = Query(None),
-    dir: str | None = Query(None),
-    s: Session = Depends(get_session),
-):
-    """Start the bars + strategies refresh as a BACKGROUND job.
-
-    Responds immediately with the page-content partial carrying a polling
-    strip (``signals/_refresh_status.html`` include); the strip polls
-    ``GET /signals/refresh/status`` every 2 s until the job finishes, at
-    which point that endpoint swaps in the refreshed content. The page —
-    and the rest of the app — stays usable while the refresh runs.
-
-    Single-flight: a second POST while a job is running joins the
-    in-flight job instead of starting another. The 20 s cooldown applies
-    to job starts.
-    """
-    _filter_kwargs = dict(
-        symbol=symbol, side=side,
-        score_min=_to_float(score_min), score_max=_to_float(score_max),
-        sort=sort, sort_dir=dir,
-    )
-    qs = _refresh_qs(
-        strategy=strategy, days=days, show_rejected=show_rejected,
-        symbol=symbol, side=side, score_min=score_min, score_max=score_max,
-        sort=sort, dir=dir,
-    )
-
-    def _content(*, job_active: bool, toast: tuple[str, str] | None):
-        ctx = _query_signals_view(
-            s, strategy=strategy, days=days, show_rejected=show_rejected,
-            **_filter_kwargs,
-        )
-        response = render(
-            request,
-            "signals/_signals_content.html",
-            signals_refresh_error=None,
-            signals_refresh_summary=None,
-            refresh_job_active=job_active,
-            refresh_qs=qs,
-            refresh_elapsed=0,
-            **ctx,
-        )
-        if toast:
-            return attach_hx_toast(response, *toast)
-        return response
-
-    # If a job is already in flight, join it — no new work, no cooldown hit.
-    existing = current_refresh_job()
-    if existing is not None and existing.status == "running":
-        return _content(
-            job_active=True,
-            toast=("info", "A refresh is already running — joining it"),
-        )
-
-    # Signals refresh is the most expensive operation in the app — bars
-    # backfill + every strategy re-runs. Debounce job STARTS.
-    cooldown_remaining = rate_limit_check("signals.refresh", cooldown_seconds=20)
-    if cooldown_remaining is not None:
-        return _content(
-            job_active=False,
-            toast=("warn", f"Just refreshed — try again in {int(cooldown_remaining) + 1}s"),
-        )
-
-    _job, started_new = start_refresh(days_back=7)
-    toast_msg = (
-        "Refresh started — fetching bars and re-running strategies"
-        if started_new
-        else "A refresh is already running — joining it"
-    )
-    return _content(job_active=True, toast=("info", toast_msg))
-
-
-@router.get("/refresh/status")
-def refresh_status(
-    request: Request,
-    strategy: str | None = Query(None),
-    days: int = Query(7, ge=1, le=90),
-    show_rejected: bool = Query(True),
-    symbol: str | None = Query(None),
-    side: str | None = Query(None),
-    score_min: str | None = Query(None),
-    score_max: str | None = Query(None),
-    sort: str | None = Query(None),
-    dir: str | None = Query(None),
-    s: Session = Depends(get_session),
-):
-    """Polling endpoint for the background refresh.
-
-    While the job runs: returns the small self-replacing status strip
-    (it re-polls itself every 2 s — the rest of the page is untouched).
-
-    When the job finishes: returns the FULL refreshed page content with
-    ``HX-Retarget: #signals-content`` so this response replaces the whole
-    content area, banner + tables, in one swap. The finished job is
-    consumed so a stray later poll doesn't re-announce it.
-    """
-    qs = _refresh_qs(
-        strategy=strategy, days=days, show_rejected=show_rejected,
-        symbol=symbol, side=side, score_min=score_min, score_max=score_max,
-        sort=sort, dir=dir,
-    )
-
-    job = current_refresh_job()
-    if job is not None and job.status == "running":
-        return render(
-            request,
-            "signals/_refresh_status.html",
-            refresh_qs=qs,
-            refresh_elapsed=job.elapsed_seconds,
-        )
-
-    finished = consume_refresh_job()
-    error = finished.error if finished else None
-    refresh_summary = finished.summary if finished else None
-
-    ctx = _query_signals_view(
-        s, strategy=strategy, days=days, show_rejected=show_rejected,
-        symbol=symbol, side=side,
-        score_min=_to_float(score_min), score_max=_to_float(score_max),
-        sort=sort, sort_dir=dir,
-    )
-    response = render(
-        request,
-        "signals/_signals_content.html",
-        signals_refresh_error=error,
-        signals_refresh_summary=refresh_summary,
-        refresh_job_active=False,
-        refresh_qs=qs,
-        refresh_elapsed=0,
-        **ctx,
-    )
-    # The poll strip is a small element inside #signals-content; retarget
-    # the final swap at the whole content block.
-    response.headers["HX-Retarget"] = "#signals-content"
-    response.headers["HX-Reswap"] = "outerHTML"
-
-    if error:
-        return attach_hx_toast(response, "error", "Signal refresh failed")
-    if refresh_summary and refresh_summary.get("up_to_date"):
-        n_marked = refresh_summary.get("trades_marked", 0)
-        n_closed = refresh_summary.get("trades_auto_closed", 0)
-        extra = ""
-        if n_marked or n_closed:
-            extra = f" ({n_marked} marked, {n_closed} auto-closed)"
-        return attach_hx_toast(
-            response, "info", f"Already up to date — no API calls used{extra}"
-        )
-    if refresh_summary:
-        n_new = refresh_summary.get("signals_emitted", 0)
-        parts = [f"{n_new} new signal{'s' if n_new != 1 else ''}"]
-        n_marked = refresh_summary.get("trades_marked", 0)
-        n_closed = refresh_summary.get("trades_auto_closed", 0)
-        if n_marked:
-            parts.append(f"{n_marked} trade{'s' if n_marked != 1 else ''} marked")
-        if n_closed:
-            parts.append(f"{n_closed} auto-closed")
-        return attach_hx_toast(
-            response, "success", f"Refreshed — {', '.join(parts)}"
-        )
-    # No job found at all (e.g., server restarted mid-poll) — just rerender.
-    return response
 
 
 @router.get("/{signal_id}")
